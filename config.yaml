@@ -1,0 +1,150 @@
+# Config for Crypto Early Signal Detector (see TZ_crypto_early_signal_detector.md)
+# Watchlist and signal thresholds live here, not hardcoded in Python (TZ section 6.4).
+
+watchlist:
+  # DeFiLlama protocol slugs. 25 real protocols with both revenue/fees data
+  # and a directly resolvable token market cap (verified against the live API).
+  # Multi-version protocols like "uniswap-v3" or "aave-v3" are NOT usable yet:
+  # DeFiLlama reports their token's market cap only under a separate parent
+  # entity that the free API does not expose in a joinable form. Documented
+  # as a known MVP limitation - see collectors/defillama.py.
+  defillama_protocols:
+    - aave-v2
+    - jupiter-aggregator
+    - lido
+    - convex-finance
+    - ens
+    - olympus-dao
+    - axie-infinity
+    - thorchain-dex
+    - railgun
+    - nexus-mutual
+    - cowswap
+    - safe
+    - livepeer
+    - sushiswap
+    - ssv-network
+    - ankr
+    - osmosis-dex
+    - renzo
+    - illuvium
+    - hyperlane
+    - virtuals-protocol
+    - reserve-protocol
+    - api3
+    - frankencoin
+    - ston.fi
+
+  # Binance Futures USDT-M perpetual tickers for the OI/price divergence
+  # signal (TZ section 4.1). Coinglass was the source named in the original
+  # TZ, but Coinglass no longer has a free API tier at all (cheapest paid
+  # plan is $29/mo) - replaced with Binance Futures public endpoints, which
+  # need no API key. See collectors/binance_futures.py for the endpoints
+  # used. Verified live against GET /fapi/v1/exchangeInfo on 2026-09-09:
+  # all 26 symbols below are active TRADING perpetuals. EOSUSDT was in the
+  # original 27-symbol list but turned out to be delisted from Binance
+  # Futures entirely (not just renamed) - removed after the live check
+  # caught it. MATICUSDT and FTMUSDT were deliberately left out too - both
+  # projects rebranded their token in 2024, and a Futures ticker around a
+  # rebrand is exactly the kind of thing that needs a live check, which is
+  # why EOSUSDT's delisting was worth catching here rather than assuming.
+  binance_futures_symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - XRPUSDT
+    - ADAUSDT
+    - DOGEUSDT
+    - AVAXUSDT
+    - LINKUSDT
+    - DOTUSDT
+    - LTCUSDT
+    - TRXUSDT
+    - ATOMUSDT
+    - NEARUSDT
+    - ETCUSDT
+    - BCHUSDT
+    - UNIUSDT
+    - AAVEUSDT
+    - FILUSDT
+    - ALGOUSDT
+    - XLMUSDT
+    - VETUSDT
+    - ICPUSDT
+    - HBARUSDT
+    - SANDUSDT
+    - APTUSDT
+
+signals:
+  revenue_price_gap:
+    # TZ section 4.5: revenue/fees grew by >= X% over `lookback_days`,
+    # while market cap grew less than that (or fell).
+    enabled: true
+    weight: 1.0
+    # MUST be 7 or 30 - not any value in TZ 4.5's stated 7-30 day range.
+    # DeFiLlama (and therefore collectors/defillama.py's stored snapshots)
+    # only pre-computes revenue growth for a 7-day and a 30-day window;
+    # signals/revenue_price_gap.py picks between those two columns based on
+    # this exact value and raises ValueError for anything else, rather than
+    # silently comparing the wrong window's revenue number against a
+    # market-cap snapshot from a different number of days back.
+    lookback_days: 7
+    revenue_growth_threshold_pct: 30
+    mcap_reaction_threshold_pct: 10
+
+  oi_divergence:
+    # TZ section 4.1: Open Interest grew by >= X% over `lookback_hours`,
+    # while price moved by less than Y% over the same window - stays high
+    # while nobody has "shown up" on the price chart yet. Stated range in
+    # the TZ is 24-48h; 36h is the midpoint, splitting the difference
+    # between reacting fast and needing enough OI history to be stable.
+    enabled: true
+    weight: 1.0
+    lookback_hours: 36
+    oi_growth_threshold_pct: 30
+    price_change_threshold_pct: 5
+
+  volume_breakout:
+    # TZ section 4.7: price breaks above a multi-month resistance level
+    # (the highest daily price over the past `resistance_lookback_days`
+    # days, EXCLUDING today) on volume at least `volume_ratio_threshold`
+    # times the average daily volume over the past `volume_avg_lookback_days`
+    # days (also excluding today, so today's own possibly-extreme volume
+    # never inflates the baseline it's being compared against - see
+    # signals/volume_breakout.py). Source: collectors/coingecko.py's daily
+    # market_chart history, stored in storage/db.py's
+    # coingecko_price_history table.
+    enabled: true
+    weight: 1.0
+    # "Multi-month" per the TZ - 180 days (~6 months) is a level that has
+    # survived roughly two quarters of trading, long enough that breaking it
+    # is a real structural event rather than noise from a recent local high.
+    # CoinGecko's free market_chart endpoint caps daily-granularity history
+    # at 365 days (collectors/coingecko.py's MAX_SAFE_DAYS) - 180 leaves
+    # comfortable room within that budget for the 30-day volume window plus
+    # data gaps, while still being long enough to call "multi-month".
+    resistance_lookback_days: 180
+    # TZ section 4.7 states this exact window: "volume ... above the average
+    # over the last 30 days" - not a range to pick from, unlike the other
+    # two settings here.
+    volume_avg_lookback_days: 30
+    # TZ section 4.7 gives a 2-3x range; 2.5x (the midpoint) is the starting
+    # value - clearly above normal day-to-day volume noise without setting
+    # the bar as high as 3x, which would let a confirmed breakout on merely
+    # "strong" (not extreme) volume slip through unreported. Same
+    # calibrate-later spirit as oi_divergence's 30%/5% starting values.
+    volume_ratio_threshold: 2.5
+
+schedule:
+  # Revenue/fees is a "slow" signal per TZ section 5 - daily polling is enough.
+  defillama_poll_hours: 24
+  # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
+  # main.py. Read by scripts/register_scheduled_task.ps1 - change the value
+  # here and re-run that script to reschedule, instead of editing the .ps1.
+  defillama_run_time: "08:00"
+  # OI is a "fast" signal per TZ section 5 - poll every few hours, not daily.
+  binance_futures_poll_hours: 6
+
+storage:
+  sqlite_path: storage/db.sqlite

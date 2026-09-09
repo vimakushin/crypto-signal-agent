@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+
+# Secrets - never commit real API keys/tokens (e.g. the Telegram bot token
+# once notifications/telegram_bot.py is added)
+.env
+
+# Local SQLite database - history/state, not source code
+storage/db.sqlite
+
+# Logs written by main.py's rotating file handler
+logs/
+
+# Database backups (scripts/backup_db.py's default --backup-dir). Full
+# binary copies of storage/db.sqlite, made on a schedule - do not belong in
+# git (would bloat history forever, one full copy per backup, not a diff).
+# If --backup-dir is pointed at a folder outside the project (e.g. a
+# OneDrive/Google Drive-synced folder) instead, this line has no effect on
+# it - only this project-local default is covered here.
+backups/
+
+# Python bytecode/caches
+__pycache__/
+*.pyc
+
+# Editor/OS noise
+.vscode/
+.idea/

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pip *)",
+      "PowerShell(winget *)",
+      "PowerShell(python -m venv .venv)",
+      "WebSearch",
+      "WebFetch(domain:www.coinglass.com)",
+      "PowerShell(Get-ScheduledTask *)"
+    ]
+  }
+}
