@@ -1,4 +1,4 @@
-# Registers TWO Windows Task Scheduler tasks for crypto-signal-agent
+# Registers THREE Windows Task Scheduler tasks for crypto-signal-agent
 # (README.md has the plain-language explanation):
 #   - CryptoSignalAgent-DeFiLlama: `main.py --cycle defillama`, once a day,
 #     at schedule.defillama_run_time from config.yaml (TZ section 5 calls
@@ -7,17 +7,22 @@
 #     schedule.binance_futures_poll_hours hours around the clock (TZ section
 #     5 calls Open Interest a "fast" signal that needs polling every 4-6h,
 #     not once a day).
+#   - CryptoSignalAgent-Backup: `scripts\backup_db.py`, once a day, at
+#     schedule.backup_run_time from config.yaml (see that script's module
+#     docstring - a consistent SQLite snapshot of storage/db.sqlite via the
+#     Online Backup API, with automatic rotation of old backups).
 #
 # Run this ONCE, from PowerShell, as the Windows user who will normally be
-# logged in on this PC (both tasks only run while that user is logged on -
-# neither wakes the PC up or runs while it is off/asleep, see README.md):
+# logged in on this PC (all three tasks only run while that user is logged
+# on - none of them wakes the PC up or runs while it is off/asleep, see
+# README.md):
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\register_scheduled_task.ps1
 #
-# Safe to re-run: it replaces both task definitions (-Force) instead of
+# Safe to re-run: it replaces all three task definitions (-Force) instead of
 # creating duplicates. Also re-run this after changing
-# schedule.defillama_run_time or schedule.binance_futures_poll_hours in
-# config.yaml, to apply the new schedule.
+# schedule.defillama_run_time, schedule.binance_futures_poll_hours, or
+# schedule.backup_run_time in config.yaml, to apply the new schedule.
 
 $ErrorActionPreference = "Stop"
 
@@ -26,6 +31,7 @@ $PythonExe   = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $ConfigPath  = Join-Path $ProjectRoot "config.yaml"
 $DeFiLlamaTaskName = "CryptoSignalAgent-DeFiLlama"
 $BinanceTaskName   = "CryptoSignalAgent-BinanceOI"
+$BackupTaskName    = "CryptoSignalAgent-Backup"
 # Older, pre-split task name that ran both cycles together once a day -
 # removed if present so a machine that registered it before this script was
 # updated doesn't end up running the old all-in-one task AND both new ones.
@@ -38,12 +44,12 @@ if (-not (Test-Path $ConfigPath)) {
     throw "config.yaml not found at $ConfigPath"
 }
 
-# Read both schedule values from config.yaml (schedule.defillama_run_time,
-# schedule.binance_futures_poll_hours) instead of hardcoding them here -
-# schedule/thresholds/watchlist live in config.yaml, not in code (CLAUDE.md
-# project rule). Uses the project's own venv Python + PyYAML (already a
-# dependency, see requirements.txt) rather than adding a separate
-# PowerShell YAML module just for this.
+# Read all three schedule values from config.yaml (schedule.defillama_run_time,
+# schedule.binance_futures_poll_hours, schedule.backup_run_time) instead of
+# hardcoding them here - schedule/thresholds/watchlist live in config.yaml,
+# not in code (CLAUDE.md project rule). Uses the project's own venv Python +
+# PyYAML (already a dependency, see requirements.txt) rather than adding a
+# separate PowerShell YAML module just for this.
 #
 # The snippet is written to a temp .py file and run as `python file.py`,
 # NOT passed inline via `python -c "..."`. PowerShell mangles double quotes
@@ -58,19 +64,21 @@ with open(sys.argv[1], encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 print(cfg["schedule"]["defillama_run_time"])
 print(cfg["schedule"]["binance_futures_poll_hours"])
+print(cfg["schedule"]["backup_run_time"])
 '@
 $tempScriptPath = Join-Path $env:TEMP "crypto-signal-agent_read-schedule.py"
 Set-Content -Path $tempScriptPath -Value $readConfigScript -Encoding utf8
 try {
     $ConfigOutput = & $PythonExe $tempScriptPath $ConfigPath
-    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 2) {
-        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours from $ConfigPath"
+    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 3) {
+        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time from $ConfigPath"
     }
 } finally {
     Remove-Item -Path $tempScriptPath -ErrorAction SilentlyContinue
 }
 $RunTimeRaw = $ConfigOutput[0].Trim()
 $PollHoursRaw = $ConfigOutput[1].Trim()
+$BackupRunTimeRaw = $ConfigOutput[2].Trim()
 
 $timeParts = $RunTimeRaw -split ":"
 if ($timeParts.Count -ne 2) {
@@ -87,12 +95,23 @@ if (-not [int]::TryParse($PollHoursRaw, [ref]$PollHours) -or $PollHours -le 0 -o
     throw "schedule.binance_futures_poll_hours in config.yaml must be a whole number between 1 and 24, got '$PollHoursRaw'"
 }
 
+$backupTimeParts = $BackupRunTimeRaw -split ":"
+if ($backupTimeParts.Count -ne 2) {
+    throw "schedule.backup_run_time in config.yaml must look like `"HH:MM`" (24h), got '$BackupRunTimeRaw'"
+}
+$BackupRunHour = [int]$backupTimeParts[0]
+$BackupRunMinute = [int]$backupTimeParts[1]
+if ($BackupRunHour -lt 0 -or $BackupRunHour -gt 23 -or $BackupRunMinute -lt 0 -or $BackupRunMinute -gt 59) {
+    throw "schedule.backup_run_time in config.yaml is out of range: '$BackupRunTimeRaw'"
+}
+
 # Built from integer Hour/Minute, not an "8:00AM"-style string - -At needs an
 # actual DateTime, and parsing "HH:MMAM/PM" text depends on the Windows
 # locale/culture. That breaks silently on a machine with a different locale,
 # which is exactly when this script is most likely to be re-run (fresh
 # Windows install, different PC) - see README.md.
 $RunTime = Get-Date -Hour $RunHour -Minute $RunMinute -Second 0
+$BackupRunTime = Get-Date -Hour $BackupRunHour -Minute $BackupRunMinute -Second 0
 
 # Anchor for the repeating Binance trigger - midnight today. Only its
 # time-of-day matters (it fixes which clock hours the repeating trigger
@@ -155,12 +174,30 @@ Register-ScheduledTask -TaskName $BinanceTaskName `
     -Description "crypto-signal-agent: Binance Futures OI snapshot + oi_divergence signal scan, every $PollHours hour(s) (see README.md)" `
     -Force | Out-Null
 
+# Same cmd.exe wrapper as the two tasks above, for the same reason (see the
+# NOTE above New-ScheduledTaskSettingsSet) - not specific to main.py, applies
+# to any venv-python.exe launch under Task Scheduler.
+$backupAction = New-ScheduledTaskAction -Execute "cmd.exe" `
+    -Argument '/c ".venv\Scripts\python.exe" scripts\backup_db.py' `
+    -WorkingDirectory $ProjectRoot
+$backupTrigger = New-ScheduledTaskTrigger -Daily -At $BackupRunTime
+
+Register-ScheduledTask -TaskName $BackupTaskName `
+    -Action $backupAction `
+    -Trigger $backupTrigger `
+    -Settings $settings `
+    -Description "crypto-signal-agent: daily SQLite backup of storage/db.sqlite via scripts/backup_db.py (see README.md)" `
+    -Force | Out-Null
+
 Write-Host "Scheduled task '$DeFiLlamaTaskName' registered - runs daily at $RunTimeRaw while this Windows user is logged in."
 Write-Host "Scheduled task '$BinanceTaskName' registered - runs every $PollHours hour(s) while this Windows user is logged in."
-Write-Host "Log files: $ProjectRoot\logs\scheduler_defillama.log (DeFiLlama task), $ProjectRoot\logs\scheduler_binance.log (BinanceOI task)"
-Write-Host "(separate files on purpose - these two tasks are independent processes that can run at the same time, see main.py's module docstring)"
+Write-Host "Scheduled task '$BackupTaskName' registered - runs daily at $BackupRunTimeRaw while this Windows user is logged in."
+Write-Host "Log files: $ProjectRoot\logs\scheduler_defillama.log (DeFiLlama task), $ProjectRoot\logs\scheduler_binance.log (BinanceOI task), $ProjectRoot\logs\backup.log (Backup task)"
+Write-Host "(separate files on purpose - these are independent processes that can run at the same time, see main.py's module docstring)"
 Write-Host ""
-Write-Host "To check either one: Get-ScheduledTask -TaskName '$DeFiLlamaTaskName' | Get-ScheduledTaskInfo"
-Write-Host "                     Get-ScheduledTask -TaskName '$BinanceTaskName' | Get-ScheduledTaskInfo"
-Write-Host "To run either right now (test): Start-ScheduledTask -TaskName '$DeFiLlamaTaskName'"
-Write-Host "                               Start-ScheduledTask -TaskName '$BinanceTaskName'"
+Write-Host "To check any one: Get-ScheduledTask -TaskName '$DeFiLlamaTaskName' | Get-ScheduledTaskInfo"
+Write-Host "                  Get-ScheduledTask -TaskName '$BinanceTaskName' | Get-ScheduledTaskInfo"
+Write-Host "                  Get-ScheduledTask -TaskName '$BackupTaskName' | Get-ScheduledTaskInfo"
+Write-Host "To run any one right now (test): Start-ScheduledTask -TaskName '$DeFiLlamaTaskName'"
+Write-Host "                                Start-ScheduledTask -TaskName '$BinanceTaskName'"
+Write-Host "                                Start-ScheduledTask -TaskName '$BackupTaskName'"

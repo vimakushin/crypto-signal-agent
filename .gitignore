@@ -27,3 +27,7 @@ __pycache__/
 # Editor/OS noise
 .vscode/
 .idea/
+
+# Claude Code session-local runtime state (e.g. scheduled-wakeup lock file) -
+# machine/session-specific, not project data.
+.claude/*.lock

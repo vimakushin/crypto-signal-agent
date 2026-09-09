@@ -145,6 +145,18 @@ schedule:
   defillama_run_time: "08:00"
   # OI is a "fast" signal per TZ section 5 - poll every few hours, not daily.
   binance_futures_poll_hours: 6
+  # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
+  # scripts/backup_db.py (the SQLite Online Backup API snapshot of
+  # storage/db.sqlite - see that script's module docstring). Same format and
+  # same scripts/register_scheduled_task.ps1 wiring as defillama_run_time
+  # above - change the value here and re-run that script to reschedule.
+  # Default is an hour after defillama_run_time (08:00), so the daily
+  # DeFiLlama snapshot has already landed in storage/db.sqlite by the time
+  # that day's backup is taken - not a hard dependency (the backup just
+  # copies whatever is in the database at the time it runs, and the
+  # BinanceOI task writes to it too), just a reasonable quiet-morning slot
+  # that avoids overlapping the DeFiLlama task's own run.
+  backup_run_time: "09:00"
 
 storage:
   sqlite_path: storage/db.sqlite
