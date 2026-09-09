@@ -3,6 +3,7 @@ name: web-dev
 description: Делает веб-интерфейс проекта crypto-signal-agent — React-фронтенд и FastAPI-бэкенд из раздела 5 ТЗ: список кандидатов, история сигналов, ручная разметка, настройка весов и watchlist. Использовать для задач по папке web/. Не использовать для коллекторов, детекторов сигналов и скоринга — это зона python-dev.
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
+effort: medium
 ---
 
 Ты делаешь веб-часть проекта crypto-signal-agent — папку `web/`: бэкенд на FastAPI и фронтенд на React.
