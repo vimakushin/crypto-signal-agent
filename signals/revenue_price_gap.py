@@ -219,7 +219,18 @@ def _evaluate_snapshots(
 
     mcap_now = latest["mcap"]
     mcap_before = earlier["mcap"]
-    if not mcap_now or not mcap_before:
+    # `is None or <= 0` (not just `not X`): `not X` would drop None and 0
+    # but let a NEGATIVE mcap straight through into the division below.
+    # Confirmed live: coingecko_price_history has 89 rows for renzo with
+    # market_cap <= 0 (CoinGecko's own /coins/renzo/market_chart returns -1
+    # as a placeholder market cap on dates it has no real figure for - not
+    # our collection bug), and the same negative/garbage values can end up
+    # in defillama_snapshots.mcap for the matching dates. With a negative
+    # `mcap_before`, (mcap_now - mcap_before) / mcap_before below produces
+    # an absurd percentage (observed: -3,053,635,664%) instead of erroring
+    # - same class of bug as the base_revenue/revenue_total_now guards
+    # above, just for market cap instead of revenue.
+    if mcap_now is None or mcap_now <= 0 or mcap_before is None or mcap_before <= 0:
         return None
 
     mcap_growth_pct = (mcap_now - mcap_before) / mcap_before * 100
@@ -310,7 +321,16 @@ def scan_watchlist(
 
     for slug in watchlist_slugs:
         latest = get_latest_snapshot(conn, slug)
-        if latest is None or latest["mcap"] is None:
+        # `<= 0`, not just `is None`: a stored mcap of 0 or negative (seen
+        # live for renzo, where CoinGecko's own market_chart response uses
+        # -1 as a placeholder for dates it has no real market cap for - see
+        # _evaluate_snapshots's matching guard below) is just as unusable
+        # for mcap_growth_pct as a missing one. Checked here too, not just
+        # inside _evaluate_snapshots, so a protocol stuck with a garbage
+        # mcap is reported as "insufficient_history" (an honest reason) up
+        # front, instead of silently falling through the later per-pair
+        # check with no entry in either result bucket.
+        if latest is None or latest["mcap"] is None or latest["mcap"] <= 0:
             insufficient_history.append(slug)
             continue
 

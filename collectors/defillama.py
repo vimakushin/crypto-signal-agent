@@ -154,6 +154,25 @@ def collect(watchlist_slugs: list[str]) -> list[dict]:
     protocols that do have known CoinGecko coins, that assumption needs
     revisiting (e.g. falling back to fetch_protocol_daily_revenue_history's
     gecko_id, or a manual slug -> gecko_id mapping in config.yaml).
+
+    Field choice for revenue_change_7d_pct - DO NOT swap this back to
+    DeFiLlama's `change_7d`, that name is misleading: `change_7d` compares
+    the last 24h of revenue (`total24h`) against the 24h a week before
+    (`total7DaysAgo`) - a single DAY vs. a single DAY, not a week vs. a
+    week. `change_7dover7d` is the field that actually compares a trailing
+    7-day window against the PRIOR 7-day window, the same "window vs. same
+    -length prior window" shape TZ 4.5 and this module's own
+    change_30dover30d (for the 30-day side) require. Confirmed live against
+    https://api.llama.fi/overview/fees?dataType=dailyRevenue for all 25
+    config.yaml watchlist protocols: change_7dover7d matched
+    scripts/backfill_history.py's own week-over-week formula
+    ((total7d - total14dto7d) / total14dto7d) in 23/25 cases (the other 2
+    were None on both sides), while change_7d matched it in 0/25 - and can
+    disagree even in SIGN (e.g. jupiter-aggregator: change_7d=+221.24%
+    vs. change_7dover7d=-34.96%, live on 2026-09-10). change_7dover7d was
+    also non-None for all 25 watchlist protocols in that same check, vs.
+    2 missing for change_7d - so it is not just more correct but also
+    better covered.
     """
     fees_by_slug = fetch_revenue_overview()
     protocols_by_slug = fetch_protocols()
@@ -175,6 +194,22 @@ def collect(watchlist_slugs: list[str]) -> list[dict]:
                 "revenue_price_gap will skip it until fixed",
                 slug,
             )
+        elif mcap <= 0:
+            # `/protocols` itself can hand back a garbage mcap, not just a
+            # missing one - confirmed live: 203 of 8218 entries on this
+            # endpoint carry mcap <= 0 (none of them in config.yaml's 25
+            # watchlist protocols as of 2026-09-10, but nothing stops that
+            # from changing on a future protocol added to the watchlist).
+            # Saved as-is (signals/revenue_price_gap.py's own guard blocks
+            # a <= 0 mcap from ever reaching mcap_growth_pct's division) -
+            # this warning exists so a bad reading is visible here, at the
+            # source, rather than only inferred later from a protocol
+            # quietly missing from every scan.
+            logger.warning(
+                "DeFiLlama: '%s' has a non-positive market cap (%s) on /protocols - "
+                "snapshot saved as-is, revenue_price_gap will skip it until this clears",
+                slug, mcap,
+            )
 
         gecko_id = protocol_entry.get("gecko_id") if protocol_entry else None
         if not gecko_id:
@@ -192,7 +227,7 @@ def collect(watchlist_slugs: list[str]) -> list[dict]:
             "fetched_at": fetched_at,
             "revenue_total_7d": fee_entry.get("total7d"),
             "revenue_total_30d": fee_entry.get("total30d"),
-            "revenue_change_7d_pct": fee_entry.get("change_7d"),
+            "revenue_change_7d_pct": fee_entry.get("change_7dover7d"),
             "revenue_change_30d_pct": fee_entry.get("change_30dover30d"),
             "mcap": mcap,
             "gecko_id": gecko_id,
