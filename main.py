@@ -42,6 +42,7 @@ using the single scheduler.log as before.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime, timezone
@@ -61,6 +62,7 @@ from storage.db import (
     save_binance_oi_snapshots,
     save_coingecko_price_history,
     save_defillama_snapshots,
+    save_signal_event,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -217,12 +219,33 @@ def run_defillama_cycle(config: dict) -> None:
                 revenue_signal_cfg.get("min_revenue_total_usd", 0),
                 len(result.insufficient_data_quality), len(result.signals),
             )
+            evaluated_at = datetime.now(timezone.utc).isoformat()
             for s in result.signals:
                 logger.info(
                     "revenue_price_gap FIRED: %s (%s) revenue +%.1f%% over %dd (configured), "
                     "actual gap between compared snapshots %.1fd, mcap only +%.1f%%",
                     s.protocol_slug, s.symbol, s.revenue_growth_pct,
                     s.lookback_days, s.actual_lookback_days, s.mcap_growth_pct,
+                )
+                save_signal_event(
+                    conn,
+                    signal_name="revenue_price_gap",
+                    protocol_slug=s.protocol_slug,
+                    triggered_at=evaluated_at,
+                    source="DeFiLlama",
+                    metric_value=s.revenue_growth_pct,
+                    details_json=json.dumps({
+                        "revenue_growth_pct": s.revenue_growth_pct,
+                        "revenue_growth_threshold_pct": revenue_signal_cfg["revenue_growth_threshold_pct"],
+                        "mcap_growth_pct": s.mcap_growth_pct,
+                        "mcap_reaction_threshold_pct": revenue_signal_cfg["mcap_reaction_threshold_pct"],
+                        "lookback_days": s.lookback_days,
+                        "actual_lookback_days": s.actual_lookback_days,
+                        "revenue_total": s.revenue_total,
+                        "mcap_now": s.mcap_now,
+                        "mcap_before": s.mcap_before,
+                        "symbol": s.symbol,
+                    }),
                 )
 
         if volume_signal_cfg.get("enabled", True):
@@ -333,12 +356,35 @@ def _run_volume_breakout(
         len(result.insufficient_liquidity), signal_cfg.get("min_volume_avg_usd", 0),
         len(result.signals),
     )
+    evaluated_at = datetime.now(timezone.utc).isoformat()
     for s in result.signals:
         logger.info(
             "volume_breakout FIRED: %s price %.6g broke above %d-day resistance %.6g, "
             "volume %.0f is %.1fx the %d-day average (%.0f)",
             s.protocol_slug, s.price_now, s.resistance_lookback_days, s.resistance_level,
             s.volume_now, s.volume_ratio, s.volume_avg_lookback_days, s.volume_avg,
+        )
+        save_signal_event(
+            conn,
+            signal_name="volume_breakout",
+            protocol_slug=s.protocol_slug,
+            triggered_at=evaluated_at,
+            source="CoinGecko",
+            metric_value=s.volume_ratio,
+            details_json=json.dumps({
+                "gecko_id": s.gecko_id,
+                "date": s.date,
+                "price_now": s.price_now,
+                "resistance_level": s.resistance_level,
+                "resistance_lookback_days": s.resistance_lookback_days,
+                "resistance_window_days_available": s.resistance_window_days_available,
+                "volume_now": s.volume_now,
+                "volume_avg": s.volume_avg,
+                "volume_avg_lookback_days": s.volume_avg_lookback_days,
+                "volume_window_days_available": s.volume_window_days_available,
+                "volume_ratio": s.volume_ratio,
+                "volume_ratio_threshold": signal_cfg["volume_ratio_threshold"],
+            }),
         )
 
 
@@ -421,10 +467,35 @@ def run_binance_futures_cycle(config: dict) -> None:
             lookback_hours, len(result.insufficient_liquidity),
             signal_cfg.get("min_oi_value_usdt", 0), len(result.signals),
         )
+        evaluated_at = datetime.now(timezone.utc).isoformat()
         for s in result.signals:
             logger.info(
                 "oi_divergence FIRED: %s OI +%.1f%% over %.1fh (actual), price only %+.1f%%",
                 s.symbol, s.oi_growth_pct, s.lookback_hours, s.price_change_pct,
+            )
+            save_signal_event(
+                conn,
+                signal_name="oi_divergence",
+                # signal_events' protocol_slug column doubles as a generic
+                # candidate-identifier column across all signal types - for
+                # Binance Futures signals it holds the ticker (e.g.
+                # "BTCUSDT"), not a DeFiLlama protocol slug. Deliberate, see
+                # this task's instructions - the schema/column isn't renamed.
+                protocol_slug=s.symbol,
+                triggered_at=evaluated_at,
+                source="Binance Futures",
+                metric_value=s.oi_growth_pct,
+                details_json=json.dumps({
+                    "lookback_hours": s.lookback_hours,
+                    "oi_growth_pct": s.oi_growth_pct,
+                    "price_change_pct": s.price_change_pct,
+                    "oi_now": s.oi_now,
+                    "oi_before": s.oi_before,
+                    "price_now": s.price_now,
+                    "price_before": s.price_before,
+                    "oi_growth_threshold_pct": signal_cfg["oi_growth_threshold_pct"],
+                    "price_change_threshold_pct": signal_cfg["price_change_threshold_pct"],
+                }),
             )
     finally:
         conn.close()

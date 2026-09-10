@@ -436,3 +436,32 @@ def save_signal_event(
         (signal_name, protocol_slug, triggered_at, source, metric_value, details_json),
     )
     conn.commit()
+
+
+def get_signal_events_since(
+    conn: sqlite3.Connection, signal_name: str, since_iso: str
+) -> list[sqlite3.Row]:
+    """All signal_events rows for `signal_name` triggered at or after
+    `since_iso`, newest first - used by scoring/ranker.py to aggregate
+    recent signals into a candidate score.
+
+    Same double-`datetime(...)`-wrap requirement as get_snapshot_days_before
+    / get_binance_oi_snapshot_hours_before above: `triggered_at` is stored as
+    Python's `datetime.isoformat()` ("2026-09-09T07:00:00+00:00"), not
+    SQLite's own `datetime(...)` output format ("2026-09-09 07:00:00").
+    Comparing the raw column against a raw `since_iso` string would compare
+    two different formats and sort wrong - both sides must go through
+    `datetime(...)` first to normalize to the same format. The `ORDER BY`
+    wraps `triggered_at` the same way: `isoformat()` drops the microsecond
+    part when it's exactly zero, so a handful of raw strings would be
+    shorter than the rest and could sort out of chronological order under
+    plain lexicographic comparison.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM signal_events
+        WHERE signal_name = ? AND datetime(triggered_at) >= datetime(?)
+        ORDER BY datetime(triggered_at) DESC
+        """,
+        (signal_name, since_iso),
+    ).fetchall()
