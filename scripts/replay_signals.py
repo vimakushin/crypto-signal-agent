@@ -30,7 +30,19 @@ the function that handles it:
     instead of silently counting as "evaluated, didn't fire" (see
     replay_revenue_price_gap); a pair is discarded if the real gap between
     the two dates is more than 1.5x the configured lookback_days (see
-    MAX_GAP_MULTIPLIER).
+    MAX_GAP_MULTIPLIER); the "earlier" point for each evaluated day is
+    looked up with storage.db.get_snapshot_days_before - the SAME production
+    function signals/revenue_price_gap.py's own scan_watchlist() calls,
+    which compares by full timestamp, not calendar date - so replay's
+    pairing can never silently diverge from what the live scan would have
+    picked, including on days where the dedupe step above had to choose
+    between several same-day rows; consecutive calendar days (no gap) where
+    the signal fired are collapsed into "episodes" (see
+    _collapse_daily_episodes), the same idea as oi_divergence's
+    _collapse_episodes below, because revenue_price_gap's 7-day rolling
+    comparison window keeps one real revenue spike visible as "fired" for
+    up to ~6-7 consecutive days in a row - left uncollapsed, that one event
+    would be counted as 6-7 separate triggers instead of one.
 
   - oi_divergence: binance_oi_snapshots mixes 4h-spaced backfilled points
     with 1h-spaced live-collector points - evaluating every raw row would
@@ -59,7 +71,6 @@ every historical point in turn instead of only the newest one.
 """
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 import sys
@@ -86,6 +97,7 @@ from storage.db import (  # noqa: E402
     get_binance_oi_snapshot_hours_before,
     get_coingecko_price_history_before,
     get_connection,
+    get_snapshot_days_before,
 )
 
 # Grid cadence oi_divergence replay evaluates on - matches
@@ -223,25 +235,58 @@ def _dedupe_defillama_rows_by_day(rows: list) -> list:
     return [best_by_day[d] for d in sorted(best_by_day)]
 
 
-def _closest_index_at_or_before(dates: list[date_cls], target: date_cls, hi: int) -> int | None:
-    """Index of the closest date <= target among dates[:hi] (an ascending
-    list of dates) - the in-memory equivalent of
-    storage.db.get_snapshot_days_before's "closest snapshot at or before"
-    semantics, applied to the deduped, in-memory per-protocol date list
-    built above instead of re-querying the (non-deduped) table.
+def _collapse_daily_episodes(entries: list[tuple[date_cls, bool | None]]) -> int:
+    """Number of continuous "episodes" in a chronological, per-calendar-day
+    fired sequence for ONE protocol - the revenue_price_gap equivalent of
+    oi_divergence's _collapse_episodes below, adapted for an irregular
+    (non-fixed-step) daily series instead of a fixed grid.
 
-    `hi` restricts the search to indices strictly before the point being
-    evaluated (passed as `bisect`'s own `hi` bound, not a list slice) - a
-    protocol with years of daily history would otherwise pay to copy an
-    ever-growing slice on every single iteration of the caller's loop.
+    An episode is a maximal run of CONSECUTIVE CALENDAR DAYS (no gap) where
+    the signal held True. Two things break a run, both deliberately: a
+    False/None flag (same as _collapse_episodes), AND a calendar-date gap
+    between two consecutive entries even if both are True - e.g. day 5 and
+    day 8 both firing, with no evaluated row for days 6-7 in between, is two
+    episodes, not one, because a real day of data is missing, not just
+    "didn't fire that day".
+
+    Args:
+        entries: (calendar date, fired) pairs for one protocol, in ascending
+            date order, one entry per evaluated (or skipped) day - fired is
+            True (fired), False (evaluated, did not fire), or None (this
+            day was skipped - no earlier pair, mcap=NULL, or gap too large;
+            see replay_revenue_price_gap).
+
+    Returns:
+        Number of episodes.
     """
-    idx = bisect.bisect_right(dates, target, hi=hi) - 1
-    return idx if idx >= 0 else None
+    episodes = 0
+    in_episode = False
+    prev_date: date_cls | None = None
+    for day, flag in entries:
+        contiguous = prev_date is not None and day == prev_date + timedelta(days=1)
+        if not contiguous:
+            in_episode = False
+        if flag:
+            if not in_episode:
+                episodes += 1
+            in_episode = True
+        else:
+            in_episode = False
+        prev_date = day
+    return episodes
 
 
 def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> dict:
     """Replay signals/revenue_price_gap.py's `_evaluate_snapshots` over every
     stored defillama_snapshots day for every watchlist protocol.
+
+    The "earlier" point for each evaluated day is looked up with
+    storage.db.get_snapshot_days_before - the SAME function
+    signals/revenue_price_gap.py's own scan_watchlist() calls in production,
+    which compares by full timestamp (not calendar date) - so this never
+    diverges from what the live signal would actually have paired, even on
+    a day where _dedupe_defillama_rows_by_day above had to pick among
+    several same-day rows for the "latest" side.
 
     Args:
         conn: open storage/db.py connection.
@@ -249,22 +294,45 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         signal_cfg: config.yaml signals.revenue_price_gap.
 
     Returns:
-        Dict with aggregate counts, a per-protocol breakdown, and the raw
-        revenue_change_Xd_pct values seen across all evaluated points (for
-        _describe).
+        Dict with aggregate raw-day-level and episode counts (see
+        _collapse_daily_episodes - one real revenue spike can stay visible
+        as "fired" for several consecutive days under revenue_price_gap's
+        rolling 7-day window, so the raw count alone overstates how many
+        distinct events actually happened), a per-protocol breakdown, and
+        the raw revenue_change_Xd_pct values seen across all evaluated
+        points (for _describe).
     """
     lookback_days = signal_cfg["lookback_days"]
+    # Same check signals/revenue_price_gap.py's scan_watchlist() raises for
+    # live use - duplicated here so a misconfigured lookback_days (config.yaml
+    # currently pins it to 7) doesn't silently make replay compare the wrong
+    # revenue window against a market-cap snapshot from a different number of
+    # days back if that value is ever changed.
+    if lookback_days not in (7, 30):
+        raise ValueError(
+            f"signals.revenue_price_gap.lookback_days in config.yaml must be 7 or 30 "
+            f"(DeFiLlama only pre-computes revenue growth for those two windows), got "
+            f"{lookback_days!r} - see signals/revenue_price_gap.py's scan_watchlist() docstring"
+        )
     revenue_threshold = signal_cfg["revenue_growth_threshold_pct"]
     mcap_threshold = signal_cfg["mcap_reaction_threshold_pct"]
     max_gap_days = lookback_days * MAX_GAP_MULTIPLIER
     revenue_col = "revenue_change_7d_pct" if lookback_days == 7 else "revenue_change_30d_pct"
+    # Same absolute-revenue column signals/revenue_price_gap.py's
+    # scan_watchlist() reads for its own min_revenue_total_usd check - NOT
+    # `revenue_col` above, which is the growth-% column, not the absolute
+    # total.
+    revenue_total_col = "revenue_total_7d" if lookback_days == 7 else "revenue_total_30d"
+    min_revenue_total_usd = signal_cfg.get("min_revenue_total_usd", 0)
 
     per_protocol: dict[str, dict] = {}
     evaluated_total = 0
-    fired_total = 0
+    fired_raw_total = 0
+    episodes_total = 0
     no_earlier_pair = 0
     excluded_no_mcap = 0
     excluded_gap_too_large = 0
+    excluded_liquidity = 0
     revenue_values: list[float] = []
 
     for slug in watchlist:
@@ -272,7 +340,9 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
             "SELECT * FROM defillama_snapshots WHERE protocol_slug = ? ORDER BY fetched_at ASC",
             (slug,),
         ).fetchall()
-        stats = {"evaluated": 0, "fired": 0, "raw_rows": len(rows), "deduped_days": 0}
+        stats = {
+            "evaluated": 0, "fired": 0, "episodes": 0, "raw_rows": len(rows), "deduped_days": 0,
+        }
         if not rows:
             per_protocol[slug] = stats
             continue
@@ -281,22 +351,50 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         dates = [_calendar_date(r["fetched_at"]) for r in deduped]
         stats["deduped_days"] = len(deduped)
 
+        entries: list[tuple[date_cls, bool | None]] = []
+
         for i, latest in enumerate(deduped):
             latest_date = dates[i]
-            target = latest_date - timedelta(days=lookback_days)
-            j = _closest_index_at_or_before(dates, target, hi=i)
-            if j is None:
-                no_earlier_pair += 1
+
+            # Liquidity/noise floor (TZ section 9) - same check and same
+            # column signals/revenue_price_gap.py's scan_watchlist() applies
+            # BEFORE looking up the earlier point, so replay never scores a
+            # point production would never even have evaluated.
+            revenue_total_now = latest[revenue_total_col]
+            if revenue_total_now is None or revenue_total_now < min_revenue_total_usd:
+                excluded_liquidity += 1
+                entries.append((latest_date, None))
                 continue
 
-            earlier = deduped[j]
-            real_gap_days = (latest_date - dates[j]).days
+            earlier = get_snapshot_days_before(conn, slug, latest["fetched_at"], lookback_days)
+            if earlier is None:
+                no_earlier_pair += 1
+                entries.append((latest_date, None))
+                continue
+
+            # Same min_revenue_total_usd floor as the `latest` check above,
+            # applied to `earlier` too - matches the fix in
+            # signals/revenue_price_gap.py's scan_watchlist(): a tiny
+            # EARLIER revenue can inflate revenue_growth_pct just as much as
+            # a tiny latest one, since it's the ratio's denominator.
+            earlier_revenue = earlier[revenue_total_col]
+            if earlier_revenue is None or earlier_revenue < min_revenue_total_usd:
+                excluded_liquidity += 1
+                entries.append((latest_date, None))
+                continue
+
+            real_gap_days = (
+                datetime.fromisoformat(latest["fetched_at"])
+                - datetime.fromisoformat(earlier["fetched_at"])
+            ).total_seconds() / 86400
             if real_gap_days > max_gap_days:
                 excluded_gap_too_large += 1
+                entries.append((latest_date, None))
                 continue
 
             if latest["mcap"] is None or earlier["mcap"] is None:
                 excluded_no_mcap += 1
+                entries.append((latest_date, None))
                 continue
 
             evaluated_total += 1
@@ -309,9 +407,15 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
             signal = revenue_price_gap._evaluate_snapshots(
                 latest, earlier, revenue_threshold, mcap_threshold, lookback_days,
             )
-            if signal is not None:
-                fired_total += 1
+            fired = signal is not None
+            entries.append((latest_date, fired))
+            if fired:
+                fired_raw_total += 1
                 stats["fired"] += 1
+
+        episodes = _collapse_daily_episodes(entries)
+        stats["episodes"] = episodes
+        episodes_total += episodes
 
         per_protocol[slug] = stats
 
@@ -321,10 +425,13 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         "revenue_threshold": revenue_threshold,
         "mcap_threshold": mcap_threshold,
         "evaluated_total": evaluated_total,
-        "fired_total": fired_total,
+        "fired_raw_total": fired_raw_total,
+        "episodes_total": episodes_total,
         "no_earlier_pair": no_earlier_pair,
         "excluded_no_mcap": excluded_no_mcap,
         "excluded_gap_too_large": excluded_gap_too_large,
+        "excluded_liquidity": excluded_liquidity,
+        "min_revenue_total_usd": min_revenue_total_usd,
         "per_protocol": per_protocol,
         "revenue_values": revenue_values,
     }
@@ -333,27 +440,43 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
 def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "revenue_price_gap: lookback_days=%d, revenue_growth_threshold_pct=%s, "
-        "mcap_reaction_threshold_pct=%s (config.yaml)",
+        "mcap_reaction_threshold_pct=%s, min_revenue_total_usd=%s (config.yaml)",
         result["lookback_days"], result["revenue_threshold"], result["mcap_threshold"],
+        result["min_revenue_total_usd"],
     )
     logger.info(
         "  Evaluated %d protocol-day point(s) total. Excluded from that count: %d with no "
         "earlier point at all yet (insufficient history), %d where either compared point "
         "had mcap=NULL (pre-CoinGecko-history era for that protocol), %d where the real "
         "gap between the two dates exceeded %.1fx the configured %d days (data hole "
-        "between backfill and live collection).",
+        "between backfill and live collection), %d where the latest point's revenue was "
+        "below the $%s liquidity floor (min_revenue_total_usd) - same filter "
+        "signals/revenue_price_gap.py's scan_watchlist() applies live, so these would never "
+        "have been evaluated in production either.",
         result["evaluated_total"], result["no_earlier_pair"], result["excluded_no_mcap"],
         result["excluded_gap_too_large"], MAX_GAP_MULTIPLIER, result["lookback_days"],
+        result["excluded_liquidity"], result["min_revenue_total_usd"],
     )
-    rate = 100 * result["fired_total"] / result["evaluated_total"] if result["evaluated_total"] else 0.0
-    logger.info("  Signal would have FIRED on %d/%d evaluated points (%.2f%%).",
-                result["fired_total"], result["evaluated_total"], rate)
-    logger.info("  Per protocol (evaluated / fired / raw rows in DB / deduped calendar days):")
+    rate = (
+        100 * result["fired_raw_total"] / result["evaluated_total"] if result["evaluated_total"] else 0.0
+    )
+    logger.info(
+        "  Raw protocol-days where the condition held: %d/%d (%.2f%%). Collapsed into %d "
+        "continuous episode(s) - the more meaningful count: revenue_price_gap compares "
+        "against a ROLLING 7-day window, so one real revenue spike can stay visible as "
+        "'fired' for up to ~6-7 consecutive days in a row and must not be counted as 6-7 "
+        "separate triggers.",
+        result["fired_raw_total"], result["evaluated_total"], rate, result["episodes_total"],
+    )
+    logger.info(
+        "  Per protocol (evaluated / raw fired days / episodes / raw rows in DB / deduped "
+        "calendar days):"
+    )
     for slug in sorted(result["per_protocol"]):
         s = result["per_protocol"][slug]
         logger.info(
-            "    %-24s evaluated=%-5d fired=%-4d raw_rows=%-5d deduped_days=%-5d",
-            slug, s["evaluated"], s["fired"], s["raw_rows"], s["deduped_days"],
+            "    %-24s evaluated=%-5d raw_fired=%-4d episodes=%-3d raw_rows=%-5d deduped_days=%-5d",
+            slug, s["evaluated"], s["fired"], s["episodes"], s["raw_rows"], s["deduped_days"],
         )
     logger.info("  %s", _describe(
         result["revenue_values"], f"{result['revenue_col']} distribution over evaluated points"
@@ -439,11 +562,13 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
     lookback_hours = signal_cfg["lookback_hours"]
     oi_threshold = signal_cfg["oi_growth_threshold_pct"]
     price_threshold = signal_cfg["price_change_threshold_pct"]
+    min_oi_value_usdt = signal_cfg.get("min_oi_value_usdt", 0)
 
     per_symbol_raw: dict[str, dict] = {}
     per_symbol_episodes: dict[str, int] = {}
     evaluated_total = 0
     insufficient_total = 0
+    insufficient_liquidity_total = 0
     fired_raw_total = 0
     episodes_total = 0
     oi_growth_values: list[float] = []
@@ -472,6 +597,15 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
             if latest is None:
                 fired_flags.append(None)
                 insufficient_total += 1
+                continue
+
+            # Liquidity/noise floor (TZ section 9) - same check
+            # signals/oi_divergence.py's scan_watchlist() applies live,
+            # BEFORE looking up the earlier point, so replay never scores a
+            # grid-point production would never even have evaluated.
+            if latest["oi_value_usdt"] is None or latest["oi_value_usdt"] < min_oi_value_usdt:
+                fired_flags.append(None)
+                insufficient_liquidity_total += 1
                 continue
 
             earlier = get_binance_oi_snapshot_hours_before(
@@ -520,8 +654,10 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
         "lookback_hours": lookback_hours,
         "oi_threshold": oi_threshold,
         "price_threshold": price_threshold,
+        "min_oi_value_usdt": min_oi_value_usdt,
         "evaluated_total": evaluated_total,
         "insufficient_total": insufficient_total,
+        "insufficient_liquidity_total": insufficient_liquidity_total,
         "fired_raw_total": fired_raw_total,
         "episodes_total": episodes_total,
         "per_symbol_raw": per_symbol_raw,
@@ -534,16 +670,20 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
 def _report_oi_divergence(result: dict) -> None:
     logger.info(
         "oi_divergence: lookback_hours=%d, oi_growth_threshold_pct=%s, "
-        "price_change_threshold_pct=%s (config.yaml); replay grid step=%dh "
-        "(resampled from mixed 1h/4h stored granularity - see module docstring)",
+        "price_change_threshold_pct=%s, min_oi_value_usdt=%s (config.yaml); replay grid "
+        "step=%dh (resampled from mixed 1h/4h stored granularity - see module docstring)",
         result["lookback_hours"], result["oi_threshold"], result["price_threshold"],
-        GRID_STEP_HOURS,
+        result["min_oi_value_usdt"], GRID_STEP_HOURS,
     )
     logger.info(
         "  Evaluated %d grid-point(s) across the whole watchlist (%d grid-point(s) skipped "
         "for insufficient history at that point in time - no stored data yet, or not far "
-        "enough back to compare).",
+        "enough back to compare; %d grid-point(s) skipped for Open Interest below the $%s "
+        "liquidity floor (min_oi_value_usdt) - same filter signals/oi_divergence.py's "
+        "scan_watchlist() applies live, so these would never have been evaluated in "
+        "production either).",
         result["evaluated_total"], result["insufficient_total"],
+        result["insufficient_liquidity_total"], result["min_oi_value_usdt"],
     )
     rate = 100 * result["fired_raw_total"] / result["evaluated_total"] if result["evaluated_total"] else 0.0
     logger.info(
@@ -612,12 +752,14 @@ def replay_volume_breakout(
     ratio_threshold = signal_cfg["volume_ratio_threshold"]
     min_resistance_values = math.ceil(resistance_days * volume_breakout.MIN_HISTORY_COVERAGE_FRACTION)
     min_volume_values = math.ceil(volume_days * volume_breakout.MIN_HISTORY_COVERAGE_FRACTION)
+    min_volume_avg_usd = signal_cfg.get("min_volume_avg_usd", 0)
 
     per_protocol: dict[str, dict] = {}
     latest_dates: dict[str, str] = {}
     evaluated_total = 0
     fired_total = 0
     insufficient_total = 0
+    insufficient_liquidity_total = 0
     early_period_total = 0
     mature_period_total = 0
     early_fired = 0
@@ -656,6 +798,18 @@ def replay_volume_breakout(
                 insufficient_total += 1
                 continue
 
+            # Liquidity/noise floor (TZ section 9) - same check and same
+            # `volume_avg` (already coverage-checked volume_values, average
+            # over volume_avg_lookback_days) signals/volume_breakout.py's
+            # scan_watchlist() applies live, BEFORE calling _evaluate, so
+            # replay never scores a point production would never even have
+            # evaluated. Computed once here and reused below for
+            # volume_ratio_values, not a second divergent computation.
+            volume_avg = sum(volume_values) / len(volume_values)
+            if volume_avg < min_volume_avg_usd:
+                insufficient_liquidity_total += 1
+                continue
+
             evaluated_total += 1
             stats["evaluated"] += 1
 
@@ -678,8 +832,20 @@ def replay_volume_breakout(
             # volume_values) exactly; volume_values itself is already
             # filtered by the real volume_breakout._valid_volumes(), so this
             # is not a second, divergent implementation of any signal logic.
-            volume_avg = sum(volume_values) / len(volume_values)
-            if volume_avg:
+            #
+            # `latest["price"]`/`latest["volume"]` truthy (not just non-NULL,
+            # already checked above by this loop's own entry filter) matters
+            # here specifically: _evaluate()'s FIRST line is
+            # `if not price_now or not volume_now: return None`, which stops
+            # BEFORE computing volume_ratio for a stored zero (not just a
+            # NULL) price/volume - without this same truthy check here,
+            # those zero points would still land in volume_ratio_values as
+            # "phantom" 0.0 entries the real signal never actually computes,
+            # dragging down this distribution's min/median for no reason.
+            # (volume_avg itself was already computed above, for the
+            # min_volume_avg_usd liquidity check - reused here as-is, not
+            # recomputed.)
+            if volume_avg and latest["price"] and latest["volume"]:
                 volume_ratio_values.append(latest["volume"] / volume_avg)
 
             signal = volume_breakout._evaluate(
@@ -700,9 +866,11 @@ def replay_volume_breakout(
         "resistance_days": resistance_days,
         "volume_days": volume_days,
         "ratio_threshold": ratio_threshold,
+        "min_volume_avg_usd": min_volume_avg_usd,
         "evaluated_total": evaluated_total,
         "fired_total": fired_total,
         "insufficient_total": insufficient_total,
+        "insufficient_liquidity_total": insufficient_liquidity_total,
         "early_period_total": early_period_total,
         "mature_period_total": mature_period_total,
         "early_fired": early_fired,
@@ -716,15 +884,20 @@ def replay_volume_breakout(
 def _report_volume_breakout(result: dict) -> None:
     logger.info(
         "volume_breakout: resistance_lookback_days=%d, volume_avg_lookback_days=%d, "
-        "volume_ratio_threshold=%s (config.yaml)",
+        "volume_ratio_threshold=%s, min_volume_avg_usd=%s (config.yaml)",
         result["resistance_days"], result["volume_days"], result["ratio_threshold"],
+        result["min_volume_avg_usd"],
     )
     logger.info(
         "  Evaluated %d protocol-day point(s) total (%d skipped for insufficient trailing "
         "history - below the %.0f%% coverage floor for the resistance and/or volume "
-        "window; see signals/volume_breakout.py's MIN_HISTORY_COVERAGE_FRACTION).",
+        "window; see signals/volume_breakout.py's MIN_HISTORY_COVERAGE_FRACTION; %d skipped "
+        "for average daily volume below the $%s liquidity floor (min_volume_avg_usd) - same "
+        "filter signals/volume_breakout.py's scan_watchlist() applies live, so these would "
+        "never have been evaluated in production either).",
         result["evaluated_total"], result["insufficient_total"],
         volume_breakout.MIN_HISTORY_COVERAGE_FRACTION * 100,
+        result["insufficient_liquidity_total"], result["min_volume_avg_usd"],
     )
     early_rate = (100 * result["early_fired"] / result["early_period_total"]
                   if result["early_period_total"] else 0.0)

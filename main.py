@@ -160,25 +160,31 @@ def run_defillama_cycle(config: dict) -> None:
                 revenue_growth_threshold_pct=revenue_signal_cfg["revenue_growth_threshold_pct"],
                 mcap_reaction_threshold_pct=revenue_signal_cfg["mcap_reaction_threshold_pct"],
                 lookback_days=revenue_signal_cfg["lookback_days"],
+                min_revenue_total_usd=revenue_signal_cfg.get("min_revenue_total_usd", 0),
             )
 
-            # Two distinct reasons for "no candidates" - conflating them into
-            # one line misleads the user either way: "needs more history"
-            # reads as a data problem when the real market simply didn't
-            # cross the threshold, and vice versa.
-            evaluated = len(watchlist) - len(result.insufficient_history)
+            # Three distinct reasons for "no candidates" - conflating them
+            # into one line misleads the user either way: "needs more
+            # history" reads as a data problem, "too small to trust" reads
+            # as a data problem too but a DIFFERENT one, and either
+            # obscures "the real market simply didn't cross the threshold".
+            evaluated = (
+                len(watchlist) - len(result.insufficient_history) - len(result.insufficient_liquidity)
+            )
             logger.info(
                 "revenue_price_gap: %d/%d protocols evaluated (%d still need >= %s days of "
-                "collected history to compare market cap), %d candidate(s) found",
+                "collected history to compare market cap, %d skipped for revenue below the "
+                "$%s liquidity floor), %d candidate(s) found",
                 evaluated, len(watchlist), len(result.insufficient_history),
-                revenue_signal_cfg["lookback_days"], len(result.signals),
+                revenue_signal_cfg["lookback_days"], len(result.insufficient_liquidity),
+                revenue_signal_cfg.get("min_revenue_total_usd", 0), len(result.signals),
             )
             for s in result.signals:
                 logger.info(
-                    "revenue_price_gap FIRED: %s (%s) revenue +%.1f%% over %dd, "
-                    "mcap only +%.1f%%",
+                    "revenue_price_gap FIRED: %s (%s) revenue +%.1f%% over %dd (configured), "
+                    "actual gap between compared snapshots %.1fd, mcap only +%.1f%%",
                     s.protocol_slug, s.symbol, s.revenue_growth_pct,
-                    s.lookback_days, s.mcap_growth_pct,
+                    s.lookback_days, s.actual_lookback_days, s.mcap_growth_pct,
                 )
 
         if volume_signal_cfg.get("enabled", True):
@@ -272,17 +278,22 @@ def _run_volume_breakout(
         resistance_lookback_days=signal_cfg["resistance_lookback_days"],
         volume_avg_lookback_days=signal_cfg["volume_avg_lookback_days"],
         volume_ratio_threshold=signal_cfg["volume_ratio_threshold"],
+        min_volume_avg_usd=signal_cfg.get("min_volume_avg_usd", 0),
     )
 
     # Same "why zero candidates" distinction as the other two signals: not
-    # enough stored history yet vs. evaluated but nobody crossed the
-    # threshold.
-    evaluated = len(watchlist) - len(result.insufficient_history)
+    # enough stored history yet vs. too thin to trust vs. evaluated but
+    # nobody crossed the threshold.
+    evaluated = (
+        len(watchlist) - len(result.insufficient_history) - len(result.insufficient_liquidity)
+    )
     logger.info(
         "volume_breakout: %d/%d protocols evaluated (%d still need more collected "
-        "price/volume history - see signals/volume_breakout.py's coverage rule), "
-        "%d candidate(s) found",
-        evaluated, len(watchlist), len(result.insufficient_history), len(result.signals),
+        "price/volume history - see signals/volume_breakout.py's coverage rule, %d skipped "
+        "for average daily volume below the $%s liquidity floor), %d candidate(s) found",
+        evaluated, len(watchlist), len(result.insufficient_history),
+        len(result.insufficient_liquidity), signal_cfg.get("min_volume_avg_usd", 0),
+        len(result.signals),
     )
     for s in result.signals:
         logger.info(
@@ -354,18 +365,23 @@ def run_binance_futures_cycle(config: dict) -> None:
             oi_growth_threshold_pct=signal_cfg["oi_growth_threshold_pct"],
             price_change_threshold_pct=signal_cfg["price_change_threshold_pct"],
             lookback_hours=lookback_hours,
+            min_oi_value_usdt=signal_cfg.get("min_oi_value_usdt", 0),
         )
 
         # Same "why zero candidates" distinction as revenue_price_gap: not
-        # enough stored history yet vs. evaluated but nobody crossed the
-        # threshold - conflating the two misleads the user about whether
-        # there's a data problem or just a quiet market.
-        evaluated = len(watchlist) - len(result.insufficient_history)
+        # enough stored history yet vs. too thin to trust vs. evaluated but
+        # nobody crossed the threshold - conflating these misleads the user
+        # about whether there's a data problem or just a quiet market.
+        evaluated = (
+            len(watchlist) - len(result.insufficient_history) - len(result.insufficient_liquidity)
+        )
         logger.info(
             "oi_divergence: %d/%d symbols evaluated (%d still need >= %sh of collected "
-            "OI history to compare), %d candidate(s) found",
+            "OI history to compare, %d skipped for Open Interest below the $%s liquidity "
+            "floor), %d candidate(s) found",
             evaluated, len(watchlist), len(result.insufficient_history),
-            lookback_hours, len(result.signals),
+            lookback_hours, len(result.insufficient_liquidity),
+            signal_cfg.get("min_oi_value_usdt", 0), len(result.signals),
         )
         for s in result.signals:
             logger.info(

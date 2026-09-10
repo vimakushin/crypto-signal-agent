@@ -72,6 +72,12 @@ class VolumeBreakoutScanResult:
     # price/volume row yet, or not enough trailing history to trust a
     # resistance level / volume average (see MIN_HISTORY_COVERAGE_FRACTION).
     insufficient_history: list[str] = field(default_factory=list)
+    # Protocol slugs skipped because the trailing volume_avg is below
+    # config.yaml's min_volume_avg_usd - kept separate from
+    # insufficient_history: there IS enough history here, it just describes
+    # a coin too thin to trust a "breakout on volume" reading from (TZ
+    # section 9's low-liquidity noise risk).
+    insufficient_liquidity: list[str] = field(default_factory=list)
 
 
 def _valid_prices(rows: list[sqlite3.Row]) -> list[float]:
@@ -164,6 +170,7 @@ def scan_watchlist(
     resistance_lookback_days: int,
     volume_avg_lookback_days: int,
     volume_ratio_threshold: float,
+    min_volume_avg_usd: float = 0,
 ) -> VolumeBreakoutScanResult:
     """Run the signal for every watchlist protocol using stored CoinGecko
     price/volume history.
@@ -181,13 +188,19 @@ def scan_watchlist(
             signals.volume_breakout.volume_avg_lookback_days (30 per the TZ).
         volume_ratio_threshold: config.yaml
             signals.volume_breakout.volume_ratio_threshold.
+        min_volume_avg_usd: minimum trailing average daily volume in USD
+            (config.yaml signals.volume_breakout.min_volume_avg_usd) a
+            protocol's volume_avg must clear before it's even evaluated -
+            see VolumeBreakoutScanResult.insufficient_liquidity. Defaults to
+            0 (no filtering) so existing callers that don't pass it keep
+            working unchanged.
 
     Returns:
         A VolumeBreakoutScanResult: `.signals` for every protocol that
-        triggered, and `.insufficient_history` for protocols skipped
-        because there's no known gecko_id, no stored price/volume row yet,
-        or not enough trailing VALID (non-NULL - see _valid_prices/
-        _valid_volumes) history in either comparison window to trust (see
+        triggered, `.insufficient_history` for protocols skipped because
+        there's no known gecko_id, no stored price/volume row yet, or not
+        enough trailing VALID (non-NULL - see _valid_prices/_valid_volumes)
+        history in either comparison window to trust (see
         MIN_HISTORY_COVERAGE_FRACTION) - expected on the first few runs
         before scripts/backfill_history.py has been run, or for a newly
         added watchlist protocol. The coverage check counts already-
@@ -198,9 +211,12 @@ def scan_watchlist(
         volume - counting raw rows there would let the coverage check pass
         on a resistance level / volume average actually built from far
         fewer real data points than MIN_HISTORY_COVERAGE_FRACTION promises.
+        `.insufficient_liquidity` lists protocols skipped because their
+        trailing volume_avg is below `min_volume_avg_usd`.
     """
     signals: list[VolumeBreakoutSignal] = []
     insufficient_history: list[str] = []
+    insufficient_liquidity: list[str] = []
 
     min_resistance_values = math.ceil(resistance_lookback_days * MIN_HISTORY_COVERAGE_FRACTION)
     min_volume_values = math.ceil(volume_avg_lookback_days * MIN_HISTORY_COVERAGE_FRACTION)
@@ -231,6 +247,17 @@ def scan_watchlist(
             insufficient_history.append(slug)
             continue
 
+        # sum()/len() here, not a second implementation of _evaluate's ratio
+        # math - just the average needed to gate on min_volume_avg_usd BEFORE
+        # calling _evaluate, so a too-thin coin lands in the distinguishable
+        # insufficient_liquidity bucket instead of a plain "didn't fire".
+        # volume_values is already the same coverage-checked list _evaluate
+        # itself would use to compute the identical average.
+        volume_avg = sum(volume_values) / len(volume_values)
+        if volume_avg < min_volume_avg_usd:
+            insufficient_liquidity.append(slug)
+            continue
+
         signal = _evaluate(
             latest, resistance_prices, volume_values,
             resistance_lookback_days, volume_avg_lookback_days, volume_ratio_threshold,
@@ -238,4 +265,8 @@ def scan_watchlist(
         if signal is not None:
             signals.append(signal)
 
-    return VolumeBreakoutScanResult(signals=signals, insufficient_history=insufficient_history)
+    return VolumeBreakoutScanResult(
+        signals=signals,
+        insufficient_history=insufficient_history,
+        insufficient_liquidity=insufficient_liquidity,
+    )

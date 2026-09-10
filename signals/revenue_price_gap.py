@@ -12,10 +12,30 @@ signal only starts firing once the collector has run for at least
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from storage.db import get_latest_snapshot, get_snapshot_days_before
+
+logger = logging.getLogger(__name__)
+
+# A pair is rejected (not scored) if the real elapsed time between `earlier`
+# and `latest` exceeds this multiple of the configured `lookback_days`.
+# storage.db.get_snapshot_days_before returns the closest stored snapshot AT
+# OR BEFORE the target date, not necessarily exactly at it - a gap in daily
+# collection (e.g. a source outage - CoinGecko has already returned 429s
+# during this project's own runs) can push "earlier" further back than
+# requested, which would silently compare latest's ~7-day revenue growth
+# (a number DeFiLlama itself computes over ITS OWN 7 days) against a
+# market-cap change measured over a longer window - violating TZ 4.5's "same
+# window" requirement without saying so. Same 1.5x ratio, and same rationale,
+# as scripts/replay_signals.py's own MAX_GAP_MULTIPLIER (duplicated here
+# rather than imported, since this module must not depend on a one-off
+# analysis script, and the two constants are simple enough that keeping them
+# in sync by inspection is not a burden).
+MAX_GAP_MULTIPLIER = 1.5
 
 
 @dataclass
@@ -23,6 +43,15 @@ class RevenueGapSignal:
     protocol_slug: str
     symbol: str | None
     lookback_days: int
+    # Actual elapsed time between the two compared snapshots, in days - NOT
+    # the configured `lookback_days` above. See MAX_GAP_MULTIPLIER: storage
+    # can have gaps, so the closest available "earlier" snapshot can sit
+    # further back than requested. Reporting the configured number instead
+    # of what actually elapsed would silently misstate the window a
+    # calibrated threshold (e.g. 30% growth) was applied to - same
+    # reasoning as signals/oi_divergence.py's own `lookback_hours` field on
+    # OiDivergenceSignal, which stores the actual, not configured, value.
+    actual_lookback_days: float
     revenue_growth_pct: float
     mcap_growth_pct: float
     revenue_total: float
@@ -43,6 +72,33 @@ class RevenueGapScanResult:
     # market cap on the latest snapshot, or no snapshot far enough back to
     # compare against `lookback_days` (first runs / short history).
     insufficient_history: list[str] = field(default_factory=list)
+    # Protocol slugs skipped because EITHER the latest OR the earlier
+    # snapshot's revenue for `lookback_days` is below config.yaml's
+    # min_revenue_total_usd - checked on both sides of the comparison, not
+    # just the latest one, since revenue_growth_pct is a ratio and a tiny
+    # EARLIER revenue can inflate it just as much as a tiny latest one.
+    # Kept separate from insufficient_history: this is not "not enough data
+    # yet", it's "there IS a number, and it's too small to mean anything"
+    # (the "tiny base, giant percent" artifact - see scan_watchlist).
+    insufficient_liquidity: list[str] = field(default_factory=list)
+
+
+def _days_between(later_iso: str, earlier_iso: str) -> float:
+    """Actual elapsed time between two stored snapshot timestamps, in days.
+
+    Mirrors signals/oi_divergence.py's `_hours_between` - see
+    MAX_GAP_MULTIPLIER above for why this matters here too.
+
+    Args:
+        later_iso: ISO 8601 timestamp of the more recent snapshot.
+        earlier_iso: ISO 8601 timestamp of the older snapshot.
+
+    Returns:
+        Elapsed time between the two timestamps, in days.
+    """
+    later = datetime.fromisoformat(later_iso)
+    earlier = datetime.fromisoformat(earlier_iso)
+    return (later - earlier).total_seconds() / 86400
 
 
 def _evaluate_snapshots(
@@ -51,11 +107,114 @@ def _evaluate_snapshots(
     revenue_growth_threshold_pct: float,
     mcap_reaction_threshold_pct: float,
     lookback_days: int,
+    actual_lookback_days: float | None = None,
 ) -> RevenueGapSignal | None:
+    """Compare one (latest, earlier) pair of stored DeFiLlama snapshots.
+
+    Args:
+        latest: most recent defillama_snapshots row for a protocol.
+        earlier: the row closest to (latest - lookback_days) for the same
+            protocol.
+        revenue_growth_threshold_pct: see config.yaml
+            signals.revenue_price_gap.revenue_growth_threshold_pct.
+        mcap_reaction_threshold_pct: see config.yaml
+            signals.revenue_price_gap.mcap_reaction_threshold_pct.
+        lookback_days: configured comparison window (7 or 30).
+        actual_lookback_days: real elapsed time between `earlier` and
+            `latest` (see _days_between) - carried through to the returned
+            signal for transparency, and checked against
+            MAX_GAP_MULTIPLIER below. Defaults to None for
+            scripts/replay_signals.py's own callers, which already apply
+            their own, separate gap exclusion (MAX_GAP_MULTIPLIER there)
+            BEFORE calling this function and don't need a second check
+            here; when None, this function skips the gap guard entirely and
+            reports `actual_lookback_days=lookback_days` on the returned
+            signal (i.e. "assume no gap"), matching replay's pre-existing
+            behavior exactly.
+    """
+    if actual_lookback_days is not None and actual_lookback_days > lookback_days * MAX_GAP_MULTIPLIER:
+        logger.warning(
+            "revenue_price_gap: '%s' - skipping, real gap between compared snapshots is "
+            "%.1f days, more than %.1fx the configured lookback_days (%d) - a collector gap "
+            "(e.g. a source outage) likely pushed the 'earlier' snapshot further back than "
+            "requested, which would compare latest's revenue growth (computed by DeFiLlama "
+            "over its own %d-day window) against a market-cap change measured over a longer "
+            "window than that - not 'the same window' as TZ 4.5 requires",
+            latest["protocol_slug"], actual_lookback_days, MAX_GAP_MULTIPLIER, lookback_days,
+            lookback_days,
+        )
+        return None
+
     revenue_growth_pct = (
         latest["revenue_change_7d_pct"] if lookback_days == 7 else latest["revenue_change_30d_pct"]
     )
     if revenue_growth_pct is None or revenue_growth_pct < revenue_growth_threshold_pct:
+        return None
+
+    # Defends the live path against the same formula flaw backfill_history.py's
+    # _compute_revenue_rollups guards against on the historical path (see that
+    # function's docstring): (total - prior) / prior * 100 only means "percent
+    # growth" if `prior` (the base-period revenue) is POSITIVE. DeFiLlama's own
+    # /overview/fees endpoint computes revenue_change_7d_pct/change_30dover30d
+    # itself - we don't control its math - and can hand back exactly this same
+    # shape of number for a protocol with a negative base period (confirmed
+    # live for nexus-mutual, an insurance protocol where payouts can exceed
+    # premiums - a real business outcome, not a data bug). With a negative
+    # base, a protocol whose losses got WORSE (more negative) can come out as
+    # a large POSITIVE percentage - which would then look exactly like real
+    # growth to the `revenue_growth_threshold_pct` check above.
+    #
+    # `earlier`'s own revenue_total_{7,30}d is the right proxy for that base
+    # period: earlier's snapshot was fetched ~lookback_days before latest's,
+    # so earlier's own trailing-N-day total covers (almost) exactly the same
+    # calendar window DeFiLlama's growth formula would have used as its
+    # denominator for latest's pct - see backfill_history.py's
+    # _compute_revenue_rollups docstring for the exact window match.
+    revenue_total_col = "revenue_total_7d" if lookback_days == 7 else "revenue_total_30d"
+    base_revenue = earlier[revenue_total_col]
+    # `is None or` (not just `<= 0`): `earlier` can legitimately have no
+    # value at all for this column - collectors/defillama.py reads it via
+    # fee_entry.get("total7d"), which is None whenever DeFiLlama's own
+    # response omits that field for this protocol/day. A missing base is
+    # exactly the situation this guard exists to block (see the guard's own
+    # comment above and below): with no base value, `revenue_growth_pct`
+    # (computed by DeFiLlama itself, not by us, from whatever base IT had)
+    # cannot be trusted to describe a real percentage change either, so it
+    # must be blocked here too, not just the base<=0 case.
+    if base_revenue is None or base_revenue <= 0:
+        logger.warning(
+            "revenue_price_gap: '%s' - skipping, base-period revenue (%s, ~%dd window "
+            "ending %s) is missing or <= 0, so this protocol's revenue_growth_pct (%.2f%%) "
+            "is not a meaningful percentage (missing/negative/zero denominator makes the "
+            "growth formula's result meaningless or its sign flip - see this function's "
+            "comment)",
+            latest["protocol_slug"], base_revenue, lookback_days, earlier["fetched_at"],
+            revenue_growth_pct,
+        )
+        return None
+
+    # Blocks the signal, distinct reason from the base_revenue guard above:
+    # even when the arithmetic above is not broken (positive base, so the %
+    # itself is well-defined), a NEGATIVE/ZERO revenue on the CURRENT period
+    # makes the signal self-contradictory in practice - "revenue grew by
+    # N%" while simultaneously reporting a negative/zero revenue right now
+    # doesn't describe anything actionable, even though the number itself
+    # is not mathematically wrong. Confirmed live for insurance protocols
+    # like nexus-mutual, where payouts can exceed premiums in some windows.
+    revenue_total_now = latest[revenue_total_col]
+    # `is None or` (not just `<= 0`) for the same reason as the base_revenue
+    # guard above: a missing current-period total (collectors/defillama.py's
+    # fee_entry.get("total7d") returning None) is just as unable to support
+    # "revenue grew by N%" as a negative/zero one - there's no current
+    # revenue number to point at at all.
+    if revenue_total_now is None or revenue_total_now <= 0:
+        logger.warning(
+            "revenue_price_gap: '%s' - skipping, latest %dd revenue total is missing, "
+            "negative or zero (%s) - revenue_growth_pct (%.2f%%) is arithmetically valid "
+            "here (base period was positive) but reporting that as '%% growth' for a "
+            "protocol with no meaningful revenue right now is not meaningful",
+            latest["protocol_slug"], lookback_days, revenue_total_now, revenue_growth_pct,
+        )
         return None
 
     mcap_now = latest["mcap"]
@@ -75,6 +234,9 @@ def _evaluate_snapshots(
         protocol_slug=latest["protocol_slug"],
         symbol=latest["symbol"],
         lookback_days=lookback_days,
+        actual_lookback_days=(
+            actual_lookback_days if actual_lookback_days is not None else float(lookback_days)
+        ),
         revenue_growth_pct=revenue_growth_pct,
         mcap_growth_pct=mcap_growth_pct,
         revenue_total=latest["revenue_total_7d"] if lookback_days == 7 else latest["revenue_total_30d"],
@@ -89,6 +251,7 @@ def scan_watchlist(
     revenue_growth_threshold_pct: float,
     mcap_reaction_threshold_pct: float,
     lookback_days: int,
+    min_revenue_total_usd: float = 0,
 ) -> RevenueGapScanResult:
     """Run the signal for every watchlist protocol using stored snapshot history.
 
@@ -97,7 +260,25 @@ def scan_watchlist(
     latest snapshot, or no snapshot far enough back to compare against
     `lookback_days` - expected on the first few collector runs, not just an
     empty `.signals` list indistinguishable from "evaluated, but none
-    crossed the threshold".
+    crossed the threshold". `.insufficient_liquidity` (TZ section 9's
+    low-liquidity noise risk) lists protocols skipped because EITHER the
+    latest OR the earlier snapshot's revenue for `lookback_days` is below
+    `min_revenue_total_usd` (config.yaml
+    signals.revenue_price_gap.min_revenue_total_usd) - a protocol whose
+    revenue on either side of the comparison is only a few hundred dollars
+    can show a huge, technically-correct growth percentage off a base
+    that's too small to be meaningful (the same "tiny base, giant percent"
+    shape as the negative-revenue formula issue _evaluate_snapshots already
+    guards, but for small POSITIVE bases instead of negative ones - checked
+    on the earlier side too, since revenue_growth_pct is a ratio and a tiny
+    denominator inflates it regardless of which side of the pair it's on).
+
+    Args:
+        min_revenue_total_usd: minimum absolute revenue (USD) over
+            `lookback_days` BOTH the latest and the earlier snapshot must
+            have before a protocol is evaluated - see above. Defaults to 0
+            (no filtering) so existing callers that don't pass it keep
+            working unchanged.
 
     Raises:
         ValueError: if `lookback_days` isn't 7 or 30. DeFiLlama (and
@@ -121,8 +302,11 @@ def scan_watchlist(
             f"{lookback_days!r} - see this function's docstring"
         )
 
+    revenue_total_col = "revenue_total_7d" if lookback_days == 7 else "revenue_total_30d"
+
     signals: list[RevenueGapSignal] = []
     insufficient_history: list[str] = []
+    insufficient_liquidity: list[str] = []
 
     for slug in watchlist_slugs:
         latest = get_latest_snapshot(conn, slug)
@@ -130,16 +314,43 @@ def scan_watchlist(
             insufficient_history.append(slug)
             continue
 
+        revenue_total_now = latest[revenue_total_col]
+        if revenue_total_now is None or revenue_total_now < min_revenue_total_usd:
+            insufficient_liquidity.append(slug)
+            continue
+
         earlier = get_snapshot_days_before(conn, slug, latest["fetched_at"], lookback_days)
         if earlier is None:
             insufficient_history.append(slug)
             continue
 
+        # Same min_revenue_total_usd floor as the `latest` check above,
+        # applied to `earlier` too: revenue_growth_pct is a RATIO
+        # (latest revenue / earlier revenue), so a tiny EARLIER revenue can
+        # produce a huge, technically-correct-looking growth percentage even
+        # when the LATEST revenue comfortably clears the floor by itself -
+        # confirmed live for jupiter-aggregator (2024-12-23,
+        # revenue_total_7d=$1,573,751, revenue_change_7d_pct=3421097%,
+        # implying a ~$46 base week for an established multi-million-dollar
+        # protocol - a data hole in DeFiLlama's totalDataChart for that
+        # week, not a real business event). Checking only the numerator's
+        # scale, as before, let exactly this kind of point through.
+        earlier_revenue = earlier[revenue_total_col]
+        if earlier_revenue is None or earlier_revenue < min_revenue_total_usd:
+            insufficient_liquidity.append(slug)
+            continue
+
+        actual_lookback_days = _days_between(latest["fetched_at"], earlier["fetched_at"])
         signal = _evaluate_snapshots(
             latest, earlier,
             revenue_growth_threshold_pct, mcap_reaction_threshold_pct, lookback_days,
+            actual_lookback_days,
         )
         if signal is not None:
             signals.append(signal)
 
-    return RevenueGapScanResult(signals=signals, insufficient_history=insufficient_history)
+    return RevenueGapScanResult(
+        signals=signals,
+        insufficient_history=insufficient_history,
+        insufficient_liquidity=insufficient_liquidity,
+    )

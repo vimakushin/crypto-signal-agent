@@ -50,6 +50,13 @@ class OiDivergenceScanResult:
     # Symbols skipped because there's no stored snapshot yet, or no stored
     # snapshot old enough to compare against (first runs / short history).
     insufficient_history: list[str] = field(default_factory=list)
+    # Symbols skipped because the latest snapshot's oi_value_usdt is below
+    # config.yaml's min_oi_value_usdt - kept separate from
+    # insufficient_history: this isn't "not enough data yet", it's "there IS
+    # data, and the position size behind it is too thin to trust as a real
+    # signal rather than noise from a handful of orders" (TZ section 9's
+    # low-liquidity risk).
+    insufficient_liquidity: list[str] = field(default_factory=list)
 
 
 def _hours_between(later_iso: str, earlier_iso: str) -> float:
@@ -140,6 +147,7 @@ def scan_watchlist(
     oi_growth_threshold_pct: float,
     price_change_threshold_pct: float,
     lookback_hours: int,
+    min_oi_value_usdt: float = 0,
 ) -> OiDivergenceScanResult:
     """Run the signal for every watchlist symbol using stored OI history.
 
@@ -155,24 +163,42 @@ def scan_watchlist(
             between the two points used for evaluation and reporting may
             differ slightly if the stored history has gaps; see
             _hours_between.
+        min_oi_value_usdt: minimum Open Interest in USD (config.yaml
+            signals.oi_divergence.min_oi_value_usdt) the latest stored point
+            must have before a symbol is even evaluated - see
+            OiDivergenceScanResult.insufficient_liquidity. Defaults to 0 (no
+            filtering) so existing callers that don't pass it keep working
+            unchanged.
 
     Returns:
         An OiDivergenceScanResult: `.signals` for every symbol that
-        triggered, and `.insufficient_history` for symbols skipped because
-        there's no stored snapshot yet, or none old enough to compare
-        against `lookback_hours` - not expected to happen in practice since
-        collectors/binance_futures.py fetches the whole lookback window on
-        its very first run, but guarded anyway in case a symbol's history
-        is short (new listing, source gap, or today's collection failed -
-        see main.py's handling of that case).
+        triggered, `.insufficient_history` for symbols skipped because
+        there's no stored snapshot yet, no `oi_value_usdt` on the latest
+        snapshot (older rows predating that column - see storage/db.py), or
+        none old enough to compare against `lookback_hours` - not expected
+        to happen in practice since collectors/binance_futures.py fetches
+        the whole lookback window on its very first run, but guarded anyway
+        in case a symbol's history is short (new listing, source gap, or
+        today's collection failed - see main.py's handling of that case) -
+        and `.insufficient_liquidity` for symbols skipped because the latest
+        snapshot's oi_value_usdt is below `min_oi_value_usdt`.
     """
     signals: list[OiDivergenceSignal] = []
     insufficient_history: list[str] = []
+    insufficient_liquidity: list[str] = []
 
     for symbol in symbols:
         latest = get_latest_binance_oi_snapshot(conn, symbol)
         if latest is None:
             insufficient_history.append(symbol)
+            continue
+
+        if latest["oi_value_usdt"] is None:
+            insufficient_history.append(symbol)
+            continue
+
+        if latest["oi_value_usdt"] < min_oi_value_usdt:
+            insufficient_liquidity.append(symbol)
             continue
 
         earlier = get_binance_oi_snapshot_hours_before(
@@ -190,4 +216,8 @@ def scan_watchlist(
         if signal is not None:
             signals.append(signal)
 
-    return OiDivergenceScanResult(signals=signals, insufficient_history=insufficient_history)
+    return OiDivergenceScanResult(
+        signals=signals,
+        insufficient_history=insufficient_history,
+        insufficient_liquidity=insufficient_liquidity,
+    )

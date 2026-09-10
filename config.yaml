@@ -92,6 +92,26 @@ signals:
     lookback_days: 7
     revenue_growth_threshold_pct: 30
     mcap_reaction_threshold_pct: 10
+    # Business-scale floor, NOT exchange/market liquidity (unlike
+    # oi_divergence's min_oi_value_usdt or volume_breakout's
+    # min_volume_avg_usd, which do measure real trading liquidity) - this is
+    # TZ section 9's "too small to trust" noise risk applied to the
+    # protocol's own REVENUE size instead: minimum absolute revenue (USD)
+    # over `lookback_days` BOTH the latest and the earlier compared snapshot
+    # must have (signals/revenue_price_gap.py checks both sides, since
+    # revenue_growth_pct is a ratio and a tiny value on EITHER side inflates
+    # it) before the signal even looks at that protocol. $10k/week is the
+    # minimal scale at which a protocol's revenue is a real market fact
+    # rather than rounding noise from a handful of transactions - well
+    # below that, a "30% growth" reading is technically correct but
+    # describes a base too small to mean anything (the same "tiny base,
+    # giant percent" shape that motivated the negative-revenue formula fix
+    # in signals/revenue_price_gap.py). Starting value, not calibrated
+    # against outcomes yet - subject to the same future threshold
+    # calibration as everything else in this file (see BACKLOG.md's
+    # backtest entry), not derived from how many signals it happens to
+    # leave on the current history.
+    min_revenue_total_usd: 10000
 
   oi_divergence:
     # TZ section 4.1: Open Interest grew by >= X% over `lookback_hours`,
@@ -104,6 +124,18 @@ signals:
     lookback_hours: 36
     oi_growth_threshold_pct: 30
     price_change_threshold_pct: 5
+    # Liquidity/noise floor (TZ section 9): minimum Open Interest in USD
+    # (binance_oi_snapshots.oi_value_usdt - collectors/binance_futures.py)
+    # the latest stored point must have before a symbol is even evaluated.
+    # $5,000,000 is the order of magnitude below which a Futures market
+    # cannot be said to have real institutional positioning behind it - a
+    # handful of retail orders can move a market that thin by 30%+ in a day,
+    # which would look identical to genuine accumulation under this signal's
+    # OI-growth condition. Starting value, not calibrated against outcomes
+    # yet - subject to the same future threshold calibration as everything
+    # else in this file (see BACKLOG.md's backtest entry), not derived from
+    # how many signals it happens to leave on the current history.
+    min_oi_value_usdt: 5000000
 
   volume_breakout:
     # TZ section 4.7: price breaks above a multi-month resistance level
@@ -135,6 +167,18 @@ signals:
     # "strong" (not extreme) volume slip through unreported. Same
     # calibrate-later spirit as oi_divergence's 30%/5% starting values.
     volume_ratio_threshold: 2.5
+    # Liquidity/noise floor (TZ section 9): minimum trailing average daily
+    # volume in USD (the same `volume_avg` this signal already computes over
+    # volume_avg_lookback_days) a protocol must clear before it's even
+    # evaluated. $1,000,000/day is the rough scale below which a coin
+    # physically cannot absorb meaningful institutional-sized buying without
+    # extreme slippage - under that, a "breakout on volume" reading is
+    # indistinguishable from the ordinary day-to-day swings of a thin
+    # market. Starting value, not calibrated against outcomes yet - subject
+    # to the same future threshold calibration as everything else in this
+    # file (see BACKLOG.md's backtest entry), not derived from how many
+    # signals it happens to leave on the current history.
+    min_volume_avg_usd: 1000000
 
 schedule:
   # Revenue/fees is a "slow" signal per TZ section 5 - daily polling is enough.

@@ -8,7 +8,8 @@
       "WebFetch(domain:www.coinglass.com)",
       "PowerShell(Get-ScheduledTask *)",
       "PowerShell(powershell -ExecutionPolicy Bypass -File scripts\\\\register_scheduled_task.ps1)",
-      "PowerShell(Start-ScheduledTask *)"
+      "PowerShell(Start-ScheduledTask *)",
+      "PowerShell(Get-CimInstance *)"
     ]
   }
 }

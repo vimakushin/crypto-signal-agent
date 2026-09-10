@@ -197,25 +197,54 @@ def _build_revenue_by_date(slug: str, daily_revenue: list[tuple[str, float]]) ->
     return revenue_by_date
 
 
-def _sum_window(revenue_by_date: dict[str, float], as_of: date, days: int, offset: int) -> float:
+def _sum_window(
+    revenue_by_date: dict[str, float], as_of: date, days: int, offset: int
+) -> tuple[float, int]:
     """Sum daily revenue over a `days`-day calendar window ending `offset`
-    days before `as_of` (offset=0 means the window ends ON `as_of`).
+    days before `as_of` (offset=0 means the window ends ON `as_of`), also
+    counting how many of those calendar days have NO entry in
+    `revenue_by_date` at all (as opposed to an entry that is present and
+    happens to be 0.0 - see `_compute_revenue_rollups`'s coverage guard for
+    why that distinction matters).
 
-    A calendar day with no entry in `revenue_by_date` counts as zero
-    revenue rather than being skipped - DeFiLlama's own daily chart
-    wouldn't have a gap-shaped hole for a protocol that simply made no
-    revenue that day, so treating a missing key the same way is the
-    faithful interpretation, not a data loss.
+    A missing day still contributes 0.0 to the sum (unchanged from before -
+    the total itself is not what this function's caller gates on; the
+    caller decides whether a window with missing days is trustworthy enough
+    to compute a growth PERCENTAGE from). Confirmed live that this
+    assumption ("a calendar day with no entry means DeFiLlama's own chart
+    has a real hole there, not that the protocol truly made exactly zero")
+    does not hold uniformly: illuvium has revenue_total_7d == 0 on 368/729
+    backfilled days (50.5%), frankencoin on 76/626 (12%) - too large and
+    too consistent to be genuine all-zero weeks for active protocols, and
+    far more consistent with gaps in DeFiLlama's own totalDataChart for
+    those protocols.
+
+    Args:
+        revenue_by_date: see `_build_revenue_by_date` - only contains dates
+            DeFiLlama actually returned a (finite) value for.
+        as_of: window's most recent day (inclusive when offset=0).
+        days: window length in calendar days.
+        offset: how many days before `as_of` the window ENDS (0 = ends on
+            `as_of` itself).
+
+    Returns:
+        (total, missing_days): `total` is the sum (missing days count as
+        0.0, as before); `missing_days` is how many of the `days` calendar
+        days in this window have no key at all in `revenue_by_date`.
     """
     total = 0.0
+    missing_days = 0
     for i in range(days):
         day = as_of - timedelta(days=offset + i)
-        total += revenue_by_date.get(day.isoformat(), 0.0)
-    return total
+        key = day.isoformat()
+        if key not in revenue_by_date:
+            missing_days += 1
+        total += revenue_by_date.get(key, 0.0)
+    return total, missing_days
 
 
 def _compute_revenue_rollups(
-    revenue_by_date: dict[str, float], as_of: date, first_date: date
+    slug: str, revenue_by_date: dict[str, float], as_of: date, first_date: date
 ) -> dict | None:
     """Reconstruct DeFiLlama's own 7d/30d revenue rollup math for one
     historical date, matching how DeFiLlama computes it live on
@@ -227,6 +256,7 @@ def _compute_revenue_rollups(
     same pattern with 30/60-day windows.
 
     Args:
+        slug: protocol slug, only used for the coverage-warning log message.
         revenue_by_date: "YYYY-MM-DD" (UTC) -> daily revenue in USD, for
             one protocol.
         as_of: the historical date to compute rollups "as of" (inclusive).
@@ -241,20 +271,90 @@ def _compute_revenue_rollups(
         None if `as_of` is less than MIN_HISTORY_DAYS_FOR_ROLLUPS calendar
         days after `first_date` - not enough history exists yet to trust
         the 30d/60d windows. Otherwise a dict with revenue_total_7d,
-        revenue_total_30d, revenue_change_7d_pct, revenue_change_30d_pct
-        (the pct fields are None, not a fabricated number, if their
-        denominator window summed to exactly zero).
+        revenue_total_30d, revenue_change_7d_pct, revenue_change_30d_pct.
+
+        The pct fields are None, not a fabricated number, for two
+        INDEPENDENT reasons (7d-pair and 30d-pair gated separately, since
+        one pair having a problem says nothing about the other):
+
+          1. Denominator window summed to zero or NEGATIVE (the
+             `total14dto7d <= 0` / `total60dto30d <= 0` checks below). A
+             negative denominator is a real, legitimate situation for some
+             protocols (e.g. insurance protocols like nexus-mutual, where
+             payouts can exceed premiums in a given window - confirmed
+             live, not a data bug), NOT just a rarer version of "zero".
+             With a negative denominator, (total - prior) / prior * 100
+             doesn't mean "percent growth" anymore - the sign flips, so a
+             protocol whose losses got WORSE (more negative) can come out
+             as a large POSITIVE percentage, which would then look exactly
+             like real growth to anything comparing against
+             revenue_growth_threshold_pct downstream
+             (signals/revenue_price_gap.py).
+
+          2. Incomplete window coverage (`missing_*` counts from
+             `_sum_window` below being > 0 for either window in the pair).
+             This reconstruction is meant to be an EXACT match of
+             DeFiLlama's own live rollup, not an approximation (unlike, say,
+             volume_breakout.py's 90% coverage tolerance for a resistance
+             window) - a calendar day with no entry in `revenue_by_date` at
+             all could be either "protocol genuinely made $0 that day" or
+             "DeFiLlama's own totalDataChart has a hole there", and
+             `_sum_window` cannot tell those apart (see its docstring; the
+             illuvium/frankencoin evidence there rules out "genuine zero
+             week" as the dominant explanation). Since the two
+             interpretations produce wildly different, unverifiable totals,
+             any missing day anywhere in a window makes the WHOLE window
+             (and therefore any pct built from it) unreliable, not just
+             "slightly off" - hence requiring 100% coverage rather than a
+             tolerance threshold.
+
+        Both reasons are collapsed into the same None in the return value
+        (not distinguished there) - same as the pre-existing "not enough
+        history" case above - since every caller downstream already treats
+        any None pct field identically (skip it). Reason 2 is logged
+        (with exactly how many days of which window were missing) so it is
+        visible rather than silent, even though the return value itself
+        doesn't distinguish it from reason 1.
     """
     if (as_of - first_date).days < MIN_HISTORY_DAYS_FOR_ROLLUPS - 1:
         return None
 
-    total7d = _sum_window(revenue_by_date, as_of, days=7, offset=0)
-    total14dto7d = _sum_window(revenue_by_date, as_of, days=7, offset=7)
-    total30d = _sum_window(revenue_by_date, as_of, days=30, offset=0)
-    total60dto30d = _sum_window(revenue_by_date, as_of, days=30, offset=30)
+    total7d, missing7d = _sum_window(revenue_by_date, as_of, days=7, offset=0)
+    total14dto7d, missing14dto7d = _sum_window(revenue_by_date, as_of, days=7, offset=7)
+    total30d, missing30d = _sum_window(revenue_by_date, as_of, days=30, offset=0)
+    total60dto30d, missing60dto30d = _sum_window(revenue_by_date, as_of, days=30, offset=30)
 
-    change_7d = (total7d - total14dto7d) / total14dto7d * 100 if total14dto7d else None
-    change_30d = (total30d - total60dto30d) / total60dto30d * 100 if total60dto30d else None
+    coverage_ok_7d = missing7d == 0 and missing14dto7d == 0
+    coverage_ok_30d = missing30d == 0 and missing60dto30d == 0
+
+    if not coverage_ok_7d:
+        logger.warning(
+            "DeFiLlama backfill: '%s' as of %s - revenue_change_7d_pct set to None, "
+            "window coverage incomplete (%d/7 day(s) missing in the current 7d window, "
+            "%d/7 day(s) missing in the prior 7d window) - a missing calendar day in "
+            "revenue_by_date could be a real $0 day OR a hole in DeFiLlama's own chart "
+            "(see _sum_window), so this reconstruction requires full coverage rather "
+            "than guessing",
+            slug, as_of, missing7d, missing14dto7d,
+        )
+    if not coverage_ok_30d:
+        logger.warning(
+            "DeFiLlama backfill: '%s' as of %s - revenue_change_30d_pct set to None, "
+            "window coverage incomplete (%d/30 day(s) missing in the current 30d window, "
+            "%d/30 day(s) missing in the prior 30d window)",
+            slug, as_of, missing30d, missing60dto30d,
+        )
+
+    # <= 0, not just == 0 (see docstring above): a negative denominator makes
+    # the growth-% formula's sign meaningless, not just its magnitude.
+    change_7d = (
+        (total7d - total14dto7d) / total14dto7d * 100
+        if coverage_ok_7d and total14dto7d > 0 else None
+    )
+    change_30d = (
+        (total30d - total60dto30d) / total60dto30d * 100
+        if coverage_ok_30d and total60dto30d > 0 else None
+    )
 
     return {
         "revenue_total_7d": total7d,
@@ -441,7 +541,7 @@ def backfill_defillama_protocol(conn, slug: str, protocol_entry: dict | None) ->
             skipped_recent += 1
             continue
 
-        rollups = _compute_revenue_rollups(revenue_by_date, as_of, first_date)
+        rollups = _compute_revenue_rollups(slug, revenue_by_date, as_of, first_date)
         if rollups is None:
             skipped_insufficient += 1
             continue
