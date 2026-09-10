@@ -1,4 +1,4 @@
-# Registers THREE Windows Task Scheduler tasks for crypto-signal-agent
+# Registers FOUR Windows Task Scheduler tasks for crypto-signal-agent
 # (README.md has the plain-language explanation):
 #   - CryptoSignalAgent-DeFiLlama: `main.py --cycle defillama`, once a day,
 #     at schedule.defillama_run_time from config.yaml (TZ section 5 calls
@@ -11,18 +11,23 @@
 #     schedule.backup_run_time from config.yaml (see that script's module
 #     docstring - a consistent SQLite snapshot of storage/db.sqlite via the
 #     Online Backup API, with automatic rotation of old backups).
+#   - CryptoSignalAgent-TelegramDigest: `notifications\telegram_bot.py`,
+#     once a day, at schedule.telegram_run_time from config.yaml (MVP.md
+#     checklist item 5 - the daily Telegram digest of ranked candidates,
+#     see that script's module docstring).
 #
 # Run this ONCE, from PowerShell, as the Windows user who will normally be
-# logged in on this PC (all three tasks only run while that user is logged
+# logged in on this PC (all four tasks only run while that user is logged
 # on - none of them wakes the PC up or runs while it is off/asleep, see
 # README.md):
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\register_scheduled_task.ps1
 #
-# Safe to re-run: it replaces all three task definitions (-Force) instead of
+# Safe to re-run: it replaces all four task definitions (-Force) instead of
 # creating duplicates. Also re-run this after changing
-# schedule.defillama_run_time, schedule.binance_futures_poll_hours, or
-# schedule.backup_run_time in config.yaml, to apply the new schedule.
+# schedule.defillama_run_time, schedule.binance_futures_poll_hours,
+# schedule.backup_run_time, or schedule.telegram_run_time in config.yaml, to
+# apply the new schedule.
 
 $ErrorActionPreference = "Stop"
 
@@ -32,6 +37,7 @@ $ConfigPath  = Join-Path $ProjectRoot "config.yaml"
 $DeFiLlamaTaskName = "CryptoSignalAgent-DeFiLlama"
 $BinanceTaskName   = "CryptoSignalAgent-BinanceOI"
 $BackupTaskName    = "CryptoSignalAgent-Backup"
+$TelegramTaskName  = "CryptoSignalAgent-TelegramDigest"
 # Older, pre-split task name that ran both cycles together once a day -
 # removed if present so a machine that registered it before this script was
 # updated doesn't end up running the old all-in-one task AND both new ones.
@@ -44,9 +50,10 @@ if (-not (Test-Path $ConfigPath)) {
     throw "config.yaml not found at $ConfigPath"
 }
 
-# Read all three schedule values from config.yaml (schedule.defillama_run_time,
-# schedule.binance_futures_poll_hours, schedule.backup_run_time) instead of
-# hardcoding them here - schedule/thresholds/watchlist live in config.yaml,
+# Read all four schedule values from config.yaml (schedule.defillama_run_time,
+# schedule.binance_futures_poll_hours, schedule.backup_run_time,
+# schedule.telegram_run_time) instead of hardcoding them here -
+# schedule/thresholds/watchlist live in config.yaml,
 # not in code (CLAUDE.md project rule). Uses the project's own venv Python +
 # PyYAML (already a dependency, see requirements.txt) rather than adding a
 # separate PowerShell YAML module just for this.
@@ -65,13 +72,14 @@ with open(sys.argv[1], encoding="utf-8") as f:
 print(cfg["schedule"]["defillama_run_time"])
 print(cfg["schedule"]["binance_futures_poll_hours"])
 print(cfg["schedule"]["backup_run_time"])
+print(cfg["schedule"]["telegram_run_time"])
 '@
 $tempScriptPath = Join-Path $env:TEMP "crypto-signal-agent_read-schedule.py"
 Set-Content -Path $tempScriptPath -Value $readConfigScript -Encoding utf8
 try {
     $ConfigOutput = & $PythonExe $tempScriptPath $ConfigPath
-    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 3) {
-        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time from $ConfigPath"
+    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 4) {
+        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time / schedule.telegram_run_time from $ConfigPath"
     }
 } finally {
     Remove-Item -Path $tempScriptPath -ErrorAction SilentlyContinue
@@ -79,6 +87,7 @@ try {
 $RunTimeRaw = $ConfigOutput[0].Trim()
 $PollHoursRaw = $ConfigOutput[1].Trim()
 $BackupRunTimeRaw = $ConfigOutput[2].Trim()
+$TelegramRunTimeRaw = $ConfigOutput[3].Trim()
 
 $timeParts = $RunTimeRaw -split ":"
 if ($timeParts.Count -ne 2) {
@@ -105,6 +114,16 @@ if ($BackupRunHour -lt 0 -or $BackupRunHour -gt 23 -or $BackupRunMinute -lt 0 -o
     throw "schedule.backup_run_time in config.yaml is out of range: '$BackupRunTimeRaw'"
 }
 
+$telegramTimeParts = $TelegramRunTimeRaw -split ":"
+if ($telegramTimeParts.Count -ne 2) {
+    throw "schedule.telegram_run_time in config.yaml must look like `"HH:MM`" (24h), got '$TelegramRunTimeRaw'"
+}
+$TelegramRunHour = [int]$telegramTimeParts[0]
+$TelegramRunMinute = [int]$telegramTimeParts[1]
+if ($TelegramRunHour -lt 0 -or $TelegramRunHour -gt 23 -or $TelegramRunMinute -lt 0 -or $TelegramRunMinute -gt 59) {
+    throw "schedule.telegram_run_time in config.yaml is out of range: '$TelegramRunTimeRaw'"
+}
+
 # Built from integer Hour/Minute, not an "8:00AM"-style string - -At needs an
 # actual DateTime, and parsing "HH:MMAM/PM" text depends on the Windows
 # locale/culture. That breaks silently on a machine with a different locale,
@@ -112,6 +131,7 @@ if ($BackupRunHour -lt 0 -or $BackupRunHour -gt 23 -or $BackupRunMinute -lt 0 -o
 # Windows install, different PC) - see README.md.
 $RunTime = Get-Date -Hour $RunHour -Minute $RunMinute -Second 0
 $BackupRunTime = Get-Date -Hour $BackupRunHour -Minute $BackupRunMinute -Second 0
+$TelegramRunTime = Get-Date -Hour $TelegramRunHour -Minute $TelegramRunMinute -Second 0
 
 # Anchor for the repeating Binance trigger - midnight today. Only its
 # time-of-day matters (it fixes which clock hours the repeating trigger
@@ -189,15 +209,32 @@ Register-ScheduledTask -TaskName $BackupTaskName `
     -Description "crypto-signal-agent: daily SQLite backup of storage/db.sqlite via scripts/backup_db.py (see README.md)" `
     -Force | Out-Null
 
+# Same cmd.exe wrapper as the three tasks above, for the same reason (see
+# the NOTE above New-ScheduledTaskSettingsSet).
+$telegramAction = New-ScheduledTaskAction -Execute "cmd.exe" `
+    -Argument '/c ".venv\Scripts\python.exe" notifications\telegram_bot.py' `
+    -WorkingDirectory $ProjectRoot
+$telegramTrigger = New-ScheduledTaskTrigger -Daily -At $TelegramRunTime
+
+Register-ScheduledTask -TaskName $TelegramTaskName `
+    -Action $telegramAction `
+    -Trigger $telegramTrigger `
+    -Settings $settings `
+    -Description "crypto-signal-agent: daily Telegram digest of ranked candidates via notifications/telegram_bot.py (see README.md)" `
+    -Force | Out-Null
+
 Write-Host "Scheduled task '$DeFiLlamaTaskName' registered - runs daily at $RunTimeRaw while this Windows user is logged in."
 Write-Host "Scheduled task '$BinanceTaskName' registered - runs every $PollHours hour(s) while this Windows user is logged in."
 Write-Host "Scheduled task '$BackupTaskName' registered - runs daily at $BackupRunTimeRaw while this Windows user is logged in."
-Write-Host "Log files: $ProjectRoot\logs\scheduler_defillama.log (DeFiLlama task), $ProjectRoot\logs\scheduler_binance.log (BinanceOI task), $ProjectRoot\logs\backup.log (Backup task)"
+Write-Host "Scheduled task '$TelegramTaskName' registered - runs daily at $TelegramRunTimeRaw while this Windows user is logged in."
+Write-Host "Log files: $ProjectRoot\logs\scheduler_defillama.log (DeFiLlama task), $ProjectRoot\logs\scheduler_binance.log (BinanceOI task), $ProjectRoot\logs\backup.log (Backup task), $ProjectRoot\logs\telegram.log (TelegramDigest task)"
 Write-Host "(separate files on purpose - these are independent processes that can run at the same time, see main.py's module docstring)"
 Write-Host ""
 Write-Host "To check any one: Get-ScheduledTask -TaskName '$DeFiLlamaTaskName' | Get-ScheduledTaskInfo"
 Write-Host "                  Get-ScheduledTask -TaskName '$BinanceTaskName' | Get-ScheduledTaskInfo"
 Write-Host "                  Get-ScheduledTask -TaskName '$BackupTaskName' | Get-ScheduledTaskInfo"
+Write-Host "                  Get-ScheduledTask -TaskName '$TelegramTaskName' | Get-ScheduledTaskInfo"
 Write-Host "To run any one right now (test): Start-ScheduledTask -TaskName '$DeFiLlamaTaskName'"
 Write-Host "                                Start-ScheduledTask -TaskName '$BinanceTaskName'"
 Write-Host "                                Start-ScheduledTask -TaskName '$BackupTaskName'"
+Write-Host "                                Start-ScheduledTask -TaskName '$TelegramTaskName'"

@@ -36,6 +36,14 @@ from storage.db import get_signal_events_since  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Same allowance for normal run-to-run jitter as main.py's
+# STALENESS_MULTIPLIER and signals/revenue_price_gap.py's
+# MAX_GAP_MULTIPLIER - reused here as-is, not recalibrated: a signal's
+# "recent enough to still count" window is 1.5x its expected polling
+# interval, not exactly 1x (which would drop a candidate just because
+# this run happened to land a little early relative to the last one).
+STALENESS_MULTIPLIER = 1.5
+
 
 @dataclass
 class SignalContribution:
@@ -135,9 +143,64 @@ def rank_candidates(
     return scores
 
 
-if __name__ == "__main__":
+def signal_weights_from_config(config: dict) -> dict[str, float]:
+    """Build the {signal_name: weight} map rank_candidates() expects, from
+    config.yaml's `signals:` section - every enabled signal contributes its
+    own weight (config.yaml signals.<name>.weight, defaulting to 1.0 if
+    unset), a disabled signal is skipped entirely.
+
+    Args:
+        config: parsed config.yaml (see load_config()).
+
+    Returns:
+        {signal_name: weight} for every signal with `enabled: true` (or no
+        `enabled` key at all, which defaults to enabled).
+    """
+    return {
+        name: cfg.get("weight", 1.0)
+        for name, cfg in config["signals"].items()
+        if cfg.get("enabled", True)
+    }
+
+
+def default_since_by_signal(config: dict) -> dict[str, str]:
+    """Build the {signal_name: since_iso} map rank_candidates() expects, from
+    config.yaml's `schedule:` section - "recent enough to still count" for
+    each signal is STALENESS_MULTIPLIER times that signal's expected polling
+    interval (defillama_poll_hours for the two DeFiLlama-fed signals,
+    binance_futures_poll_hours for oi_divergence), not exactly one interval
+    (see STALENESS_MULTIPLIER).
+
+    Args:
+        config: parsed config.yaml (see load_config()).
+
+    Returns:
+        {signal_name: since_iso} for revenue_price_gap, volume_breakout and
+        oi_divergence - the only three signal names this function knows the
+        expected polling interval for. A signal_name not in this mapping
+        (e.g. a future signal type not yet wired up here) is simply absent
+        from the result, which rank_candidates() already treats as "no
+        window to look back over, skip it".
+    """
     from datetime import datetime, timedelta, timezone
 
+    schedule_cfg = config.get("schedule", {})
+    defillama_interval = schedule_cfg.get("defillama_poll_hours", 24)
+    binance_interval = schedule_cfg.get("binance_futures_poll_hours", 6)
+    expected_interval_hours_by_signal = {
+        "revenue_price_gap": defillama_interval,
+        "volume_breakout": defillama_interval,
+        "oi_divergence": binance_interval,
+    }
+
+    now = datetime.now(timezone.utc)
+    return {
+        name: (now - timedelta(hours=hours * STALENESS_MULTIPLIER)).isoformat()
+        for name, hours in expected_interval_hours_by_signal.items()
+    }
+
+
+if __name__ == "__main__":
     import yaml
 
     # sys.path already has the project root on it (see the module-level
@@ -156,40 +219,19 @@ if __name__ == "__main__":
         with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
 
-    # Same allowance for normal run-to-run jitter as main.py's
-    # STALENESS_MULTIPLIER and signals/revenue_price_gap.py's
-    # MAX_GAP_MULTIPLIER - reused here as-is, not recalibrated: a signal's
-    # "recent enough to still count" window is 1.5x its expected polling
-    # interval, not exactly 1x (which would drop a candidate just because
-    # this run happened to land a little early relative to the last one).
-    STALENESS_MULTIPLIER = 1.5
-
     config = load_config()
     db_path = Path(config["storage"]["sqlite_path"])
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
-    signal_weights = {
-        name: cfg.get("weight", 1.0)
-        for name, cfg in config["signals"].items()
-        if cfg.get("enabled", True)
-    }
-
-    schedule_cfg = config.get("schedule", {})
-    defillama_interval = schedule_cfg.get("defillama_poll_hours", 24)
-    binance_interval = schedule_cfg.get("binance_futures_poll_hours", 6)
-    expected_interval_hours_by_signal = {
-        "revenue_price_gap": defillama_interval,
-        "volume_breakout": defillama_interval,
-        "oi_divergence": binance_interval,
-    }
-
-    now = datetime.now(timezone.utc)
-    since_by_signal = {
-        name: (now - timedelta(hours=expected_interval_hours_by_signal[name] * STALENESS_MULTIPLIER)).isoformat()
-        for name in signal_weights
-        if name in expected_interval_hours_by_signal
-    }
+    signal_weights = signal_weights_from_config(config)
+    since_by_signal = default_since_by_signal(config)
+    # default_since_by_signal() returns an entry for every signal it knows
+    # the polling interval for, regardless of whether that signal is
+    # enabled - rank_candidates() only needs the ones actually present in
+    # signal_weights, but passing the extra entries through is harmless
+    # (rank_candidates() only ever looks up since_by_signal by the names
+    # already in signal_weights).
 
     conn = get_connection(db_path)
     try:

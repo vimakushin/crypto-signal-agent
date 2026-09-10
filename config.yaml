@@ -201,6 +201,15 @@ schedule:
   # BinanceOI task writes to it too), just a reasonable quiet-morning slot
   # that avoids overlapping the DeFiLlama task's own run.
   backup_run_time: "09:00"
+  # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
+  # notifications/telegram_bot.py (the daily Telegram digest of ranked
+  # candidates - MVP.md checklist item 5). Same format and same
+  # scripts/register_scheduled_task.ps1 wiring as the other *_run_time
+  # values above. Set an hour after backup_run_time (09:00), so the daily
+  # DeFiLlama+CoinGecko cycle (can take several minutes because of
+  # CoinGecko's rate limits) and the backup have both had time to finish
+  # before the digest queries storage/db.sqlite for that day's candidates.
+  telegram_run_time: "09:30"
 
 storage:
   sqlite_path: storage/db.sqlite
