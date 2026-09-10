@@ -403,6 +403,25 @@ if __name__ == "__main__":
     conn = get_connection(db_path)
     try:
         results = rank_candidates(conn, signal_weights, since_by_signal)
+
+        # Manual-labeling journal (TZ section 6, cut-down MVP version - see
+        # notifications/observations.py's module docstring). Independent of
+        # the Telegram send below: a failure here must not block the digest,
+        # and a failed digest send below must not block this.
+        from notifications.observations import (
+            append_new_observations,
+            backfill_seven_day_outcomes,
+        )
+
+        today_str = date.today().isoformat()
+        try:
+            append_new_observations(conn, results, today_str)
+        except Exception:
+            logger.exception("observations.md: append_new_observations failed")
+        try:
+            backfill_seven_day_outcomes(conn)
+        except Exception:
+            logger.exception("observations.md: backfill_seven_day_outcomes failed")
     finally:
         conn.close()
 

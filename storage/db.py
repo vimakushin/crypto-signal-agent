@@ -360,6 +360,26 @@ def get_coingecko_price_history_before(
     ).fetchall()
 
 
+def get_coingecko_price_before(conn: sqlite3.Connection, protocol_slug: str, before_date: str) -> sqlite3.Row | None:
+    """Closest coingecko_price_history row for `protocol_slug` at or before
+    `before_date` (a plain YYYY-MM-DD string, like the `date` column itself -
+    see get_coingecko_price_history_before's docstring for why no
+    datetime(...) wrap is needed for this column specifically). Used by
+    notifications/observations.py to look up a candidate's price on/near a
+    given day for the observations journal - never look-ahead (AT OR
+    BEFORE, not nearest overall).
+    """
+    return conn.execute(
+        """
+        SELECT * FROM coingecko_price_history
+        WHERE protocol_slug = ? AND date <= ?
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        (protocol_slug, before_date),
+    ).fetchone()
+
+
 def get_latest_defillama_fetch_time(conn: sqlite3.Connection) -> str | None:
     """Most recent `fetched_at` across ALL of defillama_snapshots, with no
     per-protocol filter - unlike get_latest_snapshot above.
