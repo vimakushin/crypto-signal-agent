@@ -187,7 +187,14 @@ def collect(watchlist_slugs: list[str]) -> list[dict]:
 
         protocol_entry = protocols_by_slug.get(slug)
         mcap = protocol_entry.get("mcap") if protocol_entry else None
-        if not mcap:
+        # `is None`, not `not mcap`: `not mcap` is also True for mcap == 0,
+        # which would then fall into THIS branch ("field absent entirely")
+        # even though a 0 came back from the API - a different, more
+        # specific problem the `elif mcap <= 0` branch below exists to
+        # describe. Checking `is None` explicitly keeps "field missing" and
+        # "field present but non-positive (including exactly 0)" from being
+        # conflated under one misleading log message.
+        if mcap is None:
             logger.warning(
                 "DeFiLlama: no resolvable market cap for '%s' (likely tracked as a "
                 "versioned sub-protocol) - snapshot saved without mcap, "

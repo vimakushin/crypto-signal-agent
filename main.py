@@ -163,21 +163,31 @@ def run_defillama_cycle(config: dict) -> None:
                 min_revenue_total_usd=revenue_signal_cfg.get("min_revenue_total_usd", 0),
             )
 
-            # Three distinct reasons for "no candidates" - conflating them
+            # Four distinct reasons for "no candidates" - conflating them
             # into one line misleads the user either way: "needs more
             # history" reads as a data problem, "too small to trust" reads
-            # as a data problem too but a DIFFERENT one, and either
-            # obscures "the real market simply didn't cross the threshold".
+            # as a data problem too but a DIFFERENT one, "bad data on a
+            # protocol we DID have enough history for" (gap too large, or a
+            # revenue/mcap value that's missing or non-positive - see
+            # signals/revenue_price_gap.py's _DataQualityRejected) is yet a
+            # THIRD kind of data problem and, left unlogged, could silently
+            # zero out every candidate on a day a collector outage widens
+            # the snapshot gap - and any of the three obscures "the real
+            # market simply didn't cross the threshold".
             evaluated = (
-                len(watchlist) - len(result.insufficient_history) - len(result.insufficient_liquidity)
+                len(watchlist) - len(result.insufficient_history)
+                - len(result.insufficient_liquidity) - len(result.insufficient_data_quality)
             )
             logger.info(
                 "revenue_price_gap: %d/%d protocols evaluated (%d still need >= %s days of "
                 "collected history to compare market cap, %d skipped for revenue below the "
-                "$%s liquidity floor), %d candidate(s) found",
+                "$%s liquidity floor, %d skipped for bad data - snapshot gap too large or "
+                "missing/non-positive revenue or market cap on the compared snapshots), "
+                "%d candidate(s) found",
                 evaluated, len(watchlist), len(result.insufficient_history),
                 revenue_signal_cfg["lookback_days"], len(result.insufficient_liquidity),
-                revenue_signal_cfg.get("min_revenue_total_usd", 0), len(result.signals),
+                revenue_signal_cfg.get("min_revenue_total_usd", 0),
+                len(result.insufficient_data_quality), len(result.signals),
             )
             for s in result.signals:
                 logger.info(

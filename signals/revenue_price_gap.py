@@ -38,6 +38,21 @@ logger = logging.getLogger(__name__)
 MAX_GAP_MULTIPLIER = 1.5
 
 
+class _DataQualityRejected(Exception):
+    """Raised internally by `_evaluate_snapshots` when a protocol/pair is
+    dropped by one of its own guards (snapshot gap too large, base or
+    current revenue non-positive/missing, market cap non-positive/missing)
+    rather than because revenue growth failed to clear the configured
+    threshold.
+
+    `scan_watchlist` catches this to route the protocol into
+    `RevenueGapScanResult.insufficient_data_quality` instead of silently
+    leaving it out of every bucket - see that dataclass's docstring for why
+    this distinction matters. Not raised for the "evaluated fine, but below
+    threshold" case, which still returns None as before.
+    """
+
+
 @dataclass
 class RevenueGapSignal:
     protocol_slug: str
@@ -68,9 +83,13 @@ class RevenueGapScanResult:
     main.py can treat both signal modules the same way.
     """
     signals: list[RevenueGapSignal] = field(default_factory=list)
-    # Protocol slugs skipped because there's no latest snapshot yet, no
-    # market cap on the latest snapshot, or no snapshot far enough back to
-    # compare against `lookback_days` (first runs / short history).
+    # Protocol slugs skipped because there's no latest snapshot yet, the
+    # latest snapshot's market cap is missing or <= 0 (checked up front in
+    # scan_watchlist, before any pair comparison is attempted), or there's
+    # no snapshot far enough back to compare against `lookback_days` (first
+    # runs / short history). A market cap that's merely too old-vs-latest
+    # for a meaningful comparison, or bad on the EARLIER side, is not here -
+    # see insufficient_data_quality below.
     insufficient_history: list[str] = field(default_factory=list)
     # Protocol slugs skipped because EITHER the latest OR the earlier
     # snapshot's revenue for `lookback_days` is below config.yaml's
@@ -81,6 +100,20 @@ class RevenueGapScanResult:
     # yet", it's "there IS a number, and it's too small to mean anything"
     # (the "tiny base, giant percent" artifact - see scan_watchlist).
     insufficient_liquidity: list[str] = field(default_factory=list)
+    # Protocol slugs that reached _evaluate_snapshots but were rejected by
+    # one of ITS OWN internal guards - snapshot gap too large (collector
+    # outage pushed the 'earlier' snapshot further back than requested),
+    # base or current-period revenue missing/non-positive, or market cap
+    # missing/non-positive on either snapshot. Distinct from
+    # insufficient_liquidity (which is about revenue being too SMALL to
+    # trust, checked up front in scan_watchlist) and from
+    # insufficient_history (no snapshot far enough back to compare at all):
+    # this bucket means "we had data on both sides, but it was bad data",
+    # not "not enough data yet". Without this bucket these protocols would
+    # simply vanish from every result list, making a day where a collector
+    # gap trips this guard for the whole watchlist indistinguishable from a
+    # quiet market with zero real candidates - see scan_watchlist.
+    insufficient_data_quality: list[str] = field(default_factory=list)
 
 
 def _days_between(later_iso: str, earlier_iso: str) -> float:
@@ -143,7 +176,7 @@ def _evaluate_snapshots(
             latest["protocol_slug"], actual_lookback_days, MAX_GAP_MULTIPLIER, lookback_days,
             lookback_days,
         )
-        return None
+        raise _DataQualityRejected("snapshot gap too large")
 
     revenue_growth_pct = (
         latest["revenue_change_7d_pct"] if lookback_days == 7 else latest["revenue_change_30d_pct"]
@@ -191,7 +224,7 @@ def _evaluate_snapshots(
             latest["protocol_slug"], base_revenue, lookback_days, earlier["fetched_at"],
             revenue_growth_pct,
         )
-        return None
+        raise _DataQualityRejected("base-period revenue missing or non-positive")
 
     # Blocks the signal, distinct reason from the base_revenue guard above:
     # even when the arithmetic above is not broken (positive base, so the %
@@ -215,23 +248,31 @@ def _evaluate_snapshots(
             "protocol with no meaningful revenue right now is not meaningful",
             latest["protocol_slug"], lookback_days, revenue_total_now, revenue_growth_pct,
         )
-        return None
+        raise _DataQualityRejected("latest-period revenue missing or non-positive")
 
     mcap_now = latest["mcap"]
     mcap_before = earlier["mcap"]
     # `is None or <= 0` (not just `not X`): `not X` would drop None and 0
     # but let a NEGATIVE mcap straight through into the division below.
-    # Confirmed live: coingecko_price_history has 89 rows for renzo with
-    # market_cap <= 0 (CoinGecko's own /coins/renzo/market_chart returns -1
-    # as a placeholder market cap on dates it has no real figure for - not
-    # our collection bug), and the same negative/garbage values can end up
-    # in defillama_snapshots.mcap for the matching dates. With a negative
-    # `mcap_before`, (mcap_now - mcap_before) / mcap_before below produces
-    # an absurd percentage (observed: -3,053,635,664%) instead of erroring
-    # - same class of bug as the base_revenue/revenue_total_now guards
-    # above, just for market cap instead of revenue.
+    # Confirmed live: defillama_snapshots has 89 rows for renzo with
+    # mcap <= 0 (CoinGecko's own /coins/renzo/market_chart, which
+    # collectors/defillama.py reads market cap from, returns -1 as a
+    # placeholder on dates it has no real figure for - not our collection
+    # bug), and the same negative/garbage values can end up on either side
+    # of this comparison. With a negative `mcap_before`,
+    # (mcap_now - mcap_before) / mcap_before below produces an absurd
+    # percentage (observed: -3,053,635,664%) instead of erroring - same
+    # class of bug as the base_revenue/revenue_total_now guards above, just
+    # for market cap instead of revenue.
     if mcap_now is None or mcap_now <= 0 or mcap_before is None or mcap_before <= 0:
-        return None
+        logger.warning(
+            "revenue_price_gap: '%s' - skipping, market cap is missing or <= 0 "
+            "(latest=%s on %s, earlier=%s on %s) - mcap_growth_pct cannot be computed "
+            "meaningfully from a missing/non-positive value on either side",
+            latest["protocol_slug"], mcap_now, latest["fetched_at"], mcap_before,
+            earlier["fetched_at"],
+        )
+        raise _DataQualityRejected("market cap missing or non-positive")
 
     mcap_growth_pct = (mcap_now - mcap_before) / mcap_before * 100
 
@@ -283,6 +324,13 @@ def scan_watchlist(
     guards, but for small POSITIVE bases instead of negative ones - checked
     on the earlier side too, since revenue_growth_pct is a ratio and a tiny
     denominator inflates it regardless of which side of the pair it's on).
+    `.insufficient_data_quality` lists protocols that reached the per-pair
+    comparison but were rejected by one of `_evaluate_snapshots`'s own
+    guards (snapshot gap too large, base/current revenue missing or
+    non-positive, market cap missing or non-positive) - "we had data on
+    both sides, but it was bad data", as opposed to "not enough data yet"
+    or "revenue too small to trust". See RevenueGapScanResult's docstring
+    for why this bucket exists and _DataQualityRejected for the mechanism.
 
     Args:
         min_revenue_total_usd: minimum absolute revenue (USD) over
@@ -318,6 +366,7 @@ def scan_watchlist(
     signals: list[RevenueGapSignal] = []
     insufficient_history: list[str] = []
     insufficient_liquidity: list[str] = []
+    insufficient_data_quality: list[str] = []
 
     for slug in watchlist_slugs:
         latest = get_latest_snapshot(conn, slug)
@@ -361,11 +410,21 @@ def scan_watchlist(
             continue
 
         actual_lookback_days = _days_between(latest["fetched_at"], earlier["fetched_at"])
-        signal = _evaluate_snapshots(
-            latest, earlier,
-            revenue_growth_threshold_pct, mcap_reaction_threshold_pct, lookback_days,
-            actual_lookback_days,
-        )
+        try:
+            signal = _evaluate_snapshots(
+                latest, earlier,
+                revenue_growth_threshold_pct, mcap_reaction_threshold_pct, lookback_days,
+                actual_lookback_days,
+            )
+        except _DataQualityRejected:
+            # _evaluate_snapshots already logged the specific reason (gap,
+            # base revenue, current revenue, or market cap) - here we just
+            # need to route the slug into the right bucket so main.py can
+            # tell "bad data" apart from "quiet market, nothing crossed the
+            # threshold" instead of the slug silently vanishing from every
+            # result list. See RevenueGapScanResult docstring.
+            insufficient_data_quality.append(slug)
+            continue
         if signal is not None:
             signals.append(signal)
 
@@ -373,4 +432,5 @@ def scan_watchlist(
         signals=signals,
         insufficient_history=insufficient_history,
         insufficient_liquidity=insufficient_liquidity,
+        insufficient_data_quality=insufficient_data_quality,
     )

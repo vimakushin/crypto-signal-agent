@@ -392,7 +392,17 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
                 entries.append((latest_date, None))
                 continue
 
-            if latest["mcap"] is None or earlier["mcap"] is None:
+            # `<= 0`, not just `is None`: a stored mcap of 0 or negative
+            # (seen live for renzo - see signals/revenue_price_gap.py's
+            # matching guard) is just as unusable for mcap_growth_pct as a
+            # missing one. Without this, ~87 such points fell through this
+            # prefilter into evaluated_total and were only actually
+            # excluded later, silently, inside _evaluate_snapshots -
+            # inflating the denominator of the reported fire rate.
+            if (
+                latest["mcap"] is None or latest["mcap"] <= 0
+                or earlier["mcap"] is None or earlier["mcap"] <= 0
+            ):
                 excluded_no_mcap += 1
                 entries.append((latest_date, None))
                 continue
@@ -404,9 +414,19 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
             if rev_val is not None:
                 revenue_values.append(rev_val)
 
-            signal = revenue_price_gap._evaluate_snapshots(
-                latest, earlier, revenue_threshold, mcap_threshold, lookback_days,
-            )
+            try:
+                signal = revenue_price_gap._evaluate_snapshots(
+                    latest, earlier, revenue_threshold, mcap_threshold, lookback_days,
+                )
+            except revenue_price_gap._DataQualityRejected:
+                # _evaluate_snapshots now raises instead of returning None
+                # for its own internal guards (base/current revenue
+                # non-positive - the gap and mcap guards are already
+                # covered by this function's own prefilters above, so this
+                # branch is effectively unreachable for those two). Treat
+                # exactly like the old `signal = None` / not-fired case so
+                # replay's counts are unaffected.
+                signal = None
             fired = signal is not None
             entries.append((latest_date, fired))
             if fired:
@@ -447,7 +467,8 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "  Evaluated %d protocol-day point(s) total. Excluded from that count: %d with no "
         "earlier point at all yet (insufficient history), %d where either compared point "
-        "had mcap=NULL (pre-CoinGecko-history era for that protocol), %d where the real "
+        "had mcap missing or <= 0 (pre-CoinGecko-history era for that protocol, or a known "
+        "CoinGecko placeholder value), %d where the real "
         "gap between the two dates exceeded %.1fx the configured %d days (data hole "
         "between backfill and live collection), %d where the latest point's revenue was "
         "below the $%s liquidity floor (min_revenue_total_usd) - same filter "

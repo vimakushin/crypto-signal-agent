@@ -84,7 +84,7 @@ from storage.db import (  # noqa: E402
 )
 
 # DeFiLlama's own live rollup (fetch_revenue_overview -> total7d/total30d/
-# change_7d/change_30dover30d, relayed as-is by collectors/defillama.py)
+# change_7dover7d/change_30dover30d, relayed as-is by collectors/defillama.py)
 # needs a full calendar window of daily revenue behind a date before its
 # numbers mean anything - 60 days is the stricter of the two windows this
 # script reconstructs (the 30d rollup's "60 days before" sub-window), so it
