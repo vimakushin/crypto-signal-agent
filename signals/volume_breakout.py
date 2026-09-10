@@ -196,23 +196,12 @@ def scan_watchlist(
             working unchanged.
 
     Returns:
-        A VolumeBreakoutScanResult: `.signals` for every protocol that
-        triggered, `.insufficient_history` for protocols skipped because
-        there's no known gecko_id, no stored price/volume row yet, or not
-        enough trailing VALID (non-NULL - see _valid_prices/_valid_volumes)
-        history in either comparison window to trust (see
-        MIN_HISTORY_COVERAGE_FRACTION) - expected on the first few runs
-        before scripts/backfill_history.py has been run, or for a newly
-        added watchlist protocol. The coverage check counts already-
-        filtered values, NOT the raw row count returned by storage: a coin
-        CoinGecko doesn't report volume for on some days (documented in
-        collectors/coingecko.py, common for low-liquidity coins) can have
-        plenty of stored ROWS in a window while most of them carry a NULL
-        volume - counting raw rows there would let the coverage check pass
-        on a resistance level / volume average actually built from far
-        fewer real data points than MIN_HISTORY_COVERAGE_FRACTION promises.
-        `.insufficient_liquidity` lists protocols skipped because their
-        trailing volume_avg is below `min_volume_avg_usd`.
+        A VolumeBreakoutScanResult: `.insufficient_history` covers missing
+        gecko_id/price-volume row, or not enough VALID (non-NULL, see
+        _valid_prices/_valid_volumes) trailing history - counted on
+        already-filtered values, not raw row count, since CoinGecko can
+        omit volume on some days while the row itself still exists.
+        `.insufficient_liquidity` covers volume_avg below `min_volume_avg_usd`.
     """
     signals: list[VolumeBreakoutSignal] = []
     insufficient_history: list[str] = []
