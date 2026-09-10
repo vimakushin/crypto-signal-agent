@@ -204,3 +204,17 @@ schedule:
 
 storage:
   sqlite_path: storage/db.sqlite
+
+backup:
+  # Folder scripts/backup_db.py writes timestamped backups into. Lives here,
+  # not only as that script's --backup-dir flag, because the scheduled task
+  # (CryptoSignalAgent-Backup, see scripts/register_scheduled_task.ps1) runs
+  # backup_db.py with no arguments at all - if this path only existed as a
+  # CLI flag, the scheduled task would silently keep writing to the old
+  # location until someone remembered to edit the .ps1 and re-register it.
+  # Points inside the local Google Drive sync folder (G:\My Drive), NOT the
+  # drive's root, so backups land in their own subfolder rather than mixed in
+  # among everything else already synced there - see backup_db.py's module
+  # docstring for why a cloud-synced folder is worth pointing this at instead
+  # of the project-local default.
+  backup_dir: "G:\\My Drive\\crypto-signal-agent-backups"

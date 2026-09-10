@@ -26,9 +26,22 @@ workaround.
 
 Where backups are stored
 -------------------------
-Configurable via --backup-dir (default: <project root>/backups/ - see
-DEFAULT_BACKUP_DIR below). Two real options, deliberately left to the user
-to choose between (this script doesn't guess):
+Resolved in this priority order (highest first), same pattern as --db-path
+below:
+
+  1. --backup-dir, if passed explicitly on the command line - a manual run
+     can still point this at any folder, whatever config.yaml says.
+  2. backup.backup_dir in config.yaml, if that key is present - this is what
+     the scheduled task (CryptoSignalAgent-Backup, run with no arguments at
+     all - see scripts/register_scheduled_task.ps1) actually uses day to
+     day, so changing where backups go only requires editing config.yaml,
+     not the scheduled task itself.
+  3. DEFAULT_BACKUP_DIR (<project root>/backups/), if neither of the above
+     is set - keeps this script working unchanged on a config.yaml that
+     predates the backup: section, or one where it was deliberately omitted.
+
+Two real options for backup.backup_dir / --backup-dir, deliberately left to
+the user to choose between (this script doesn't guess):
 
   1. A local folder inside the project (the default, "backups/"). Simplest
      for an MVP, zero setup - but it lives on the same physical disk as
@@ -40,10 +53,11 @@ to choose between (this script doesn't guess):
      copy, not a diff).
   2. A folder inside an existing cloud-sync client the user already has
      running (e.g. a OneDrive or Google Drive folder synced on this PC) -
-     pass its path via --backup-dir. This survives a local disk failure
-     because a synced copy also lives in the cloud (and usually on other
-     synced devices), but only works if that sync client is already
-     installed and signed in - this script cannot detect or set that up.
+     set it via config.yaml's backup.backup_dir (or pass --backup-dir for a
+     one-off run). This survives a local disk failure because a synced copy
+     also lives in the cloud (and usually on other synced devices), but only
+     works if that sync client is already installed and signed in - this
+     script cannot detect or set that up.
 
 Rotation
 --------
@@ -250,11 +264,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--backup-dir",
         type=Path,
-        default=DEFAULT_BACKUP_DIR,
+        default=None,
         help=(
-            f"Folder to write timestamped backups into (default: {DEFAULT_BACKUP_DIR}, "
-            "a project-local folder excluded from git - see the module docstring for "
-            "the alternative of pointing this at a cloud-synced folder instead)."
+            "Folder to write timestamped backups into. Defaults to "
+            "backup.backup_dir from config.yaml if that key is set, otherwise "
+            f"falls back to {DEFAULT_BACKUP_DIR} (a project-local folder excluded "
+            "from git) - see the module docstring's 'Where backups are stored' "
+            "section for the full priority order."
         ),
     )
     parser.add_argument(
@@ -269,11 +285,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
+    # Only read config.yaml if at least one of db_path / backup_dir wasn't
+    # given explicitly on the command line - an explicit flag never requires
+    # config.yaml to even be readable, same as the pre-existing --db-path
+    # behaviour this now also applies to --backup-dir.
+    cfg: dict | None = None
+    if args.db_path is None or args.backup_dir is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            logger.exception(
+                "Could not read config.yaml - pass --db-path and --backup-dir "
+                "explicitly instead"
+            )
+            sys.exit(1)
+
     if args.db_path is not None:
         db_path = args.db_path
     else:
         try:
-            cfg = load_config()
             db_path = Path(cfg["storage"]["sqlite_path"])
         except Exception:
             logger.exception(
@@ -284,7 +314,22 @@ def main() -> None:
         if not db_path.is_absolute():
             db_path = PROJECT_ROOT / db_path
 
-    backup_dir = args.backup_dir
+    if args.backup_dir is not None:
+        backup_dir = args.backup_dir
+    else:
+        backup_dir_str = None
+        try:
+            backup_dir_str = cfg.get("backup", {}).get("backup_dir")
+        except Exception:
+            # A malformed backup: section (e.g. not a mapping) must not stop
+            # the backup itself - fall back to the local default below.
+            logger.warning(
+                "Could not read backup.backup_dir from config.yaml - falling "
+                "back to %s",
+                DEFAULT_BACKUP_DIR,
+            )
+        backup_dir = Path(backup_dir_str) if backup_dir_str else DEFAULT_BACKUP_DIR
+
     if not backup_dir.is_absolute():
         backup_dir = PROJECT_ROOT / backup_dir
 

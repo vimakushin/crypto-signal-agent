@@ -95,10 +95,12 @@ Start-ScheduledTask -TaskName "CryptoSignalAgent-Backup"
 .venv\Scripts\python.exe scripts\backup_db.py
 ```
 
-По умолчанию копии — в `backups\` внутри проекта (не в git). Если утеряется этот диск/компьютер — пропадут и оригинал, и копии одновременно. Надёжнее указать папку внутри облачной синхронизации (OneDrive, Google Диск):
+Куда писать копии, задаётся в `config.yaml` (`backup.backup_dir`), а не флагом — иначе задание планировщика (оно запускает скрипт без аргументов) продолжило бы писать в старое место. Сейчас там путь внутри Google Диска — `G:\My Drive\crypto-signal-agent-backups` — копии автоматически попадают в облако, это защищает даже от поломки всего компьютера. Если в `config.yaml` путь не задан, используется локальная `backups\` внутри проекта (не в git) — минус в том, что при утере диска/компьютера пропадут и оригинал, и копии одновременно.
+
+Чтобы поменять место хранения, отредактируйте `backup.backup_dir` в `config.yaml`. Флаг `--backup-dir` при ручном запуске по-прежнему работает и перекрывает config.yaml для одного конкретного запуска:
 
 ```powershell
-.venv\Scripts\python.exe scripts\backup_db.py --backup-dir "C:\Users\vital\OneDrive\crypto-signal-agent-backups"
+.venv\Scripts\python.exe scripts\backup_db.py --backup-dir "C:\путь\для\разового\теста"
 ```
 
 Хранятся последние 14 копий (`--keep` меняет это число), старые удаляются автоматически. Лог — `logs\backup.log`.
