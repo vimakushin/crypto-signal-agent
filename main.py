@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -53,6 +54,9 @@ from collectors import binance_futures, coingecko, defillama
 from signals import oi_divergence, revenue_price_gap, volume_breakout
 from storage.db import (
     get_connection,
+    get_latest_binance_oi_fetch_time,
+    get_latest_coingecko_fetch_time,
+    get_latest_defillama_fetch_time,
     init_db,
     save_binance_oi_snapshots,
     save_coingecko_price_history,
@@ -62,6 +66,30 @@ from storage.db import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+# Same allowance for normal run-to-run jitter as
+# signals/revenue_price_gap.py's MAX_GAP_MULTIPLIER (that value's own
+# comment explains the reasoning: a scheduled run can legitimately land a
+# bit early/late without it meaning anything is actually broken) - reused
+# here as-is, not recalibrated, for the same reason: a source is considered
+# "stale" only once it's overdue by more than 1.5x its expected polling
+# interval, not the moment it's a few minutes late.
+STALENESS_MULTIPLIER = 1.5
+
+# scripts/backup_db.py runs once a day (config.yaml schedule.backup_run_time
+# sets WHEN, not how often) - there's no separate "backup interval" setting
+# in config.yaml to read, so this is a plain constant, same category as
+# STALENESS_MULTIPLIER above: an operational-diagnostics tolerance, not a
+# calibrated signal threshold, so it does not belong in config.yaml either.
+BACKUP_EXPECTED_INTERVAL_HOURS = 24
+
+# Matches scripts/backup_db.py's BACKUP_FILENAME_GLOB exactly - duplicated
+# rather than imported, since importing scripts.backup_db would run that
+# module's unconditional _setup_logging() call at import time (it runs at
+# module scope, not inside main()) and stomp on this script's own
+# _setup_logging(log_filename) setup for the current --cycle. See
+# scripts/backup_db.py's own module docstring for the full backup design.
+_BACKUP_FILENAME_GLOB = "db_????????_??????.sqlite"
 
 
 def _setup_logging(log_filename: str = "scheduler.log") -> None:
@@ -402,6 +430,107 @@ def run_binance_futures_cycle(config: dict) -> None:
         conn.close()
 
 
+def _warn_stale(source: str, elapsed_hours: float, expected_interval_hours: float) -> None:
+    """Log a hard-to-miss WARNING that `source` hasn't produced fresh data
+    recently, framed by a line of "=" so it stands out from the surrounding
+    INFO lines in the log file.
+
+    Args:
+        source: human-readable name of the data source/operation.
+        elapsed_hours: hours since the last observed activity.
+        expected_interval_hours: how often `source` is supposed to run.
+    """
+    border = "=" * 70
+    logger.warning(
+        "%s\n"
+        "STALE DATA: %s has not produced a new row in %.1f hours (%.1f days) - "
+        "expected roughly every %.1f hours. The scheduled task may have "
+        "silently failed to start (known low-memory issue on this machine, "
+        "see README.md) - check Get-ScheduledTaskInfo and the corresponding "
+        "logs\\scheduler_*.log / logs\\backup.log.\n%s",
+        border, source, elapsed_hours, elapsed_hours / 24, expected_interval_hours, border,
+    )
+
+
+def check_data_freshness(conn, config: dict) -> None:
+    """Warn loudly if any of the three collectors or the DB backup have gone
+    quiet for longer than expected (TZ section: transparency about what the
+    system is/isn't doing).
+
+    Why this exists at all: on this machine, Windows Task Scheduler has been
+    observed to report LastTaskResult=0 (success) for a task whose process
+    never actually started (a known low-memory condition here) - so nothing
+    in Task Scheduler itself flags the problem, and data collection just
+    quietly stops. Since Task Scheduler can't be trusted to notice this,
+    main.py checks its OWN evidence instead: how long ago each destination
+    table (or the backup folder) last actually received a new row/file. This
+    is run on every invocation, regardless of which --cycle was requested,
+    so that even a single-cycle run notices if a DIFFERENT source has gone
+    stale.
+
+    Each of the four checks is independent and best-effort: a source that
+    has genuinely never run yet (fresh install) logs an INFO line, not a
+    warning - that's an expected state, not a problem. A source that HAS run
+    before but has gone quiet for more than STALENESS_MULTIPLIER times its
+    expected interval gets a loud, boxed WARNING via _warn_stale. This
+    function never raises - see the try/except around its call site below.
+
+    Args:
+        conn: open storage/db.py connection to the live database.
+        config: parsed config.yaml (see load_config) - reads
+            schedule.defillama_poll_hours, schedule.binance_futures_poll_hours,
+            and backup.backup_dir.
+    """
+    schedule_cfg = config.get("schedule", {})
+    defillama_interval = schedule_cfg.get("defillama_poll_hours", 24)
+    binance_interval = schedule_cfg.get("binance_futures_poll_hours", 6)
+
+    checks = [
+        ("DeFiLlama collector (defillama_snapshots)", get_latest_defillama_fetch_time(conn), defillama_interval),
+        ("CoinGecko collector (coingecko_price_history)", get_latest_coingecko_fetch_time(conn), defillama_interval),
+        ("Binance Futures collector (binance_oi_snapshots)", get_latest_binance_oi_fetch_time(conn), binance_interval),
+    ]
+
+    for source, latest_iso, expected_interval_hours in checks:
+        if latest_iso is None:
+            logger.info("No data for %s yet, skipping freshness check", source)
+            continue
+        latest = datetime.fromisoformat(latest_iso)
+        elapsed_hours = (datetime.now(timezone.utc) - latest).total_seconds() / 3600
+        if elapsed_hours > expected_interval_hours * STALENESS_MULTIPLIER:
+            _warn_stale(source, elapsed_hours, expected_interval_hours)
+
+    # Backup check: no storage/db.py table for this - resolve backup_dir the
+    # same way scripts/backup_db.py's main() does (explicit config value, or
+    # the project-local default), duplicated rather than imported (see
+    # _BACKUP_FILENAME_GLOB's comment above for why scripts.backup_db can't
+    # be imported here).
+    try:
+        backup_dir_str = config.get("backup", {}).get("backup_dir")
+    except Exception:
+        logger.warning(
+            "Could not read backup.backup_dir from config.yaml - falling back to default backup dir"
+        )
+        backup_dir_str = None
+
+    backup_dir = Path(backup_dir_str) if backup_dir_str else PROJECT_ROOT / "backups"
+    if not backup_dir.is_absolute():
+        backup_dir = PROJECT_ROOT / backup_dir
+
+    if not backup_dir.is_dir():
+        logger.info("No backups for %s yet, skipping freshness check", backup_dir)
+    else:
+        backups = sorted(backup_dir.glob(_BACKUP_FILENAME_GLOB))
+        if not backups:
+            logger.info("No backups in %s yet, skipping freshness check", backup_dir)
+        else:
+            latest_backup = backups[-1]
+            mtime = latest_backup.stat().st_mtime
+            elapsed_hours = (datetime.now() - datetime.fromtimestamp(mtime)).total_seconds() / 3600
+            if elapsed_hours > BACKUP_EXPECTED_INTERVAL_HOURS * STALENESS_MULTIPLIER:
+                _warn_stale(f"DB backup ({backup_dir})", elapsed_hours, BACKUP_EXPECTED_INTERVAL_HOURS)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI args for this script.
 
@@ -467,6 +596,23 @@ if __name__ == "__main__":
         except Exception:
             logger.exception("Binance Futures cycle failed")
             failed = True
+
+    # Runs regardless of --cycle and regardless of `failed` above - even a
+    # single-cycle run should notice if a DIFFERENT source has gone stale
+    # (see check_data_freshness's docstring). Must never affect the process's
+    # exit code on its own: this is diagnostics about OTHER runs, not a
+    # failure of this run.
+    try:
+        db_path = Path(cfg["storage"]["sqlite_path"])
+        if not db_path.is_absolute():
+            db_path = PROJECT_ROOT / db_path
+        freshness_conn = get_connection(db_path)
+        try:
+            check_data_freshness(freshness_conn, cfg)
+        finally:
+            freshness_conn.close()
+    except Exception:
+        logger.exception("Data freshness check failed")
 
     if failed:
         sys.exit(1)

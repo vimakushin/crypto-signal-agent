@@ -360,6 +360,64 @@ def get_coingecko_price_history_before(
     ).fetchall()
 
 
+def get_latest_defillama_fetch_time(conn: sqlite3.Connection) -> str | None:
+    """Most recent `fetched_at` across ALL of defillama_snapshots, with no
+    per-protocol filter - unlike get_latest_snapshot above.
+
+    Used by main.py's data-freshness check, which asks "has this COLLECTOR
+    run recently at all", not "what's the latest data for protocol X" - a
+    single protocol having a recent row wouldn't tell you the collector as a
+    whole is still running on schedule, and vice versa a stale MAX() across
+    the whole table is exactly the "the scheduled task stopped starting"
+    symptom that check exists to catch. `fetched_at` (when the collector
+    call happened) rather than any data-derived timestamp is the right
+    column for that question, not just the only one available.
+
+    Returns:
+        ISO 8601 string of the latest fetched_at, or None if the table is
+        empty (collector has never run yet - not an error).
+    """
+    return conn.execute("SELECT MAX(fetched_at) FROM defillama_snapshots").fetchone()[0]
+
+
+def get_latest_binance_oi_fetch_time(conn: sqlite3.Connection) -> str | None:
+    """Most recent `fetched_at` across ALL of binance_oi_snapshots.
+
+    Deliberately `fetched_at` (when this collector run wrote the row), NOT
+    `oi_timestamp` (when Binance says the OI reading itself occurred) - see
+    get_latest_defillama_fetch_time's docstring for why: the freshness
+    question is "did the collector process actually run recently", which
+    `oi_timestamp` doesn't answer on its own (Binance's OI history endpoint
+    could in principle return timestamps for a window that ends before "now"
+    even on a perfectly healthy run). `fetched_at` is stamped by our own
+    collector at write time and is what actually moves - or stops moving -
+    when the scheduled task silently fails to start.
+
+    Returns:
+        ISO 8601 string of the latest fetched_at, or None if the table is
+        empty (collector has never run yet - not an error).
+    """
+    return conn.execute("SELECT MAX(fetched_at) FROM binance_oi_snapshots").fetchone()[0]
+
+
+def get_latest_coingecko_fetch_time(conn: sqlite3.Connection) -> str | None:
+    """Most recent `fetched_at` across ALL of coingecko_price_history.
+
+    Deliberately `fetched_at` (when this collector run wrote the row), NOT
+    `date` (the calendar date the price/volume point is FOR) - same
+    reasoning as get_latest_binance_oi_fetch_time's docstring: `date` is a
+    property of the data, not of when the collector last successfully ran,
+    and CoinGecko can legitimately return a `date` that lags "today" for
+    reasons unrelated to whether the collector itself is still being
+    launched on schedule.
+
+    Returns:
+        ISO 8601 string of the latest fetched_at, or None if the table is
+        empty (collector has never run yet - not an error).
+    """
+    return conn.execute("SELECT MAX(fetched_at) FROM coingecko_price_history").fetchone()[0]
+
+
 def save_signal_event(
     conn: sqlite3.Connection,
     signal_name: str,
