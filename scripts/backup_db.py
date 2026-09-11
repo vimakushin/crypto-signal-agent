@@ -71,7 +71,7 @@ shared cloud folder with other files in it).
 Usage
 -----
     .venv\\Scripts\\python.exe scripts\\backup_db.py
-    .venv\\Scripts\\python.exe scripts\\backup_db.py --backup-dir "C:\\Users\\vital\\OneDrive\\crypto-signal-agent-backups" --keep 30
+    .venv\\Scripts\\python.exe scripts\\backup_db.py --backup-dir "C:\\Users\\<you>\\OneDrive\\crypto-signal-agent-backups" --keep 30
 
 Safe to run repeatedly / on a schedule: creates --backup-dir if it doesn't
 exist yet, never overwrites a previous backup (each filename carries its own
