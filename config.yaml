@@ -186,30 +186,38 @@ schedule:
   # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
   # main.py. Read by scripts/register_scheduled_task.ps1 - change the value
   # here and re-run that script to reschedule, instead of editing the .ps1.
-  defillama_run_time: "08:00"
+  defillama_run_time: "11:00"
   # OI is a "fast" signal per TZ section 5 - poll every few hours, not daily.
   binance_futures_poll_hours: 6
+  # Local time of day ("HH:MM", 24h) the repeating BinanceOI trigger is
+  # anchored to - only its time-of-day matters (it fixes which clock hours
+  # the repeating trigger lands on, e.g. anchoring at 03:00 with a 6h
+  # interval fires at 03:00/09:00/15:00/21:00). Read by
+  # scripts/register_scheduled_task.ps1 the same way as the other
+  # *_run_time values below - change the value here and re-run that script
+  # to reschedule, instead of editing the .ps1.
+  binance_anchor_time: "03:00"
   # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
   # scripts/backup_db.py (the SQLite Online Backup API snapshot of
   # storage/db.sqlite - see that script's module docstring). Same format and
   # same scripts/register_scheduled_task.ps1 wiring as defillama_run_time
   # above - change the value here and re-run that script to reschedule.
-  # Default is an hour after defillama_run_time (08:00), so the daily
+  # Default is an hour after defillama_run_time (11:00), so the daily
   # DeFiLlama snapshot has already landed in storage/db.sqlite by the time
   # that day's backup is taken - not a hard dependency (the backup just
   # copies whatever is in the database at the time it runs, and the
   # BinanceOI task writes to it too), just a reasonable quiet-morning slot
   # that avoids overlapping the DeFiLlama task's own run.
-  backup_run_time: "09:00"
+  backup_run_time: "12:00"
   # Local time of day ("HH:MM", 24h) the Windows Task Scheduler task runs
   # notifications/telegram_bot.py (the daily Telegram digest of ranked
   # candidates - MVP.md checklist item 5). Same format and same
   # scripts/register_scheduled_task.ps1 wiring as the other *_run_time
-  # values above. Set an hour after backup_run_time (09:00), so the daily
+  # values above. Set an hour after backup_run_time (12:00), so the daily
   # DeFiLlama+CoinGecko cycle (can take several minutes because of
   # CoinGecko's rate limits) and the backup have both had time to finish
   # before the digest queries storage/db.sqlite for that day's candidates.
-  telegram_run_time: "09:30"
+  telegram_run_time: "12:30"
 
 storage:
   sqlite_path: storage/db.sqlite

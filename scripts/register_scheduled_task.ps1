@@ -26,8 +26,8 @@
 # Safe to re-run: it replaces all four task definitions (-Force) instead of
 # creating duplicates. Also re-run this after changing
 # schedule.defillama_run_time, schedule.binance_futures_poll_hours,
-# schedule.backup_run_time, or schedule.telegram_run_time in config.yaml, to
-# apply the new schedule.
+# schedule.binance_anchor_time, schedule.backup_run_time, or
+# schedule.telegram_run_time in config.yaml, to apply the new schedule.
 
 $ErrorActionPreference = "Stop"
 
@@ -50,10 +50,10 @@ if (-not (Test-Path $ConfigPath)) {
     throw "config.yaml not found at $ConfigPath"
 }
 
-# Read all four schedule values from config.yaml (schedule.defillama_run_time,
-# schedule.binance_futures_poll_hours, schedule.backup_run_time,
-# schedule.telegram_run_time) instead of hardcoding them here -
-# schedule/thresholds/watchlist live in config.yaml,
+# Read all five schedule values from config.yaml (schedule.defillama_run_time,
+# schedule.binance_futures_poll_hours, schedule.binance_anchor_time,
+# schedule.backup_run_time, schedule.telegram_run_time) instead of
+# hardcoding them here - schedule/thresholds/watchlist live in config.yaml,
 # not in code (CLAUDE.md project rule). Uses the project's own venv Python +
 # PyYAML (already a dependency, see requirements.txt) rather than adding a
 # separate PowerShell YAML module just for this.
@@ -73,13 +73,14 @@ print(cfg["schedule"]["defillama_run_time"])
 print(cfg["schedule"]["binance_futures_poll_hours"])
 print(cfg["schedule"]["backup_run_time"])
 print(cfg["schedule"]["telegram_run_time"])
+print(cfg["schedule"]["binance_anchor_time"])
 '@
 $tempScriptPath = Join-Path $env:TEMP "crypto-signal-agent_read-schedule.py"
 Set-Content -Path $tempScriptPath -Value $readConfigScript -Encoding utf8
 try {
     $ConfigOutput = & $PythonExe $tempScriptPath $ConfigPath
-    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 4) {
-        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time / schedule.telegram_run_time from $ConfigPath"
+    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 5) {
+        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time / schedule.telegram_run_time / schedule.binance_anchor_time from $ConfigPath"
     }
 } finally {
     Remove-Item -Path $tempScriptPath -ErrorAction SilentlyContinue
@@ -88,6 +89,7 @@ $RunTimeRaw = $ConfigOutput[0].Trim()
 $PollHoursRaw = $ConfigOutput[1].Trim()
 $BackupRunTimeRaw = $ConfigOutput[2].Trim()
 $TelegramRunTimeRaw = $ConfigOutput[3].Trim()
+$BinanceAnchorRunTimeRaw = $ConfigOutput[4].Trim()
 
 $timeParts = $RunTimeRaw -split ":"
 if ($timeParts.Count -ne 2) {
@@ -124,6 +126,16 @@ if ($TelegramRunHour -lt 0 -or $TelegramRunHour -gt 23 -or $TelegramRunMinute -l
     throw "schedule.telegram_run_time in config.yaml is out of range: '$TelegramRunTimeRaw'"
 }
 
+$binanceAnchorTimeParts = $BinanceAnchorRunTimeRaw -split ":"
+if ($binanceAnchorTimeParts.Count -ne 2) {
+    throw "schedule.binance_anchor_time in config.yaml must look like `"HH:MM`" (24h), got '$BinanceAnchorRunTimeRaw'"
+}
+$BinanceAnchorHour = [int]$binanceAnchorTimeParts[0]
+$BinanceAnchorMinute = [int]$binanceAnchorTimeParts[1]
+if ($BinanceAnchorHour -lt 0 -or $BinanceAnchorHour -gt 23 -or $BinanceAnchorMinute -lt 0 -or $BinanceAnchorMinute -gt 59) {
+    throw "schedule.binance_anchor_time in config.yaml is out of range: '$BinanceAnchorRunTimeRaw'"
+}
+
 # Built from integer Hour/Minute, not an "8:00AM"-style string - -At needs an
 # actual DateTime, and parsing "HH:MMAM/PM" text depends on the Windows
 # locale/culture. That breaks silently on a machine with a different locale,
@@ -133,13 +145,14 @@ $RunTime = Get-Date -Hour $RunHour -Minute $RunMinute -Second 0
 $BackupRunTime = Get-Date -Hour $BackupRunHour -Minute $BackupRunMinute -Second 0
 $TelegramRunTime = Get-Date -Hour $TelegramRunHour -Minute $TelegramRunMinute -Second 0
 
-# Anchor for the repeating Binance trigger - midnight today. Only its
-# time-of-day matters (it fixes which clock hours the repeating trigger
-# lands on, e.g. anchoring at 00:00 with a 6h interval fires at
-# 00:00/06:00/12:00/18:00); the date itself is irrelevant once the
-# repetition pattern is registered, and -StartWhenAvailable below covers a
-# PC that's off/asleep at the exact moment a repetition was due.
-$BinanceAnchorTime = Get-Date -Hour 0 -Minute 0 -Second 0
+# Anchor for the repeating Binance trigger - schedule.binance_anchor_time
+# from config.yaml (today's date, that time of day). Only its time-of-day
+# matters (it fixes which clock hours the repeating trigger lands on, e.g.
+# anchoring at 03:00 with a 6h interval fires at 03:00/09:00/15:00/21:00);
+# the date itself is irrelevant once the repetition pattern is registered,
+# and -StartWhenAvailable below covers a PC that's off/asleep at the exact
+# moment a repetition was due.
+$BinanceAnchorTime = Get-Date -Hour $BinanceAnchorHour -Minute $BinanceAnchorMinute -Second 0
 
 # NOTE: Task Scheduler must call python.exe through cmd.exe /c, not directly.
 # Calling the venv's python.exe as the task's own -Execute target hangs
