@@ -1,56 +1,58 @@
 # crypto-signal-agent
 
-Сервис, который следит за крипторынком и ищет монеты на ранней стадии движения — до того, как рост станет заметен на графике цены.
+*English | [Русский](README.ru.md)*
 
-## Какую задачу решает
+A service that watches the crypto market for coins in the early stage of a move — before that move shows up on the price chart.
 
-К моменту, когда рост монеты виден на ценовом графике, ранняя возможность обычно уже упущена. Вместо того чтобы смотреть на цену, сервис следит за тремя независимыми рыночными сигналами, которые часто опережают цену: рост выручки протокола без реакции капитализации токена, накопление позиций на фьючерсном рынке без движения цены, и пробой ценового уровня на аномальном объёме. Каждый день бот присылает в Telegram список кандидатов — с расшифровкой, какой именно сигнал сработал и с какими цифрами.
+## What problem it solves
 
-Это не торговый бот. Система не даёт рекомендаций «покупать/продавать», не называет целевые цены и не исполняет сделки — она только собирает и ранжирует кандидатов для ручной проверки человеком. Решение всегда остаётся за пользователем.
+By the time a coin's rally is visible on the price chart, the early opportunity is usually already gone. Instead of watching price, this service tracks three independent market signals that tend to lead it: protocol revenue growing while the token's market cap doesn't react, futures positioning building up while price stays flat, and a price breakout on abnormal volume. Every day, a Telegram bot sends a list of candidates — with a breakdown of exactly which signal fired and on what numbers.
 
-## Как устроено
+This isn't a trading bot. It never says "buy" or "sell," never names a price target, and never places an order — it only collects and ranks candidates for a human to review manually. The call is always the user's.
+
+## How it's built
 
 ```
 collectors/  →  signals/  →  scoring/  →  notifications/
-(сбор данных)  (детекторы)   (ранжирование)  (сводка)
+(data collection) (detectors)  (ranking)   (digest)
 ```
 
-- **Сборщики данных** (`collectors/`) берут историю из трёх бесплатных публичных API — DeFiLlama (revenue/fees протоколов), Binance Futures (Open Interest, без ключа) и CoinGecko (цена/объём/капитализация) — и копят её в локальной базе SQLite (`storage/`), чтобы сигналы могли сравнивать «сейчас» с «было раньше» без повторных запросов к источнику.
-- **Детекторы сигналов** (`signals/`) — три независимых модуля:
-  - **revenue-gap** — выручка протокола выросла на X% за 7-30 дней, а капитализация токена не отреагировала;
-  - **OI-дивергенция** — открытый интерес на фьючерсах вырос на X%, а цена почти не сдвинулась;
-  - **пробой на объёме** — цена пробила многомесячный уровень сопротивления на объёме в 2-3× выше среднего.
+- **Collectors** (`collectors/`) pull history from three free public APIs — DeFiLlama (protocol revenue/fees), Binance Futures (Open Interest, no API key required) and CoinGecko (price/volume/market cap) — and accumulate it in a local SQLite database (`storage/`), so signals can compare "now" against "before" without re-hitting the source every time.
+- **Signal detectors** (`signals/`) — three independent modules:
+  - **revenue-gap** — protocol revenue grew X% over 7-30 days while the token's market cap didn't react;
+  - **OI divergence** — futures Open Interest grew X% while price barely moved;
+  - **volume breakout** — price broke a multi-month resistance level on 2-3× average volume.
 
-  Каждый детектор явно отличает «сигнал не сработал» от «данных пока недостаточно» или «данные ненадёжны» — молчание никогда не выдаётся за отсутствие сигнала.
-- **Скоринг** (`scoring/ranker.py`) складывает сработавшие сигналы по конкретной монете в один балл — по весам из `config.yaml` — и не пересчитывает ничего заново: только агрегирует то, что уже сохранено.
-- **Уведомления** (`notifications/`) раз в сутки шлют в Telegram сводку кандидатов с полной расшифровкой, и параллельно ведут `observations.md` — простой markdown-журнал ручной разметки: что сигнализировала система, что стало с монетой через 7/14/30 дней, сработало или нет.
+  Each detector explicitly distinguishes "the signal didn't fire" from "not enough history yet" or "the data can't be trusted" — silence is never presented as an absence of signal.
+- **Scoring** (`scoring/ranker.py`) sums a coin's fired signals into a single score, weighted per `config.yaml`. It never recomputes anything — only aggregates what's already been stored.
+- **Notifications** (`notifications/`) send a daily Telegram digest of candidates with the full breakdown, and in parallel maintain `observations.md` — a plain markdown manual-labeling journal: what the system flagged, and what happened to the coin 7/14/30 days later.
 
-Все пороги, веса сигналов, список отслеживаемых монет и расписание живут в `config.yaml`, а не зашиты в коде.
+All thresholds, signal weights, the watchlist and the schedule live in `config.yaml`, not hardcoded in the code.
 
-## Что уже работает
+## What's working today
 
-Определение готовности MVP — в [`MVP.md`](MVP.md), шесть конкретных пунктов без «почти». На текущий момент собраны данные по всем трём источникам, все три сигнала считаются и логируются, срабатывания сохраняются в базу, скор считается и объясняется, ежедневная сводка уходит в Telegram. Веб-интерфейс, ручная разметка через UI и полноценный бэктест — сознательно не в MVP, см. [`BACKLOG.md`](BACKLOG.md).
+MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. A web UI, in-app manual labeling, and a full backtest are deliberately out of scope for MVP — see [`BACKLOG.md`](BACKLOG.md).
 
-## Как разрабатывался проект
+## How the project was built
 
-Весь код написан и проверен через Claude Code с разделением ролей между специализированными субагентами (`.claude/agents/`), а не одним потоком без структуры:
+Every line of code here was written and reviewed through Claude Code, with the work split across specialized subagents (`.claude/agents/`) rather than done in one undifferentiated stream:
 
-- **python-dev** — пишет и правит всё ядро на Python: сборщики, детекторы сигналов, скоринг, хранилище, уведомления.
-- **web-dev** — отдельно отвечает за будущий веб-интерфейс, не трогает ядро.
-- **code-reviewer** — после каждого заметного изменения проверяет код на корректность: логические ошибки, необработанные исключения, утечки секретов — сам ничего не правит, только докладывает.
-- **signal-validator** — отдельно проверяет не код, а осмысленность результата: свежесть данных, ложные срабатывания, шум на низколиквидных монетах, отсутствие подглядывания в будущее при расчётах на исторических данных.
+- **python-dev** writes and fixes the entire Python core: collectors, signal detectors, scoring, storage, notifications.
+- **web-dev** owns the future web UI, and only the web UI — it never touches the core.
+- **code-reviewer** checks every notable change for correctness — logic bugs, unhandled exceptions, leaked secrets — after it's written and before the next task starts. It only reads and reports; it never edits code itself.
+- **signal-validator** checks something different: not whether the code is right, but whether its output means anything — data freshness, false positives, noise on low-liquidity coins, no look-ahead bias when running calculations against historical data.
 
-Порядок по умолчанию: пишет профильный агент → проверяет `code-reviewer` → если это сигнал — ещё и `signal-validator` → блокирующие находки чинятся до того, как двигаться дальше.
+The default order is: the relevant agent writes the change → `code-reviewer` checks it → if it's a signal, `signal-validator` checks it too → any blocking finding gets fixed before moving on to the next thing.
 
-Готовность MVP определена заранее и явно, в [`MVP.md`](MVP.md) — шесть пунктов, всё, чего там нет, в MVP не входит. Каждое отклонение от текущего пункта проговаривается прямо, а не делается молча. Осознанно отложенные решения — с обоснованием, а не забытые — фиксируются в [`BACKLOG.md`](BACKLOG.md) и перечитываются перед следующей итерацией.
+MVP readiness was defined up front, in writing, in [`MVP.md`](MVP.md) — six items, and anything not on that list is simply out of scope for MVP. Every deviation from the current item gets called out explicitly rather than slipped in quietly. Decisions that were deliberately deferred — with the reasoning for deferring them, not just dropped — are logged in [`BACKLOG.md`](BACKLOG.md) and re-read before each new round of work.
 
 ---
 
-## Эксплуатация
+## Operations
 
-### Установка
+### Setup
 
-Нужно заранее: Python 3.11+ и git.
+You'll need Python 3.11+ and git.
 
 ```powershell
 git clone https://github.com/vimakushin/crypto-signal-agent.git
@@ -59,49 +61,49 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-Скопируйте `.env.example` в `.env` и впишите токен Telegram-бота и свой chat_id (получить у [@BotFather](https://t.me/BotFather) и через `https://api.telegram.org/bot<TOKEN>/getUpdates` после того, как напишете боту любое сообщение) — без этого сборщики данных и сигналы всё равно работают, не сработает только ежедневная сводка в Telegram.
+Copy `.env.example` to `.env` and fill in a Telegram bot token and your chat id (get a token from [@BotFather](https://t.me/BotFather), then find your chat id by sending the bot any message and checking `https://api.telegram.org/bot<TOKEN>/getUpdates`) — data collection and the signals themselves work fine without this, only the daily Telegram digest won't send.
 
-### Запуск
+### Running it
 
 ```powershell
 .venv\Scripts\python.exe main.py
 ```
 
-Без `--cycle` выполняются оба цикла сразу. На первом запуске кандидатов, скорее всего, не будет: revenue-gap нужно минимум 7 дней истории капитализации, пробою на объёме — почти всё окно `resistance_lookback_days` (180 дней по умолчанию) — без `backfill_history.py` это копится месяцами. OI-дивергенция может сработать уже на первом запуске (Binance сразу отдаёт ~36-48ч истории). Запустить по отдельности:
+Without `--cycle`, both cycles run together. On the very first run, you probably won't see any candidates yet: revenue-gap needs at least 7 days of accumulated market-cap history, and volume breakout needs nearly the whole `resistance_lookback_days` window (180 days by default) — without `backfill_history.py`, that takes months to build up on its own. OI divergence can fire on the first run, since Binance returns ~36-48h of history right away. To run one cycle at a time:
 
 ```powershell
 .venv\Scripts\python.exe main.py --cycle defillama
 .venv\Scripts\python.exe main.py --cycle binance
 ```
 
-### Наполнение истории задним числом
+### Backfilling history
 
-Обычный запуск копит историю только с момента первого запуска. Чтобы сигналам было на чём проверяться сразу, есть разовый скрипт — грузит историю revenue/цены/капитализации из прошлого (DeFiLlama — несколько лет, CoinGecko — до 365 дней, Binance OI — до ~30 дней, глубже у самого Binance данных нет):
+A normal run only accumulates history from the moment it first ran. To give the signals something to work with right away, there's a one-off script that pulls historical revenue/price/market-cap data (DeFiLlama — several years, CoinGecko — up to 365 days, Binance OI — up to ~30 days, which is as far back as Binance itself keeps it):
 
 ```powershell
 .venv\Scripts\python.exe scripts\backfill_history.py
 ```
 
-Медленно (лимиты CoinGecko), делается один раз вручную, не часть ежедневного цикла. Безопасно перезапускаемый — уже сохранённые дни не дублируются. Прогресс и пропуски — в `logs\backfill.log`.
+Slow (CoinGecko's rate limits), meant to be run once by hand, not part of the daily cycle. Safe to re-run — days already saved aren't duplicated. Progress and any gaps go to `logs\backfill.log`.
 
-### Автоматический запуск по расписанию
+### Scheduled runs
 
-Четыре отдельных задания Планировщика Windows:
+Four separate Windows Task Scheduler tasks:
 
-- **`CryptoSignalAgent-DeFiLlama`** — раз в сутки, `main.py --cycle defillama`.
-- **`CryptoSignalAgent-BinanceOI`** — каждые несколько часов, `main.py --cycle binance`.
-- **`CryptoSignalAgent-Backup`** — раз в сутки, `scripts\backup_db.py`.
-- **`CryptoSignalAgent-TelegramDigest`** — раз в сутки, `notifications\telegram_bot.py` (заодно дописывает `observations.md`).
+- **`CryptoSignalAgent-DeFiLlama`** — once a day, `main.py --cycle defillama`.
+- **`CryptoSignalAgent-BinanceOI`** — every few hours, `main.py --cycle binance`.
+- **`CryptoSignalAgent-Backup`** — once a day, `scripts\backup_db.py`.
+- **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`).
 
-Время и периодичность — в `config.yaml` (`schedule.*`). После правки `config.yaml` один раз заново выполнить:
+Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.yaml`, re-run this once to apply it:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_scheduled_task.ps1
 ```
 
-Если компьютер в назначенное время выключен — пропуск ожидаем, задание выполнится при следующем включении.
+If the computer is off at the scheduled time, that run is simply skipped — it'll run at the next opportunity once the computer is back on.
 
-Проверить состояние:
+Check status:
 
 ```powershell
 Get-ScheduledTask -TaskName "CryptoSignalAgent-DeFiLlama" | Get-ScheduledTaskInfo
@@ -110,7 +112,7 @@ Get-ScheduledTask -TaskName "CryptoSignalAgent-Backup" | Get-ScheduledTaskInfo
 Get-ScheduledTask -TaskName "CryptoSignalAgent-TelegramDigest" | Get-ScheduledTaskInfo
 ```
 
-Запустить прямо сейчас вручную:
+Run any of them right now, by hand:
 
 ```powershell
 Start-ScheduledTask -TaskName "CryptoSignalAgent-DeFiLlama"
@@ -119,66 +121,66 @@ Start-ScheduledTask -TaskName "CryptoSignalAgent-Backup"
 Start-ScheduledTask -TaskName "CryptoSignalAgent-TelegramDigest"
 ```
 
-Логи:
+Logs:
 
-- `logs\scheduler_defillama.log` — задание DeFiLlama.
-- `logs\scheduler_binance.log` — задание Binance.
-- `logs\backup.log` — задание бэкапа.
-- `logs\telegram.log` — задание Telegram-сводки.
-- `logs\scheduler.log` — только ручной запуск `main.py` без `--cycle`.
-- `logs\backfill.log` — разовый `backfill_history.py`.
+- `logs\scheduler_defillama.log` — the DeFiLlama task.
+- `logs\scheduler_binance.log` — the Binance task.
+- `logs\backup.log` — the backup task.
+- `logs\telegram.log` — the Telegram digest task.
+- `logs\scheduler.log` — manual `main.py` runs without `--cycle` only.
+- `logs\backfill.log` — the one-off `backfill_history.py`.
 
-Лог всегда объясняет, за что монета получила сигнал, и отдельно различает «истории пока недостаточно» от «данных хватает, но порог не пробит». Если сбор данных за день не удался — лог предупредит отдельной строкой, а не молча оценит по устаревшим данным. При каждом запуске `main.py` также проверяет, не «протухли» ли данные по каждому источнику (и файл бэкапа) дольше ожидаемого — если да, в лог и консоль идёт заметное предупреждение, а не тихий пропуск.
+The log always explains exactly why a coin got a signal, and separately distinguishes "not enough history yet" from "there's plenty of data, it just didn't cross the threshold." If a day's data collection failed outright, the log flags it as its own line instead of silently scoring against stale data. Every `main.py` run also checks whether any source's data — or the backup file — has gone stale longer than expected; if so, it prints and logs a hard-to-miss warning instead of failing silently.
 
-Если задания пропали (переустановка Windows, перенос на другой компьютер) — пересоздать той же командой `register_scheduled_task.ps1` выше.
+If the scheduled tasks ever disappear (a Windows reinstall, moving to a new machine), recreate them with the same `register_scheduled_task.ps1` command above.
 
-### Журнал наблюдений (`observations.md`)
+### The observations journal (`observations.md`)
 
-Ранняя, урезанная версия ручной разметки: обычная markdown-таблица в корне проекта, коммитится в git. Каждый день, когда уходит сводка в Telegram, туда дописывается по одной строке на нового кандидата (не чаще раза в 30 дней на одну и ту же монету, чтобы сигнал, держащийся сработавшим неделями, не плодил дубли) — дата, монета, скор, какие сигналы сработали, цена/капитализация на тот момент. Через 7 дней система сама подставляет туда фактическую цену/капитализацию. Колонки «через 14 дней», «через 30 дней» и «Вывод» — заполняются вручную, код их не трогает.
+An early, cut-down version of manual labeling: a plain markdown table at the project root, committed to git. Every day, when the Telegram digest goes out, one row gets added per new candidate — no more than once every 30 days for the same coin, so a signal that stays fired for weeks doesn't flood the journal with near-duplicates — with the date, the coin, its score, which signals fired, and price/market cap at that moment. Seven days later, the system fills in the actual price/market cap on its own. The "after 14 days," "after 30 days," and "Verdict" columns are filled in by hand; the code never touches them.
 
-### Резервные копии базы данных
+### Database backups
 
-`storage\db.sqlite` в git не попадает (см. `.gitignore`) — слишком большой и постоянно меняется. `scripts\backup_db.py` использует безопасный способ SQLite снять копию "на лету" (`sqlite3.Connection.backup`), не ломается, даже если в этот момент идёт запись.
+`storage\db.sqlite` isn't tracked in git (see `.gitignore`) — too large and it changes constantly. `scripts\backup_db.py` uses SQLite's own safe way of snapshotting a live database (`sqlite3.Connection.backup`), which doesn't break even if a write is happening at that exact moment.
 
 ```powershell
 .venv\Scripts\python.exe scripts\backup_db.py
 ```
 
-Куда писать копии, задаётся в `config.yaml` (`backup.backup_dir`), а не флагом — иначе задание планировщика (оно запускает скрипт без аргументов) продолжило бы писать в старое место. Если путь не задан, используется локальная `backups\` внутри проекта (не в git) — минус в том, что при утере диска/компьютера пропадут и оригинал, и копии одновременно; надёжнее указать папку внутри облачной синхронизации (OneDrive, Google Диск и т.п.).
+Where backups go is set in `config.yaml` (`backup.backup_dir`), not a flag — otherwise the scheduled task, which runs the script with no arguments, would keep writing to the old location forever. If it isn't set, backups land in a local `backups\` folder inside the project (not tracked in git) — the downside being that losing the disk or the machine takes out both the original and the backups at once; pointing it at a cloud-synced folder (OneDrive, Google Drive, etc.) is safer.
 
-Чтобы поменять место хранения, отредактируйте `backup.backup_dir` в `config.yaml`. Флаг `--backup-dir` при ручном запуске по-прежнему работает и перекрывает config.yaml для одного конкретного запуска:
+To change where backups are stored, edit `backup.backup_dir` in `config.yaml`. The `--backup-dir` flag still works for a manual, one-off run and overrides `config.yaml` just for that run:
 
 ```powershell
-.venv\Scripts\python.exe scripts\backup_db.py --backup-dir "C:\путь\для\разового\теста"
+.venv\Scripts\python.exe scripts\backup_db.py --backup-dir "C:\path\for\a\one-off\test"
 ```
 
-Хранятся последние 14 копий (`--keep` меняет это число), старые удаляются автоматически. Лог — `logs\backup.log`.
+The 14 most recent backups are kept (`--keep` changes that number); older ones are deleted automatically. Log: `logs\backup.log`.
 
-### Контроль версий (git)
+### Version control (git)
 
-Git — история изменений проекта; каждый коммит — снимок файлов, к которому можно вернуться. Касается только кода (`.py`, `.yaml`, `.md`) — БД, логи и бэкапы в git не попадают, для них раздел выше.
+Git is the project's change history — every commit is a snapshot you can come back to. This only covers code (`.py`, `.yaml`, `.md`); the database, logs and backups aren't tracked in git, see the section above for those.
 
-#### Сохранить изменения
+#### Saving changes
 
 ```powershell
 git add .
-git commit -m "краткое описание того, что изменилось"
+git commit -m "short description of what changed"
 git push
 ```
 
-`git add .` — отмечает изменения к сохранению. `git commit` — сохраняет снимок локально. `git push` — отправляет на GitHub, отдельно от компьютера.
+`git add .` marks changes as ready to be saved. `git commit` saves a snapshot locally. `git push` sends it to GitHub, off the machine.
 
-#### Восстановить на новом компьютере
+#### Restoring on a new machine
 
-См. «Установка» выше. После клонирования код и `config.yaml` на месте, но:
+See "Setup" above. Once you've cloned it, the code and `config.yaml` are in place, but:
 
-- **История в БД пустая** — восстановить из бэкапа:
+- **The database history is empty** — restore it from a backup:
 
 ```powershell
 copy "backups\db_20260909_080000.sqlite" "storage\db.sqlite"
 ```
 
-  (подставить имя самой свежей копии).
+  (use the filename of your most recent backup).
 
-- **Секреты** — `.env` не хранится в git, создать заново из `.env.example` (см. «Установка»).
-- Задания Планировщика — зарегистрировать заново (`scripts\register_scheduled_task.ps1`), не переносятся вместе с кодом.
+- **Secrets** — `.env` isn't tracked in git; recreate it from `.env.example` (see "Setup").
+- The scheduled tasks need to be registered again (`scripts\register_scheduled_task.ps1`) — they don't travel with the code.
