@@ -161,10 +161,26 @@ $BinanceAnchorTime = Get-Date -Hour $BinanceAnchorHour -Minute $BinanceAnchorMin
 # inheriting console handles in that mode. The cmd.exe wrapper avoids it.
 # Verified working (LastTaskResult=0, clean log, fresh SQLite row) with this
 # wrapper; do not "simplify" this back to a direct python.exe call.
+#
+# NOTE: explicit -AllowStartIfOnBatteries / -DontStopIfGoingOnBatteries -
+# these are the actual (inverted-name) cmdlet parameters for what show up as
+# the Settings object's DisallowStartIfOnBatteries/StopIfGoingOnBatteries
+# properties; New-ScheduledTaskSettingsSet defaults both of THOSE to $true
+# when neither switch is passed, which silently skipped or aborted runs on
+# this machine (a laptop, not always plugged in) - confirmed live via
+# Get-ScheduledTask ... | Select -Expand Settings on 2026-09-12. (A first
+# attempt at this fix used -DisallowStartIfOnBatteries:$false /
+# -StopIfGoingOnBatteries:$false directly - those aren't real parameter
+# names on this cmdlet and fail with "parameter cannot be found", caught by
+# actually running the script rather than just reading it.) WakeToRun stays
+# off on purpose - StartWhenAvailable already picks up a missed run once the
+# PC is next on, no need to wake it just to poll.
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -DontStopOnIdleEnd `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries
 
 if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false
