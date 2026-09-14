@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 import sys
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
@@ -97,6 +98,7 @@ from storage.db import (  # noqa: E402
     get_binance_oi_snapshot_hours_before,
     get_coingecko_price_history_before,
     get_connection,
+    get_defillama_daily_revenue_window,
     get_snapshot_days_before,
 )
 
@@ -299,31 +301,35 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         as "fired" for several consecutive days under revenue_price_gap's
         rolling 7-day window, so the raw count alone overstates how many
         distinct events actually happened), a per-protocol breakdown, and
-        the raw revenue_change_Xd_pct values seen across all evaluated
-        points (for _describe).
+        the revenue_growth_pct values seen across FIRED points only (for
+        _describe - see the loop below for why this is fired-only, not
+        all-evaluated, since this rewrite).
     """
     lookback_days = signal_cfg["lookback_days"]
+    baseline_window_days = signal_cfg["baseline_window_days"]
     # Same check signals/revenue_price_gap.py's scan_watchlist() raises for
-    # live use - duplicated here so a misconfigured lookback_days (config.yaml
-    # currently pins it to 7) doesn't silently make replay compare the wrong
-    # revenue window against a market-cap snapshot from a different number of
-    # days back if that value is ever changed.
-    if lookback_days not in (7, 30):
+    # live use - duplicated here so a misconfigured lookback_days/
+    # baseline_window_days doesn't silently make replay compare a "recent"
+    # window that isn't actually narrower than the "baseline" it's compared
+    # against.
+    if lookback_days >= baseline_window_days:
         raise ValueError(
-            f"signals.revenue_price_gap.lookback_days in config.yaml must be 7 or 30 "
-            f"(DeFiLlama only pre-computes revenue growth for those two windows), got "
-            f"{lookback_days!r} - see signals/revenue_price_gap.py's scan_watchlist() docstring"
+            f"signals.revenue_price_gap.lookback_days ({lookback_days}) must be strictly "
+            f"less than baseline_window_days ({baseline_window_days}) in config.yaml - see "
+            f"signals/revenue_price_gap.py's scan_watchlist() docstring"
         )
     revenue_threshold = signal_cfg["revenue_growth_threshold_pct"]
     mcap_threshold = signal_cfg["mcap_reaction_threshold_pct"]
+    outlier_max_share_pct = signal_cfg.get("outlier_max_share_pct", 100)
     max_gap_days = lookback_days * MAX_GAP_MULTIPLIER
-    revenue_col = "revenue_change_7d_pct" if lookback_days == 7 else "revenue_change_30d_pct"
-    # Same absolute-revenue column signals/revenue_price_gap.py's
-    # scan_watchlist() reads for its own min_revenue_total_usd check - NOT
-    # `revenue_col` above, which is the growth-% column, not the absolute
-    # total.
-    revenue_total_col = "revenue_total_7d" if lookback_days == 7 else "revenue_total_30d"
     min_revenue_total_usd = signal_cfg.get("min_revenue_total_usd", 0)
+    # math.floor, not math.ceil - mirrors signals/revenue_price_gap.py's own
+    # scan_watchlist() exactly (see that function's comment for why: ceil on
+    # a small window like lookback_days=7 rounds "~90% coverage" up to
+    # "100%, zero gaps tolerated"). Duplicated here rather than imported -
+    # keep both in sync.
+    min_valid_recent = math.floor(lookback_days * revenue_price_gap.MIN_HISTORY_COVERAGE_FRACTION)
+    min_valid_baseline = math.floor(baseline_window_days * revenue_price_gap.MIN_HISTORY_COVERAGE_FRACTION)
 
     per_protocol: dict[str, dict] = {}
     evaluated_total = 0
@@ -333,6 +339,7 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
     excluded_no_mcap = 0
     excluded_gap_too_large = 0
     excluded_liquidity = 0
+    excluded_insufficient_daily_history = 0
     revenue_values: list[float] = []
 
     for slug in watchlist:
@@ -356,30 +363,9 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         for i, latest in enumerate(deduped):
             latest_date = dates[i]
 
-            # Liquidity/noise floor (TZ section 9) - same check and same
-            # column signals/revenue_price_gap.py's scan_watchlist() applies
-            # BEFORE looking up the earlier point, so replay never scores a
-            # point production would never even have evaluated.
-            revenue_total_now = latest[revenue_total_col]
-            if revenue_total_now is None or revenue_total_now < min_revenue_total_usd:
-                excluded_liquidity += 1
-                entries.append((latest_date, None))
-                continue
-
             earlier = get_snapshot_days_before(conn, slug, latest["fetched_at"], lookback_days)
             if earlier is None:
                 no_earlier_pair += 1
-                entries.append((latest_date, None))
-                continue
-
-            # Same min_revenue_total_usd floor as the `latest` check above,
-            # applied to `earlier` too - matches the fix in
-            # signals/revenue_price_gap.py's scan_watchlist(): a tiny
-            # EARLIER revenue can inflate revenue_growth_pct just as much as
-            # a tiny latest one, since it's the ratio's denominator.
-            earlier_revenue = earlier[revenue_total_col]
-            if earlier_revenue is None or earlier_revenue < min_revenue_total_usd:
-                excluded_liquidity += 1
                 entries.append((latest_date, None))
                 continue
 
@@ -407,31 +393,64 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
                 entries.append((latest_date, None))
                 continue
 
+            # Same coverage/liquidity prefilters signals/revenue_price_gap.py's
+            # scan_watchlist() applies live, using the same
+            # get_defillama_daily_revenue_window() production function - so
+            # replay never scores a point production would never even have
+            # evaluated, and can never silently diverge from what windowing
+            # production would have picked.
+            end_date = latest_date.isoformat()
+            recent_rows = get_defillama_daily_revenue_window(conn, slug, end_date, lookback_days)
+            baseline_rows = get_defillama_daily_revenue_window(
+                conn, slug, end_date, baseline_window_days
+            )
+            valid_recent = [r["revenue_usd"] for r in recent_rows if r["revenue_usd"] is not None]
+            valid_baseline = [r["revenue_usd"] for r in baseline_rows if r["revenue_usd"] is not None]
+
+            if len(valid_recent) < min_valid_recent or len(valid_baseline) < min_valid_baseline:
+                excluded_insufficient_daily_history += 1
+                entries.append((latest_date, None))
+                continue
+
+            recent_sum = sum(valid_recent)
+            baseline_weekly_equivalent = statistics.median(valid_baseline) * lookback_days
+            if recent_sum < min_revenue_total_usd or baseline_weekly_equivalent < min_revenue_total_usd:
+                excluded_liquidity += 1
+                entries.append((latest_date, None))
+                continue
+
             evaluated_total += 1
             stats["evaluated"] += 1
 
-            rev_val = latest[revenue_col]
-            if rev_val is not None:
-                revenue_values.append(rev_val)
-
             try:
                 signal = revenue_price_gap._evaluate_snapshots(
-                    latest, earlier, revenue_threshold, mcap_threshold, lookback_days,
+                    latest, earlier, recent_rows, baseline_rows,
+                    revenue_threshold, mcap_threshold, outlier_max_share_pct, lookback_days,
                 )
             except revenue_price_gap._DataQualityRejected:
                 # _evaluate_snapshots now raises instead of returning None
-                # for its own internal guards (base/current revenue
-                # non-positive - the gap and mcap guards are already
-                # covered by this function's own prefilters above, so this
-                # branch is effectively unreachable for those two). Treat
-                # exactly like the old `signal = None` / not-fired case so
-                # replay's counts are unaffected.
+                # for its own internal guards (outlier share, base/current
+                # median revenue non-positive - the gap and mcap guards are
+                # already covered by this function's own prefilters above,
+                # so this branch is effectively unreachable for those two).
+                # Treat exactly like the old `signal = None` / not-fired
+                # case so replay's counts are unaffected.
                 signal = None
             fired = signal is not None
             entries.append((latest_date, fired))
             if fired:
                 fired_raw_total += 1
                 stats["fired"] += 1
+                # Only collected when the signal actually fired - unlike the
+                # old revenue_change_Xd_pct column (always present on every
+                # evaluated row), revenue_growth_pct is only a field on the
+                # returned RevenueGapSignal object itself, which
+                # _evaluate_snapshots only constructs once it has already
+                # decided to fire. This narrows what this distribution shows
+                # (fired growth-% values, not all-evaluated growth-%), but
+                # is still useful for judging how far above threshold actual
+                # fires land.
+                revenue_values.append(signal.revenue_growth_pct)
 
         episodes = _collapse_daily_episodes(entries)
         stats["episodes"] = episodes
@@ -441,9 +460,10 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
 
     return {
         "lookback_days": lookback_days,
-        "revenue_col": revenue_col,
+        "baseline_window_days": baseline_window_days,
         "revenue_threshold": revenue_threshold,
         "mcap_threshold": mcap_threshold,
+        "outlier_max_share_pct": outlier_max_share_pct,
         "evaluated_total": evaluated_total,
         "fired_raw_total": fired_raw_total,
         "episodes_total": episodes_total,
@@ -451,6 +471,7 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         "excluded_no_mcap": excluded_no_mcap,
         "excluded_gap_too_large": excluded_gap_too_large,
         "excluded_liquidity": excluded_liquidity,
+        "excluded_insufficient_daily_history": excluded_insufficient_daily_history,
         "min_revenue_total_usd": min_revenue_total_usd,
         "per_protocol": per_protocol,
         "revenue_values": revenue_values,
@@ -459,10 +480,11 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
 
 def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
-        "revenue_price_gap: lookback_days=%d, revenue_growth_threshold_pct=%s, "
-        "mcap_reaction_threshold_pct=%s, min_revenue_total_usd=%s (config.yaml)",
-        result["lookback_days"], result["revenue_threshold"], result["mcap_threshold"],
-        result["min_revenue_total_usd"],
+        "revenue_price_gap: lookback_days=%d, baseline_window_days=%d, "
+        "revenue_growth_threshold_pct=%s, mcap_reaction_threshold_pct=%s, "
+        "outlier_max_share_pct=%s, min_revenue_total_usd=%s (config.yaml)",
+        result["lookback_days"], result["baseline_window_days"], result["revenue_threshold"],
+        result["mcap_threshold"], result["outlier_max_share_pct"], result["min_revenue_total_usd"],
     )
     logger.info(
         "  Evaluated %d protocol-day point(s) total. Excluded from that count: %d with no "
@@ -470,12 +492,16 @@ def _report_revenue_price_gap(result: dict) -> None:
         "had mcap missing or <= 0 (pre-CoinGecko-history era for that protocol, or a known "
         "CoinGecko placeholder value), %d where the real "
         "gap between the two dates exceeded %.1fx the configured %d days (data hole "
-        "between backfill and live collection), %d where the latest point's revenue was "
-        "below the $%s liquidity floor (min_revenue_total_usd) - same filter "
-        "signals/revenue_price_gap.py's scan_watchlist() applies live, so these would never "
-        "have been evaluated in production either.",
+        "between backfill and live collection), %d where daily revenue history coverage "
+        "(defillama_daily_revenue) was too thin for a trustworthy median on the recent "
+        "and/or baseline window, %d where the recent window's revenue sum or the baseline "
+        "window's weekly-equivalent median was below the $%s liquidity floor "
+        "(min_revenue_total_usd) - same filters signals/revenue_price_gap.py's "
+        "scan_watchlist() applies live, so these would never have been evaluated in "
+        "production either.",
         result["evaluated_total"], result["no_earlier_pair"], result["excluded_no_mcap"],
         result["excluded_gap_too_large"], MAX_GAP_MULTIPLIER, result["lookback_days"],
+        result["excluded_insufficient_daily_history"],
         result["excluded_liquidity"], result["min_revenue_total_usd"],
     )
     rate = (
@@ -500,7 +526,7 @@ def _report_revenue_price_gap(result: dict) -> None:
             slug, s["evaluated"], s["fired"], s["episodes"], s["raw_rows"], s["deduped_days"],
         )
     logger.info("  %s", _describe(
-        result["revenue_values"], f"{result['revenue_col']} distribution over evaluated points"
+        result["revenue_values"], "revenue_growth_pct distribution over FIRED points only"
     ))
 
 

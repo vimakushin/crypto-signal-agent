@@ -95,6 +95,39 @@ CREATE TABLE IF NOT EXISTS coingecko_price_history (
 CREATE INDEX IF NOT EXISTS idx_coingecko_price_history_gecko_date
     ON coingecko_price_history (gecko_id, date);
 
+-- Daily revenue history, one row per (protocol, calendar date), from
+-- collectors/defillama.py's fetch_protocol_daily_revenue_history() (relayed
+-- by collectors/defillama.py's new collect_daily_revenue() for the live
+-- daily cycle, and by scripts/backfill_history.py's
+-- backfill_defillama_protocol() for the full historical backfill).
+-- Exists because signals/revenue_price_gap.py was found (see BACKLOG.md's
+-- "revenue_price_gap ловит одиночные выбросы" entry) to be misled by
+-- DeFiLlama's own pre-computed weekly SUM: one unusually large single day
+-- can dominate a whole week's total and make a flat trend look like a
+-- genuine spike. The fix compares the MEDIAN daily revenue over a recent
+-- window against the median over a longer baseline window instead - a
+-- statistic that needs the individual daily values, not just a weekly
+-- rollup, hence this table. `revenue_usd` can be NULL: DeFiLlama's own
+-- totalDataChart occasionally carries a malformed/non-numeric point, which
+-- fetch_protocol_daily_revenue_history() already guards against by DROPPING
+-- that one date rather than saving a fabricated value for it (see that
+-- function's docstring) - so in practice a NULL here would only come from a
+-- future caller that stores a placeholder for a known-missing day; callers
+-- reading this table must still treat NULL as "no data for this day", the
+-- same convention scripts/backfill_history.py's _sum_window already uses
+-- for a day absent from revenue_by_date entirely.
+CREATE TABLE IF NOT EXISTS defillama_daily_revenue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_slug TEXT NOT NULL,
+    date TEXT NOT NULL,
+    revenue_usd REAL,
+    fetched_at TEXT NOT NULL,
+    UNIQUE(protocol_slug, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_defillama_daily_revenue_slug_date
+    ON defillama_daily_revenue (protocol_slug, date);
+
 CREATE TABLE IF NOT EXISTS signal_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     signal_name TEXT NOT NULL,
@@ -213,6 +246,89 @@ def get_snapshot_days_before(
         """,
         (protocol_slug, reference_iso, f"-{days} days"),
     ).fetchone()
+
+
+def save_defillama_daily_revenue(conn: sqlite3.Connection, records: list[dict]) -> None:
+    """Persist daily revenue points from
+    collectors/defillama.py's collect_daily_revenue(), or historical rows
+    built by scripts/backfill_history.py.
+
+    INSERT OR IGNORE (backed by the UNIQUE(protocol_slug, date) constraint
+    on defillama_daily_revenue) - same idempotency pattern as
+    save_coingecko_price_history above: the live daily cycle re-fetches a
+    trailing window that overlaps what it already saved on previous runs,
+    and a re-run of the backfill script after a partial failure must not
+    duplicate rows for a date it already wrote - both just no-op on a
+    (protocol_slug, date) pair already saved.
+
+    Known, accepted limitation: same trade-off as
+    save_binance_oi_snapshots's own docstring below, applied to DeFiLlama
+    instead of Binance. If DeFiLlama later revises the revenue figure for a
+    date we already stored (on-chain indexers commonly do this as they
+    backfill or reconcile a day after it closes), OR IGNORE means our
+    already-stored (older) value silently wins and the revision is dropped
+    - executemany() also doesn't report how many rows were inserted vs.
+    ignored, so that would happen without any signal in the logs. Not
+    treated as a bug: the failure mode is "slightly stale historical
+    revenue", not a wrong/missing reading right now. If this ever needs
+    fixing, switch to INSERT OR REPLACE (or an explicit UPSERT) instead of
+    OR IGNORE - not done here, since REPLACE risks the opposite problem:
+    overwriting a more complete backfilled value with a less complete one
+    from a live re-fetch.
+    """
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO defillama_daily_revenue (
+            protocol_slug, date, revenue_usd, fetched_at
+        ) VALUES (
+            :protocol_slug, :date, :revenue_usd, :fetched_at
+        )
+        """,
+        records,
+    )
+    conn.commit()
+
+
+def get_defillama_daily_revenue_window(
+    conn: sqlite3.Connection, protocol_slug: str, end_date: str, days: int
+) -> list[sqlite3.Row]:
+    """Trailing `days`-day window of stored daily revenue for one protocol,
+    ending on `end_date` INCLUSIVE.
+
+    Unlike get_coingecko_price_history_before above (which EXCLUDES its
+    `before_date`, so "today" never leaks into its own comparison baseline),
+    this deliberately includes `end_date` itself: it is the direct
+    replacement for DeFiLlama's own revenue_total_7d - "the last 7 days,
+    counting today" - not a lookback baseline that must exclude today. Both
+    `end_date` and the stored `date` column are plain "YYYY-MM-DD" strings
+    (like coingecko_price_history.date - see
+    get_coingecko_price_history_before's docstring for why that means no
+    datetime(...) wrap is needed for the equality/inequality side of this
+    comparison), so `date(?, ?)` (SQLite's date function) is only needed for
+    the lower bound's "-N days" arithmetic.
+
+    With days=7 the (exclusive) lower bound is end_date-7, so the rows
+    returned cover end_date-6 .. end_date inclusive - exactly 7 calendar
+    dates when there are no gaps in stored history.
+
+    Args:
+        protocol_slug: DeFiLlama protocol slug.
+        end_date: "YYYY-MM-DD", the most recent date in the window.
+        days: window length in calendar days.
+
+    Returns:
+        Rows oldest-to-newest, at most `days` of them - fewer if history is
+        short or has gaps (callers apply their own coverage floor, e.g.
+        signals/revenue_price_gap.py's MIN_HISTORY_COVERAGE_FRACTION).
+    """
+    return conn.execute(
+        """
+        SELECT * FROM defillama_daily_revenue
+        WHERE protocol_slug = ? AND date <= ? AND date > date(?, ?)
+        ORDER BY date ASC
+        """,
+        (protocol_slug, end_date, end_date, f"-{days} days"),
+    ).fetchall()
 
 
 def save_binance_oi_snapshots(conn: sqlite3.Connection, records: list[dict]) -> None:

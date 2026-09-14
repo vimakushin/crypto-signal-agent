@@ -132,6 +132,70 @@ def fetch_protocol_daily_revenue_history(slug: str) -> dict:
     }
 
 
+# Live daily collection window for defillama_daily_revenue - trims
+# fetch_protocol_daily_revenue_history()'s full response (years of history)
+# down to just what signals/revenue_price_gap.py's 90-day baseline window
+# needs, plus a margin for the odd missed collector run. This only saves on
+# what gets WRITTEN, not on the request itself: DeFiLlama's per-protocol
+# endpoint always returns the whole history in one response regardless of
+# how much of it the caller keeps (see fetch_protocol_daily_revenue_history's
+# docstring) - there is no "give me only the last N days" request to make.
+LIVE_DAILY_REVENUE_WINDOW_DAYS = 100
+
+
+def collect_daily_revenue(watchlist_slugs: list[str]) -> list[dict]:
+    """Fetch and trim daily revenue history for every watchlist protocol,
+    for storage/db.py's defillama_daily_revenue table (TZ 4.5's
+    revenue_price_gap signal - see that table's docstring for why it exists
+    alongside the weekly-rollup defillama_snapshots table above).
+
+    Calls the same fetch_protocol_daily_revenue_history() scripts/
+    backfill_history.py already uses for its one-time historical backfill,
+    once per watchlist protocol - unlike collect() above, which fetches all
+    protocols in two requests total, this endpoint is per-protocol, so this
+    function makes one request per slug.
+
+    Never raises for a single protocol's request failure (RuntimeError from
+    _get_with_retry after all retries) - logs it and continues with the rest
+    of the watchlist, same principle as collect() above (TZ section 7: log
+    data-source failures, don't let one bad protocol take down the whole
+    cycle).
+
+    Args:
+        watchlist_slugs: config.yaml watchlist.defillama_protocols.
+
+    Returns:
+        List of dicts ready for storage/db.py's save_defillama_daily_revenue:
+        protocol_slug, date, revenue_usd, fetched_at (one shared fetched_at
+        for the whole call - when THIS collection run happened, not when any
+        individual historical day's revenue was itself recorded by
+        DeFiLlama).
+    """
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    records: list[dict] = []
+    for slug in watchlist_slugs:
+        try:
+            history = fetch_protocol_daily_revenue_history(slug)
+        except RuntimeError:
+            logger.error(
+                "DeFiLlama: could not fetch daily revenue history for '%s' - skipping "
+                "this protocol for defillama_daily_revenue this cycle",
+                slug,
+            )
+            continue
+
+        daily_revenue = history["daily_revenue"][-LIVE_DAILY_REVENUE_WINDOW_DAYS:]
+        for date_str, revenue in daily_revenue:
+            records.append({
+                "protocol_slug": slug,
+                "date": date_str,
+                "revenue_usd": revenue,
+                "fetched_at": fetched_at,
+            })
+
+    return records
+
+
 def collect(watchlist_slugs: list[str]) -> list[dict]:
     """Fetch revenue/fees + market cap for each watchlist protocol.
 

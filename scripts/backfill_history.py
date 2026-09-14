@@ -80,6 +80,7 @@ from storage.db import (  # noqa: E402
     init_db,
     save_binance_oi_snapshots,
     save_coingecko_price_history,
+    save_defillama_daily_revenue,
     save_defillama_snapshots,
 )
 
@@ -474,6 +475,37 @@ def backfill_defillama_protocol(conn, slug: str, protocol_entry: dict | None) ->
     if not daily_revenue:
         logger.warning("DeFiLlama backfill: no daily revenue history at all for '%s' - skipping", slug)
         return
+
+    # Full daily revenue history, saved as-is to defillama_daily_revenue for
+    # signals/revenue_price_gap.py's median-based comparison (TZ 4.5's
+    # rewrite - see storage/db.py's table docstring). Deliberately NOT
+    # limited by BACKFILL_SKIP_RECENT_DAYS the way defillama_snapshots below
+    # is: that limit exists only because defillama_snapshots dedupes on
+    # `fetched_at`, and this script's midnight-UTC fetched_at doesn't share
+    # a format with the live collector's actual-run-time fetched_at (see
+    # BACKFILL_SKIP_RECENT_DAYS's docstring) - defillama_daily_revenue
+    # instead dedupes on (protocol_slug, date), so a re-run or a live
+    # collector run for the same date can never collide here regardless of
+    # what fetched_at string either side used.
+    daily_revenue_records = [
+        {
+            "protocol_slug": slug,
+            "date": date_str,
+            "revenue_usd": revenue,
+            "fetched_at": datetime(
+                date.fromisoformat(date_str).year,
+                date.fromisoformat(date_str).month,
+                date.fromisoformat(date_str).day,
+                tzinfo=timezone.utc,
+            ).isoformat(),
+        }
+        for date_str, revenue in daily_revenue
+    ]
+    save_defillama_daily_revenue(conn, daily_revenue_records)
+    logger.info(
+        "DeFiLlama backfill: '%s' saved %d daily revenue row(s) to defillama_daily_revenue",
+        slug, len(daily_revenue_records),
+    )
 
     revenue_by_date = _build_revenue_by_date(slug, daily_revenue)
     first_date = date.fromisoformat(daily_revenue[0][0])

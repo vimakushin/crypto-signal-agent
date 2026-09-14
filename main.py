@@ -61,6 +61,7 @@ from storage.db import (
     init_db,
     save_binance_oi_snapshots,
     save_coingecko_price_history,
+    save_defillama_daily_revenue,
     save_defillama_snapshots,
     save_signal_event,
 )
@@ -183,6 +184,14 @@ def run_defillama_cycle(config: dict) -> None:
         save_defillama_snapshots(conn, records)
         logger.info("Saved snapshots to %s", db_path)
 
+        logger.info("Fetching DeFiLlama daily revenue history for %d protocols...", len(watchlist))
+        daily_revenue_records = defillama.collect_daily_revenue(watchlist)
+        save_defillama_daily_revenue(conn, daily_revenue_records)
+        logger.info(
+            "Collected and saved %d daily revenue point(s) across %d watchlist protocol(s)",
+            len(daily_revenue_records), len({r["protocol_slug"] for r in daily_revenue_records}),
+        )
+
         if revenue_signal_cfg.get("enabled", True):
             result = revenue_price_gap.scan_watchlist(
                 conn,
@@ -190,7 +199,9 @@ def run_defillama_cycle(config: dict) -> None:
                 revenue_growth_threshold_pct=revenue_signal_cfg["revenue_growth_threshold_pct"],
                 mcap_reaction_threshold_pct=revenue_signal_cfg["mcap_reaction_threshold_pct"],
                 lookback_days=revenue_signal_cfg["lookback_days"],
+                baseline_window_days=revenue_signal_cfg["baseline_window_days"],
                 min_revenue_total_usd=revenue_signal_cfg.get("min_revenue_total_usd", 0),
+                outlier_max_share_pct=revenue_signal_cfg.get("outlier_max_share_pct", 100),
             )
 
             # Four distinct reasons for "no candidates" - conflating them
@@ -222,10 +233,14 @@ def run_defillama_cycle(config: dict) -> None:
             evaluated_at = datetime.now(timezone.utc).isoformat()
             for s in result.signals:
                 logger.info(
-                    "revenue_price_gap FIRED: %s (%s) revenue +%.1f%% over %dd (configured), "
-                    "actual gap between compared snapshots %.1fd, mcap only +%.1f%%",
-                    s.protocol_slug, s.symbol, s.revenue_growth_pct,
-                    s.lookback_days, s.actual_lookback_days, s.mcap_growth_pct,
+                    "revenue_price_gap FIRED: %s (%s) median daily revenue +%.1f%% over %dd "
+                    "(configured) - recent $%.0f/day vs baseline $%.0f/day, week sum $%.0f "
+                    "(largest day %.1f%% of it), actual gap between compared snapshots "
+                    "%.1fd, mcap only +%.1f%%",
+                    s.protocol_slug, s.symbol, s.revenue_growth_pct, s.lookback_days,
+                    s.recent_median_daily_revenue, s.baseline_median_daily_revenue,
+                    s.recent_week_sum, s.max_day_share_pct, s.actual_lookback_days,
+                    s.mcap_growth_pct,
                 )
                 save_signal_event(
                     conn,
@@ -241,7 +256,10 @@ def run_defillama_cycle(config: dict) -> None:
                         "mcap_reaction_threshold_pct": revenue_signal_cfg["mcap_reaction_threshold_pct"],
                         "lookback_days": s.lookback_days,
                         "actual_lookback_days": s.actual_lookback_days,
-                        "revenue_total": s.revenue_total,
+                        "recent_median_daily_revenue": s.recent_median_daily_revenue,
+                        "baseline_median_daily_revenue": s.baseline_median_daily_revenue,
+                        "recent_week_sum": s.recent_week_sum,
+                        "max_day_share_pct": s.max_day_share_pct,
                         "mcap_now": s.mcap_now,
                         "mcap_before": s.mcap_before,
                         "symbol": s.symbol,
