@@ -1,0 +1,22 @@
+<tr>
+  <td colspan="20">
+    <span class="error-msg">Не удалось сохранить разметку: {{ error }}</span>
+    ({{ signal_name }} / {{ protocol_slug }} / {{ episode_start_date }})
+  </td>
+  <td class="actions">
+    <input type="hidden" name="signal_name" value="{{ signal_name }}">
+    <input type="hidden" name="protocol_slug" value="{{ protocol_slug }}">
+    <input type="hidden" name="episode_start_date" value="{{ episode_start_date }}">
+    <input type="hidden" name="is_open" value="{{ is_open }}">
+    <input type="text" name="outcome_comment" placeholder="комментарий (необязательно)">
+    <br>
+    {% for outcome in valid_outcomes %}
+    <button type="button"
+      hx-post="/episodes/outcome"
+      hx-include="closest tr"
+      hx-vals='{"outcome": "{{ outcome }}"}'
+      hx-target="closest tr"
+      hx-swap="outerHTML">{{ outcome }}</button>
+    {% endfor %}
+  </td>
+</tr>

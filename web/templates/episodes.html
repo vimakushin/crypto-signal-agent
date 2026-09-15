@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% import "_episode_row.html" as row_macros %}
+{% block title %}Разметка эпизодов — crypto-signal-agent{% endblock %}
+{% block content %}
+<h1>Разметка сработавших сигналов</h1>
+<p class="hint">
+  Внутренний инструмент для ручной оценки: «сработало» / «не сработало» / «рано судить».
+  Это не рекомендация к сделке — решение принимаете вы, глядя на цифры ниже.
+</p>
+
+<form class="filter-form" method="get" action="/episodes">
+  <label>
+    <input type="checkbox" name="show_old_formula" value="true"
+      {% if show_old_formula %}checked{% endif %}
+      onchange="this.form.submit()">
+    показывать эпизоды revenue_price_gap по старой формуле (до 15.09.2026)
+  </label>
+  {% if not show_old_formula %}
+  <input type="hidden" name="show_old_formula" value="false">
+  {% endif %}
+</form>
+
+<h2>Новые для разметки ({{ new_episodes|length }})</h2>
+{% if new_episodes %}
+<table>
+  <thead>
+    <tr>
+      <th>Монета / тикер</th>
+      <th>Сигнал</th>
+      <th class="wrap">Расшифровка</th>
+      <th>Начало &rarr; конец эпизода</th>
+      <th>Дней</th>
+      <th>Статус</th>
+      <th>Цена на старт</th>
+      <th>Цена сейчас</th>
+      <th>Капитализация на старт</th>
+      <th>Капитализация сейчас</th>
+      <th>Разметка</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for ep in new_episodes %}
+      {{ row_macros.render_row(ep) }}
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">Пока нет эпизодов, готовых к разметке (эпизод должен быть не моложе настроенного в config.yaml числа дней).</p>
+{% endif %}
+
+<h2>Пересмотреть ({{ reviewable_episodes|length }})</h2>
+<p class="hint">
+  Эти эпизоды уже были размечены, пока ещё продолжались (шли), и с тех пор прошло достаточно
+  времени, чтобы стоило посмотреть заново — эпизод всё ещё открыт.
+</p>
+{% if reviewable_episodes %}
+<table>
+  <thead>
+    <tr>
+      <th>Монета / тикер</th>
+      <th>Сигнал</th>
+      <th class="wrap">Расшифровка</th>
+      <th>Начало &rarr; конец эпизода</th>
+      <th>Дней</th>
+      <th>Статус</th>
+      <th>Цена на старт</th>
+      <th>Цена сейчас</th>
+      <th>Капитализация на старт</th>
+      <th>Капитализация сейчас</th>
+      <th>Прежняя оценка</th>
+      <th>Разметка</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for ep in reviewable_episodes %}
+      {{ row_macros.render_row(ep) }}
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">Нет эпизодов, которые стоило бы пересмотреть прямо сейчас.</p>
+{% endif %}
+
+{% endblock %}

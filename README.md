@@ -138,6 +138,20 @@ If the scheduled tasks ever disappear (a Windows reinstall, moving to a new mach
 
 An early, cut-down version of manual labeling: a plain markdown table at the project root, committed to git. Every day, when the Telegram digest goes out, one row gets added per new candidate — no more than once every 30 days for the same coin, so a signal that stays fired for weeks doesn't flood the journal with near-duplicates — with the date, the coin, its score, which signals fired, and price/market cap at that moment. Seven days later, the system fills in the actual price/market cap on its own. The "after 14 days," "after 30 days," and "Verdict" columns are filled in by hand; the code never touches them.
 
+### Web UI — episode labeling
+
+The first screen of the internal web UI (TZ section 6): manual "did it hold up" labeling for signal firings. Not a product for end users — that stays Telegram-only — this is a local tool for the owner, since manual "worked / didn't work" labels are the only honest data behind future weight calibration.
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn web.app:app --host 127.0.0.1 --port 8000
+```
+
+Then open `http://127.0.0.1:8000/episodes` in a browser. Listens on `127.0.0.1` only — never reachable from outside the machine, no login, none planned (see `.claude/agents/web-dev.md`'s boundaries).
+
+The same signal firing a day apart for weeks (one protocol can stay "fired" for weeks under `revenue_price_gap`) is grouped into one episode, not one row per day — `storage/episodes.py` does the grouping, reusing the same freshness logic `scoring/ranker.py` already uses for the daily digest. The screen only lists episodes old enough to judge (7+ days since they started by default, `config.yaml`'s `episode_review.min_age_days`) and not yet labeled; three buttons record "worked / didn't work / too early to tell" straight into a new `episode_outcomes` table (`storage/db.py`) — `observations.md` is untouched by this screen, it stays a separate, read-only journal. An episode labeled while still active gets resurfaced for a second look if it's still going `episode_review.reopen_after_days` (14 by default) later, since the first call may not have held.
+
+`revenue_price_gap`'s formula changed on 2026-09-15 (weekly sums → daily medians, see `BACKLOG.md`) — an episode spanning that date is always split in two, and anything computed under the old formula is marked with a visible badge and can be filtered out, so the two are never averaged together by mistake.
+
 ### Database backups
 
 `storage\db.sqlite` isn't tracked in git (see `.gitignore`) — too large and it changes constantly. `scripts\backup_db.py` uses SQLite's own safe way of snapshotting a live database (`sqlite3.Connection.backup`), which doesn't break even if a write is happening at that exact moment.

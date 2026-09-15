@@ -1,0 +1,66 @@
+{% macro render_row(ep) %}
+<tr>
+  <td>{{ ep.label }}</td>
+  <td>{{ ep.signal_name }}</td>
+  <td class="wrap">{{ ep.signal_description }}</td>
+  <td>{{ ep.episode_start_date }} &rarr; {{ ep.episode_end_date }}</td>
+  <td>{{ ep.duration_days }}</td>
+  <td>
+    {% if ep.is_open %}
+      <span class="badge badge-open">открыт</span>
+    {% else %}
+      <span class="badge badge-closed">закрыт</span>
+    {% endif %}
+    {% if ep.old_formula_badge %}
+      <span class="badge badge-old-formula" title="эпизод целиком до смены формулы revenue_price_gap 15.09.2026 (сумма за неделю)">старая формула</span>
+    {% endif %}
+  </td>
+  <td>{{ ep.price_start|fmt_price }}</td>
+  <td>{{ ep.price_now|fmt_price }}</td>
+  <td>
+    {% if ep.mcap_note %}
+      {{ ep.mcap_note }}
+    {% else %}
+      {{ ep.mcap_start|fmt_mcap }}
+    {% endif %}
+  </td>
+  <td>
+    {% if ep.mcap_note %}
+      &mdash;
+    {% else %}
+      {{ ep.mcap_now|fmt_mcap }}
+    {% endif %}
+  </td>
+  {% if ep.prior_outcome %}
+  <td class="wrap prior">
+    было: <strong>{{ ep.prior_outcome }}</strong> ({{ ep.prior_outcome_at[:10] }}, пока эпизод ещё продолжался){% if ep.prior_outcome_comment %}<br>«{{ ep.prior_outcome_comment }}»{% endif %}
+  </td>
+  {% endif %}
+  <td class="actions">
+    <input type="hidden" name="signal_name" value="{{ ep.signal_name }}">
+    <input type="hidden" name="protocol_slug" value="{{ ep.protocol_slug }}">
+    <input type="hidden" name="episode_start_date" value="{{ ep.episode_start_date }}">
+    <input type="hidden" name="is_open" value="{{ 'true' if ep.is_open else 'false' }}">
+    <input type="text" name="outcome_comment" placeholder="комментарий (необязательно)">
+    <br>
+    <button type="button"
+      hx-post="/episodes/outcome"
+      hx-include="closest tr"
+      hx-vals='{"outcome": "сработало"}'
+      hx-target="closest tr"
+      hx-swap="outerHTML">сработало</button>
+    <button type="button"
+      hx-post="/episodes/outcome"
+      hx-include="closest tr"
+      hx-vals='{"outcome": "не сработало"}'
+      hx-target="closest tr"
+      hx-swap="outerHTML">не сработало</button>
+    <button type="button"
+      hx-post="/episodes/outcome"
+      hx-include="closest tr"
+      hx-vals='{"outcome": "рано судить"}'
+      hx-target="closest tr"
+      hx-swap="outerHTML">рано судить</button>
+  </td>
+</tr>
+{% endmacro %}
