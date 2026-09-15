@@ -116,20 +116,24 @@ signals:
     # window's revenue SUM and the baseline window's median scaled to a
     # weekly-equivalent (signals/revenue_price_gap.py's scan_watchlist()
     # checks both sides, since a tiny value on EITHER side inflates the
-    # growth ratio). Now that revenue_growth_pct itself is computed from
-    # MEDIANS (not sums) and outlier_max_share_pct above separately catches
-    # a single-day spike, this floor's own job has narrowed to just ruling
-    # out protocols of a genuinely toy scale (a handful of transactions a
-    # week) - it no longer has to single-handedly guard against one large
-    # day distorting a whole week. $50,000/week is five times the old
-    # $10,000 value: clearly above "a handful of transactions", but still
-    # modest enough not to exclude genuine mid-size protocols - this signal
-    # is aimed at protocols the market hasn't fully priced in yet, not
-    # top-of-market names. Starting value, not calibrated against outcomes
-    # yet - subject to the same future threshold calibration as everything
-    # else in this file (see BACKLOG.md's backtest entry), not derived from
-    # how many signals it happens to leave on the current history.
-    min_revenue_total_usd: 50000
+    # growth ratio). $10,000/week is deliberately low, not a forgotten
+    # setting. Now that revenue_growth_pct itself is computed from MEDIANS
+    # (not sums), this floor's only remaining job is to rule out protocols
+    # whose daily revenue is so small that the numbers are source-data
+    # rounding and noise rather than a real business fact - guarding against
+    # a single-day spike and against "tiny base, huge percent swing" is now
+    # handled separately, by outlier_max_share_pct above and by the median
+    # itself. This was raised to $50,000 on 2026-09-15 and then reverted:
+    # at $50,000 it cut 61 of 127 episodes (nearly half) and switched off
+    # seven protocols (including aave-v2, ens, axie-infinity, olympus-dao,
+    # ssv-network, thorchain-dex, ston.fi) that together account for 39% of
+    # all signal activity - and a manual check of four of those seven
+    # against their raw daily numbers showed a broad multi-day trend, not
+    # noise. The genuinely toy-scale case is ankr at $27/week, not
+    # aave-v2. Full numbers are in BACKLOG.md. $10,000 is a return to the
+    # earlier-justified value based on this new evidence, not a number
+    # picked to maximize how many signals fire.
+    min_revenue_total_usd: 10000
 
   oi_divergence:
     # TZ section 4.1: Open Interest grew by >= X% over `lookback_hours`,
