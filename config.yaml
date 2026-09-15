@@ -241,6 +241,25 @@ schedule:
   # before the digest queries storage/db.sqlite for that day's candidates.
   telegram_run_time: "12:30"
 
+episode_review:
+  # Manual "did it hold up" labeling screen (storage/episodes.py). If an
+  # episode was labeled while still open (labeled_when_open=1) and is STILL
+  # open this many days later, get_reviewable_episodes() surfaces it again
+  # for a second look, since the earlier label may no longer be the full
+  # picture. 14 is an approximate starting point, not fitted to any observed
+  # case - revisit once episode_outcomes has accumulated enough real labels
+  # to judge whether it's the right cadence.
+  reopen_after_days: 14
+
+  # get_open_episodes()'s minimum age before an episode is even offered for
+  # labeling - a very recent episode hasn't had time to show whether it
+  # "worked" yet. Like reopen_after_days above, 7 is a starting point, not
+  # fitted to any observed case (TZ_crypto_early_signal_detector.md section 6
+  # does not prescribe a specific number of days here) - revisit once
+  # episode_outcomes has accumulated enough real labels to judge whether it's
+  # the right cadence.
+  min_age_days: 7
+
 storage:
   sqlite_path: storage/db.sqlite
 

@@ -138,6 +138,24 @@ CREATE TABLE IF NOT EXISTS signal_events (
     details_json TEXT,
     outcome TEXT
 );
+
+-- Manual "did this hold up" labeling for one EPISODE (a signal firing on the
+-- same protocol on consecutive days is one episode, not N separate
+-- observations - see storage/episodes.py, built for the new manual-labeling
+-- web screen, TZ section 6). One row per (signal_name, protocol_slug,
+-- episode_start_date) - re-labeling the same episode overwrites this same
+-- row (see save_episode_outcome's INSERT ... ON CONFLICT below), it does not
+-- accumulate a second opinion.
+CREATE TABLE IF NOT EXISTS episode_outcomes (
+    signal_name TEXT NOT NULL,
+    protocol_slug TEXT NOT NULL,
+    episode_start_date TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    outcome_at TEXT NOT NULL,
+    outcome_comment TEXT,
+    labeled_when_open INTEGER NOT NULL,
+    PRIMARY KEY (signal_name, protocol_slug, episode_start_date)
+);
 """
 
 
@@ -601,3 +619,85 @@ def get_signal_events_since(
         """,
         (signal_name, since_iso),
     ).fetchall()
+
+
+VALID_EPISODE_OUTCOMES = ("сработало", "не сработало", "рано судить")
+
+
+def save_episode_outcome(
+    conn: sqlite3.Connection,
+    signal_name: str,
+    protocol_slug: str,
+    episode_start_date: str,
+    outcome: str,
+    outcome_comment: str | None,
+    labeled_when_open: bool,
+    outcome_at: str,
+) -> None:
+    """Record (or overwrite) a manual outcome label for one episode - the
+    web screen's "разметка результатов срабатываний" (see
+    storage/episodes.py's get_open_episodes/get_reviewable_episodes, which
+    read this table back).
+
+    Re-labeling the same (signal_name, protocol_slug, episode_start_date)
+    triple overwrites the existing row in place (INSERT ... ON CONFLICT ...
+    DO UPDATE), rather than accumulating a second opinion - a deliberate
+    re-review (e.g. via get_reviewable_episodes, once labeled_when_open=1
+    and enough time has passed) replaces the earlier label outright.
+
+    Args:
+        conn: open storage/db.py connection.
+        signal_name: e.g. "revenue_price_gap".
+        protocol_slug: DeFiLlama protocol slug or Binance symbol, matching
+            signal_events.protocol_slug for this episode.
+        episode_start_date: "YYYY-MM-DD", the episode's first fired date.
+        outcome: one of VALID_EPISODE_OUTCOMES - anything else raises.
+        outcome_comment: optional free-text note, may be None.
+        labeled_when_open: whether the episode was still open (still firing,
+            per the same freshness cursor scoring/ranker.py's
+            default_since_by_signal() uses) at the moment this label was
+            recorded - lets get_reviewable_episodes() later find episodes
+            that were labeled early and might be worth a second look.
+        outcome_at: ISO 8601 timestamp of when this label was recorded -
+            like `triggered_at`/`fetched_at` elsewhere in this file, the
+            caller supplies it (typically
+            `datetime.now(timezone.utc).isoformat()`) rather than this
+            function generating it internally, so this writer stays
+            deterministic/testable the same way the rest of this module's
+            writers are.
+
+    Raises:
+        ValueError: if `outcome` is not one of VALID_EPISODE_OUTCOMES - kept
+            as strict as the rest of the project's handling of malformed
+            data (see e.g. signals/revenue_price_gap.py's
+            _DataQualityRejected guards).
+    """
+    if outcome not in VALID_EPISODE_OUTCOMES:
+        raise ValueError(
+            f"save_episode_outcome: outcome={outcome!r} is not one of "
+            f"{VALID_EPISODE_OUTCOMES}"
+        )
+
+    conn.execute(
+        """
+        INSERT INTO episode_outcomes (
+            signal_name, protocol_slug, episode_start_date, outcome,
+            outcome_at, outcome_comment, labeled_when_open
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (signal_name, protocol_slug, episode_start_date) DO UPDATE SET
+            outcome = excluded.outcome,
+            outcome_at = excluded.outcome_at,
+            outcome_comment = excluded.outcome_comment,
+            labeled_when_open = excluded.labeled_when_open
+        """,
+        (
+            signal_name,
+            protocol_slug,
+            episode_start_date,
+            outcome,
+            outcome_at,
+            outcome_comment,
+            1 if labeled_when_open else 0,
+        ),
+    )
+    conn.commit()

@@ -101,6 +101,7 @@ from storage.db import (  # noqa: E402
     get_defillama_daily_revenue_window,
     get_snapshot_days_before,
 )
+from storage.episodes import collapse_into_episodes  # noqa: E402
 
 # Grid cadence oi_divergence replay evaluates on - matches
 # scripts/backfill_history.py's BINANCE_BACKFILL_PERIOD ("4h"), the coarser
@@ -251,6 +252,13 @@ def _collapse_daily_episodes(entries: list[tuple[date_cls, bool | None]]) -> int
     episodes, not one, because a real day of data is missing, not just
     "didn't fire that day".
 
+    Thin wrapper around storage/episodes.py's collapse_into_episodes (the
+    shared primitive also used by storage/episodes.py's
+    get_open_episodes/get_reviewable_episodes for the web labeling screen) -
+    this function's own signature/return type (int, not the (start, end)
+    pairs collapse_into_episodes returns) is unchanged for existing callers
+    in this script.
+
     Args:
         entries: (calendar date, fired) pairs for one protocol, in ascending
             date order, one entry per evaluated (or skipped) day - fired is
@@ -261,21 +269,10 @@ def _collapse_daily_episodes(entries: list[tuple[date_cls, bool | None]]) -> int
     Returns:
         Number of episodes.
     """
-    episodes = 0
-    in_episode = False
-    prev_date: date_cls | None = None
-    for day, flag in entries:
-        contiguous = prev_date is not None and day == prev_date + timedelta(days=1)
-        if not contiguous:
-            in_episode = False
-        if flag:
-            if not in_episode:
-                episodes += 1
-            in_episode = True
-        else:
-            in_episode = False
-        prev_date = day
-    return episodes
+    episodes = collapse_into_episodes(
+        entries, lambda prev_day, day: day == prev_day + timedelta(days=1)
+    )
+    return len(episodes)
 
 
 def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> dict:
@@ -571,6 +568,13 @@ def _collapse_episodes(fired_flags: list[bool | None]) -> int:
     silently bridged into one, since continuity in the underlying grid was
     actually broken.
 
+    Thin wrapper around storage/episodes.py's collapse_into_episodes - see
+    _collapse_daily_episodes above for why this is a shared primitive now.
+    Positions here are plain list indices (0, 1, 2, ...), always contiguous
+    by construction (the grid itself is already fixed-step - see
+    replay_oi_divergence/_build_grid), so the only thing that actually
+    breaks a run is a False/None flag, exactly as before.
+
     Args:
         fired_flags: one entry per grid boundary, in chronological order -
             True (fired), False (evaluated, did not fire), or None (not
@@ -579,16 +583,9 @@ def _collapse_episodes(fired_flags: list[bool | None]) -> int:
     Returns:
         Number of episodes.
     """
-    episodes = 0
-    in_episode = False
-    for flag in fired_flags:
-        if flag:
-            if not in_episode:
-                episodes += 1
-            in_episode = True
-        else:
-            in_episode = False
-    return episodes
+    entries = list(enumerate(fired_flags))
+    episodes = collapse_into_episodes(entries, lambda prev_i, i: i == prev_i + 1)
+    return len(episodes)
 
 
 def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
