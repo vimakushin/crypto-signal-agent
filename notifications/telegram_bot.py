@@ -398,10 +398,10 @@ if __name__ == "__main__":
         db_path = PROJECT_ROOT / db_path
 
     signal_weights = signal_weights_from_config(config)
-    since_by_signal = default_since_by_signal(config)
 
     conn = get_connection(db_path)
     try:
+        since_by_signal = default_since_by_signal(conn, config)
         results = rank_candidates(conn, signal_weights, since_by_signal)
 
         # Manual-labeling journal (TZ section 6, cut-down MVP version - see

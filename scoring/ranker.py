@@ -32,7 +32,12 @@ from pathlib import Path
 # the script's OWN directory on sys.path in that case, not the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from storage.db import get_signal_events_since  # noqa: E402
+from storage.db import (  # noqa: E402
+    get_latest_binance_oi_fetch_time,
+    get_latest_coingecko_fetch_time,
+    get_latest_defillama_fetch_time,
+    get_signal_events_since,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,16 @@ logger = logging.getLogger(__name__)
 # interval, not exactly 1x (which would drop a candidate just because
 # this run happened to land a little early relative to the last one).
 STALENESS_MULTIPLIER = 1.5
+
+# How far back rank_candidates() looks for CANDIDATE signal_events rows,
+# before default_since_by_signal()'s per-signal cursor decides whether each
+# one is still confirmed fresh (see rank_candidates' docstring). Wider than
+# any single signal's STALENESS_MULTIPLIER allowance (the widest today is
+# DeFiLlama's ~36h at defillama_poll_hours=24) so that a row this window
+# excludes was never going to be considered "still fresh" even under the old
+# age-based logic - this is a discovery window for logging what got dropped
+# and why, not a second chance for genuinely old history to sneak back in.
+DISCOVERY_WINDOW_HOURS = 72
 
 
 @dataclass
@@ -75,38 +90,74 @@ def rank_candidates(
             signals.<name>.weight for every enabled signal. A candidate's
             score for a signal is simply that signal's weight ("this signal
             fired" = its full weight) - no extra formula on top.
-        since_by_signal: {signal_name: since_iso} - how far back to look for
-            each signal. A signal_name present in signal_weights but missing
-            here is skipped entirely (no window to look back over).
+        since_by_signal: {signal_name: since_iso} - the per-signal cursor
+            produced by default_since_by_signal(), i.e. "the most recent
+            actual collector run for this signal's data source, if it's not
+            itself stale". A signal_name present in signal_weights but
+            missing here means that signal's whole collection pipeline is
+            stale or has never run - every row for it is excluded (and
+            logged) below.
 
     Returns:
         One CandidateScore per protocol_slug/ticker that had at least one
-        matching signal_events row, sorted by total_score descending. If the
+        matching signal_events row CONFIRMED by a real collector run at or
+        after its signal's cursor, sorted by total_score descending. If the
         SAME signal fired multiple times for the same candidate within the
         window, only its single freshest occurrence counts toward the score
         (a sustained/continuing state, not repeated separate events) - but
         every OTHER distinct signal that also fired for that candidate still
-        contributes its own weight on top.
+        contributes its own weight on top. A signal_events row whose
+        triggered_at predates its signal's cursor - i.e. a later collector
+        run happened but did NOT reconfirm this trigger, for example because
+        an outlier guard rejected it on the later run - is excluded and
+        logged, not silently carried forward with stale numbers.
     """
     # protocol_slug -> {signal_name: SignalContribution}
     by_candidate: dict[str, dict[str, SignalContribution]] = {}
 
-    for signal_name, weight in signal_weights.items():
-        since_iso = since_by_signal.get(signal_name)
-        if since_iso is None:
-            continue
+    from datetime import datetime, timedelta, timezone
 
-        rows = get_signal_events_since(conn, signal_name, since_iso)
+    discovery_since = (
+        datetime.now(timezone.utc) - timedelta(hours=DISCOVERY_WINDOW_HOURS)
+    ).isoformat()
+
+    for signal_name, weight in signal_weights.items():
+        rows = get_signal_events_since(conn, signal_name, discovery_since)
         for row in rows:
             protocol_slug = row["protocol_slug"]
-            candidate_signals = by_candidate.setdefault(protocol_slug, {})
-            if signal_name in candidate_signals:
+            # Deliberately NOT by_candidate.setdefault() here - only look up
+            # what already exists, so that a candidate whose every row for
+            # this signal turns out stale (see cursor check below) never
+            # gets an empty-but-present entry in by_candidate, which would
+            # otherwise surface as a ghost "score: 0.00" candidate with no
+            # contributions in the ranked output.
+            if signal_name in by_candidate.get(protocol_slug, {}):
                 # Rows are DESC by triggered_at, so the first row seen per
                 # (candidate, signal_name) is already the freshest - a
                 # repeat trigger of the SAME signal is a continuing state,
                 # not a new event, and must not be double-counted.
                 continue
 
+            cursor = since_by_signal.get(signal_name)
+            if cursor is None or row["triggered_at"] < cursor:
+                logger.info(
+                    "rank_candidates: excluding stale signal_events row - "
+                    "signal=%s protocol=%s last fired at %s, but %s - this "
+                    "trigger was not reconfirmed by the most recent actual "
+                    "collector run and will not appear in the ranked output",
+                    signal_name,
+                    protocol_slug,
+                    row["triggered_at"],
+                    (
+                        "this signal's whole collection pipeline is stale "
+                        "or has never run (no cursor)"
+                        if cursor is None
+                        else f"the most recent actual check was at {cursor}"
+                    ),
+                )
+                continue
+
+            candidate_signals = by_candidate.setdefault(protocol_slug, {})
             details: dict = {}
             details_json = row["details_json"]
             if details_json:
@@ -163,41 +214,83 @@ def signal_weights_from_config(config: dict) -> dict[str, float]:
     }
 
 
-def default_since_by_signal(config: dict) -> dict[str, str]:
-    """Build the {signal_name: since_iso} map rank_candidates() expects, from
-    config.yaml's `schedule:` section - "recent enough to still count" for
-    each signal is STALENESS_MULTIPLIER times that signal's expected polling
-    interval (defillama_poll_hours for the two DeFiLlama-fed signals,
-    binance_futures_poll_hours for oi_divergence), not exactly one interval
-    (see STALENESS_MULTIPLIER).
+def default_since_by_signal(conn: sqlite3.Connection, config: dict) -> dict[str, str]:
+    """Build the {signal_name: since_iso} map rank_candidates() expects.
+
+    Unlike the old age-of-the-row approach, this is NOT "now minus some
+    multiple of the polling interval" - a signal_events row's own age proved
+    unusable as a freshness test (a row that a LATER collector run actually
+    rejected, e.g. via an outlier guard, still looks "recent" by that
+    measure right up until a full staleness window has passed, so a rejected
+    trigger kept showing up in the ranked output with stale numbers). Instead
+    each signal gets a cursor from the most recent ACTUAL collector run for
+    its data source (storage/db.py's get_latest_*_fetch_time functions, the
+    same ones main.py's data-freshness diagnostics already use) -
+    rank_candidates() then only counts a signal_events row if it was
+    reconfirmed at or after that cursor.
+
+    Each signal is mapped to the data source its numbers actually come from:
+    - revenue_price_gap: DeFiLlama (get_latest_defillama_fetch_time).
+    - volume_breakout: CoinGecko (get_latest_coingecko_fetch_time) - NOT
+      DeFiLlama, even though both run on the same schedule.
+      volume_breakout's numbers come from CoinGecko, and if CoinGecko alone
+      had an outage on a day DeFiLlama still ran fine, a DeFiLlama-based
+      cursor would wrongly "re-confirm" a volume_breakout row that was never
+      actually re-checked.
+    - oi_divergence: Binance Futures (get_latest_binance_oi_fetch_time).
+
+    STALENESS_MULTIPLIER still applies, but to a different question than
+    before: not "how old is this row", but "how old is the latest fetch
+    timestamp for this signal's whole collection pipeline" - if even the
+    latest fetch is older than STALENESS_MULTIPLIER times the expected
+    polling interval, the entire pipeline is considered stale and the signal
+    is dropped from the result (same as if it had never run).
 
     Args:
+        conn: open storage/db.py connection.
         config: parsed config.yaml (see load_config()).
 
     Returns:
         {signal_name: since_iso} for revenue_price_gap, volume_breakout and
         oi_divergence - the only three signal names this function knows the
-        expected polling interval for. A signal_name not in this mapping
-        (e.g. a future signal type not yet wired up here) is simply absent
-        from the result, which rank_candidates() already treats as "no
-        window to look back over, skip it".
+        data source and expected polling interval for. A signal_name is
+        absent from the result if its data source has never been fetched
+        (get_latest_*_fetch_time returned None) or its latest fetch is
+        itself stale - both cases rank_candidates() already treats as "no
+        cursor, exclude every row for this signal".
     """
     from datetime import datetime, timedelta, timezone
 
     schedule_cfg = config.get("schedule", {})
     defillama_interval = schedule_cfg.get("defillama_poll_hours", 24)
     binance_interval = schedule_cfg.get("binance_futures_poll_hours", 6)
-    expected_interval_hours_by_signal = {
-        "revenue_price_gap": defillama_interval,
-        "volume_breakout": defillama_interval,
-        "oi_divergence": binance_interval,
+
+    # signal_name -> (latest fetch time getter, expected polling interval)
+    source_by_signal = {
+        "revenue_price_gap": (get_latest_defillama_fetch_time, defillama_interval),
+        "volume_breakout": (get_latest_coingecko_fetch_time, defillama_interval),
+        "oi_divergence": (get_latest_binance_oi_fetch_time, binance_interval),
     }
 
     now = datetime.now(timezone.utc)
-    return {
-        name: (now - timedelta(hours=hours * STALENESS_MULTIPLIER)).isoformat()
-        for name, hours in expected_interval_hours_by_signal.items()
-    }
+    since_by_signal: dict[str, str] = {}
+    for signal_name, (get_latest_fetch_time, interval_hours) in source_by_signal.items():
+        latest_fetch = get_latest_fetch_time(conn)
+        if latest_fetch is None:
+            # This signal's data source has never been fetched at all -
+            # nothing to confirm any row against, skip the signal entirely.
+            continue
+
+        fetch_age = now - datetime.fromisoformat(latest_fetch)
+        if fetch_age > timedelta(hours=interval_hours * STALENESS_MULTIPLIER):
+            # The collector itself hasn't run recently enough - the whole
+            # pipeline is stale, not just one row, so there's nothing fresh
+            # to confirm any signal_events row against.
+            continue
+
+        since_by_signal[signal_name] = latest_fetch
+
+    return since_by_signal
 
 
 if __name__ == "__main__":
@@ -225,16 +318,17 @@ if __name__ == "__main__":
         db_path = PROJECT_ROOT / db_path
 
     signal_weights = signal_weights_from_config(config)
-    since_by_signal = default_since_by_signal(config)
-    # default_since_by_signal() returns an entry for every signal it knows
-    # the polling interval for, regardless of whether that signal is
-    # enabled - rank_candidates() only needs the ones actually present in
-    # signal_weights, but passing the extra entries through is harmless
-    # (rank_candidates() only ever looks up since_by_signal by the names
-    # already in signal_weights).
 
     conn = get_connection(db_path)
     try:
+        since_by_signal = default_since_by_signal(conn, config)
+        # default_since_by_signal() returns an entry for every signal it
+        # knows the data source and polling interval for AND whose pipeline
+        # isn't stale, regardless of whether that signal is enabled -
+        # rank_candidates() only needs the ones actually present in
+        # signal_weights, but passing the extra entries through is harmless
+        # (rank_candidates() only ever looks up since_by_signal by the names
+        # already in signal_weights).
         results = rank_candidates(conn, signal_weights, since_by_signal)
     finally:
         conn.close()
