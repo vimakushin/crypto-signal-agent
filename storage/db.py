@@ -460,6 +460,30 @@ def get_latest_coingecko_price_history(conn: sqlite3.Connection, gecko_id: str) 
     ).fetchone()
 
 
+def get_latest_coingecko_price_history_by_slug(
+    conn: sqlite3.Connection, protocol_slug: str
+) -> sqlite3.Row | None:
+    """Most recent stored price/volume row for one DeFiLlama protocol slug -
+    same lookup as get_latest_coingecko_price_history above, but keyed by
+    `protocol_slug` instead of `gecko_id`. Needed for the episode-labeling
+    web screen: signal_events.protocol_slug for revenue_price_gap and
+    volume_breakout episodes is the DeFiLlama slug (e.g. "cowswap"), not the
+    CoinGecko gecko_id, so the gecko_id-keyed function can't be used
+    directly there. Relies on collect_price_volume_history
+    (collectors/coingecko.py) having stamped protocol_slug onto every row
+    via its DeFiLlama-slug-to-gecko_id mapping.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM coingecko_price_history
+        WHERE protocol_slug = ?
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        (protocol_slug,),
+    ).fetchone()
+
+
 def get_coingecko_price_history_before(
     conn: sqlite3.Connection, gecko_id: str, before_date: str, days: int
 ) -> list[sqlite3.Row]:
