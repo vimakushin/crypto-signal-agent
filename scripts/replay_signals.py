@@ -71,6 +71,7 @@ every historical point in turn instead of only the newest one.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import statistics
@@ -101,7 +102,7 @@ from storage.db import (  # noqa: E402
     get_defillama_daily_revenue_window,
     get_snapshot_days_before,
 )
-from storage.episodes import collapse_into_episodes  # noqa: E402
+from storage.episodes import Episode, collapse_into_episodes  # noqa: E402
 
 # Grid cadence oi_divergence replay evaluates on - matches
 # scripts/backfill_history.py's BINANCE_BACKFILL_PERIOD ("4h"), the coarser
@@ -297,10 +298,14 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         _collapse_daily_episodes - one real revenue spike can stay visible
         as "fired" for several consecutive days under revenue_price_gap's
         rolling 7-day window, so the raw count alone overstates how many
-        distinct events actually happened), a per-protocol breakdown, and
-        the revenue_growth_pct values seen across FIRED points only (for
+        distinct events actually happened), a per-protocol breakdown, the
+        revenue_growth_pct values seen across FIRED points only (for
         _describe - see the loop below for why this is fired-only, not
-        all-evaluated, since this rewrite).
+        all-evaluated, since this rewrite), and per_protocol_entries (slug
+        -> the raw (date, RevenueGapSignal | False | None) list this
+        function's own loop already builds to feed _collapse_daily_episodes
+        - exposed so build_revenue_price_gap_episodes can turn it into
+        dated Episode objects without a second pass over storage).
     """
     lookback_days = signal_cfg["lookback_days"]
     baseline_window_days = signal_cfg["baseline_window_days"]
@@ -329,6 +334,13 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
     min_valid_baseline = math.floor(baseline_window_days * revenue_price_gap.MIN_HISTORY_COVERAGE_FRACTION)
 
     per_protocol: dict[str, dict] = {}
+    # Every protocol's (date, RevenueGapSignal | False | None) entries list,
+    # keyed by slug - the SAME list this loop already builds below to feed
+    # _collapse_daily_episodes for the episode COUNT. Exposed here (an
+    # additive return key, see this function's Returns docstring) purely so
+    # build_revenue_price_gap_episodes can turn those same entries into
+    # dated Episode objects without re-running this loop a second time.
+    per_protocol_entries: dict[str, list[tuple[date_cls, "revenue_price_gap.RevenueGapSignal | bool | None"]]] = {}
     evaluated_total = 0
     fired_raw_total = 0
     episodes_total = 0
@@ -434,7 +446,16 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
                 # case so replay's counts are unaffected.
                 signal = None
             fired = signal is not None
-            entries.append((latest_date, fired))
+            # Stores the fired RevenueGapSignal object itself, not a bare
+            # bool - _collapse_daily_episodes/collapse_into_episodes below
+            # only ever check `if flag:` (truthiness), so a dataclass
+            # instance works exactly like True there, unchanged. This is
+            # what lets build_revenue_price_gap_episodes (below) reuse this
+            # SAME per-protocol loop, instead of re-running it a second time
+            # just to get the signal object back for an episode's
+            # first/last_metric_value and details_json - see this
+            # function's docstring return value note on per_protocol_entries.
+            entries.append((latest_date, signal if fired else False))
             if fired:
                 fired_raw_total += 1
                 stats["fired"] += 1
@@ -454,6 +475,7 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         episodes_total += episodes
 
         per_protocol[slug] = stats
+        per_protocol_entries[slug] = entries
 
     return {
         "lookback_days": lookback_days,
@@ -472,6 +494,10 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         "min_revenue_total_usd": min_revenue_total_usd,
         "per_protocol": per_protocol,
         "revenue_values": revenue_values,
+        # See per_protocol_entries's declaration above this loop - not used
+        # by _report_revenue_price_gap below, only by
+        # build_revenue_price_gap_episodes (backtest date-level prep).
+        "per_protocol_entries": per_protocol_entries,
     }
 
 
@@ -525,6 +551,83 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info("  %s", _describe(
         result["revenue_values"], "revenue_growth_pct distribution over FIRED points only"
     ))
+
+
+def build_revenue_price_gap_episodes(result: dict) -> list[Episode]:
+    """Turn replay_revenue_price_gap's per_protocol_entries into dated
+    Episode objects (storage/episodes.py's shared shape - the same one the
+    manual-labeling web screen already reads from signal_events), for the
+    backtest prep this script was extended for (BACKLOG.md's "Бэктест
+    сегодня посчитать нельзя..." entry): "how would TODAY's formula have
+    scored the whole history", with real episode start/end dates so a
+    caller can look up price N days after each one.
+
+    Does not re-run any evaluation - reuses the exact (date, signal) pairs
+    replay_revenue_price_gap's own loop already produced, and groups them
+    with the SAME storage/episodes.py's collapse_into_episodes primitive
+    _collapse_daily_episodes (used for the plain episode COUNT) is already a
+    thin wrapper over - not a fourth reimplementation of the grouping logic.
+
+    Args:
+        result: replay_revenue_price_gap's return value.
+
+    Returns:
+        Episode objects, oldest first within each protocol, protocols in
+        the order per_protocol_entries iterates them (insertion order -
+        watchlist order). `is_open` is always False - these are backtest
+        episodes over closed historical data, not open signal_events rows
+        being tracked against a live freshness cursor.
+    """
+    episodes: list[Episode] = []
+    for slug, entries in result["per_protocol_entries"].items():
+        day_episodes = collapse_into_episodes(
+            entries, lambda prev_day, day: day == prev_day + timedelta(days=1)
+        )
+        by_day = dict(entries)
+        for start_day, end_day in day_episodes:
+            first_signal = by_day[start_day]
+            last_signal = by_day[end_day]
+            episodes.append(
+                Episode(
+                    signal_name="revenue_price_gap",
+                    protocol_slug=slug,
+                    episode_start_date=start_day.isoformat(),
+                    episode_end_date=end_day.isoformat(),
+                    duration_days=(end_day - start_day).days + 1,
+                    is_open=False,
+                    first_metric_value=first_signal.revenue_growth_pct,
+                    first_details_json=_revenue_price_gap_details_json(first_signal, result),
+                    last_metric_value=last_signal.revenue_growth_pct,
+                    last_details_json=_revenue_price_gap_details_json(last_signal, result),
+                    last_triggered_at=f"{end_day.isoformat()}T00:00:00+00:00",
+                )
+            )
+    return episodes
+
+
+def _revenue_price_gap_details_json(signal, result: dict) -> str:
+    """Same field set main.py's run_defillama_cycle puts into
+    signal_events.details_json for signal_name="revenue_price_gap" (see
+    main.py, next to its save_signal_event(..., signal_name=
+    "revenue_price_gap", ...) call) - so notifications/telegram_bot.py's
+    _SIGNAL_FORMATTERS can render a backtest episode with the exact same
+    formatter a live one uses.
+    """
+    return json.dumps({
+        "revenue_growth_pct": signal.revenue_growth_pct,
+        "revenue_growth_threshold_pct": result["revenue_threshold"],
+        "mcap_growth_pct": signal.mcap_growth_pct,
+        "mcap_reaction_threshold_pct": result["mcap_threshold"],
+        "lookback_days": signal.lookback_days,
+        "actual_lookback_days": signal.actual_lookback_days,
+        "recent_median_daily_revenue": signal.recent_median_daily_revenue,
+        "baseline_median_daily_revenue": signal.baseline_median_daily_revenue,
+        "recent_week_sum": signal.recent_week_sum,
+        "max_day_share_pct": signal.max_day_share_pct,
+        "mcap_now": signal.mcap_now,
+        "mcap_before": signal.mcap_before,
+        "symbol": signal.symbol,
+    })
 
 
 # --------------------------------------------------------------------------
@@ -600,8 +703,12 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
 
     Returns:
         Dict with aggregate raw-point and episode counts, a per-symbol
-        breakdown, and the raw oi_growth_pct / actual-elapsed-hours values
-        seen across all evaluated grid-points.
+        breakdown, the raw oi_growth_pct / actual-elapsed-hours values seen
+        across all evaluated grid-points, and per_symbol_entries (symbol ->
+        the raw (boundary_datetime, OiDivergenceSignal | False | None) list
+        this function's own loop already builds to feed _collapse_episodes -
+        exposed so build_oi_divergence_episodes can turn it into dated
+        Episode objects without a second pass over storage).
     """
     lookback_hours = signal_cfg["lookback_hours"]
     oi_threshold = signal_cfg["oi_growth_threshold_pct"]
@@ -610,6 +717,10 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
 
     per_symbol_raw: dict[str, dict] = {}
     per_symbol_episodes: dict[str, int] = {}
+    # symbol -> (boundary_datetime, OiDivergenceSignal | False | None) list -
+    # see this function's Returns docstring; additive, not used by
+    # _report_oi_divergence, only by build_oi_divergence_episodes.
+    per_symbol_entries: dict[str, list] = {}
     evaluated_total = 0
     insufficient_total = 0
     insufficient_liquidity_total = 0
@@ -626,6 +737,7 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
         if not ts_rows:
             per_symbol_raw[symbol] = {"evaluated": 0, "fired": 0}
             per_symbol_episodes[symbol] = 0
+            per_symbol_entries[symbol] = []
             continue
 
         first_ts = datetime.fromisoformat(ts_rows[0]["oi_timestamp"])
@@ -684,7 +796,13 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
                 latest, earlier, oi_threshold, price_threshold, actual_hours,
             )
             fired = signal is not None
-            fired_flags.append(fired)
+            # Stores the fired OiDivergenceSignal object itself, not a bare
+            # bool - same reasoning as replay_revenue_price_gap's entries
+            # list above: _collapse_episodes/collapse_into_episodes only
+            # check truthiness, so this is unchanged for them, and it's what
+            # lets build_oi_divergence_episodes (below) reuse this SAME
+            # per-symbol loop instead of a second pass over storage.
+            fired_flags.append(signal if fired else False)
             if fired:
                 fired_raw_total += 1
                 symbol_fired += 1
@@ -693,6 +811,13 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
         episodes = _collapse_episodes(fired_flags)
         per_symbol_episodes[symbol] = episodes
         episodes_total += episodes
+        # grid and fired_flags are the same length and order (one fired_flags
+        # entry per grid boundary, appended in the same loop above, even for
+        # boundaries with insufficient data - see the `None` appends above).
+        # Paired here into (boundary_datetime, signal | False | None) so
+        # build_oi_divergence_episodes can group by calendar date without
+        # re-running this loop.
+        per_symbol_entries[symbol] = list(zip(grid, fired_flags))
 
     return {
         "lookback_hours": lookback_hours,
@@ -708,6 +833,7 @@ def replay_oi_divergence(conn, symbols: list[str], signal_cfg: dict) -> dict:
         "per_symbol_episodes": per_symbol_episodes,
         "oi_growth_values": oi_growth_values,
         "actual_lookback_values": actual_lookback_values,
+        "per_symbol_entries": per_symbol_entries,
     }
 
 
@@ -754,6 +880,78 @@ def _report_oi_divergence(result: dict) -> None:
     ))
 
 
+def build_oi_divergence_episodes(result: dict) -> list[Episode]:
+    """Turn replay_oi_divergence's per_symbol_entries into dated Episode
+    objects - the oi_divergence counterpart of
+    build_revenue_price_gap_episodes above (see that function's docstring
+    for the shared backtest-prep motivation).
+
+    Grouping stays on the same GRID_STEP_HOURS-spaced grid
+    replay_oi_divergence itself evaluates on (contiguity = "next boundary is
+    exactly GRID_STEP_HOURS later", same idea as _collapse_episodes' plain
+    positional-index check, expressed directly over the boundary datetimes
+    here instead of list indices since per_symbol_entries already pairs
+    each flag with its real boundary) - episode_start_date/episode_end_date
+    are still reported as calendar dates ("YYYY-MM-DD", the same shape every
+    other Episode in the project uses), taken from the first/last grid
+    boundary in the episode.
+
+    Args:
+        result: replay_oi_divergence's return value.
+
+    Returns:
+        Episode objects, oldest first within each symbol. `is_open` is
+        always False - see build_revenue_price_gap_episodes.
+    """
+    episodes: list[Episode] = []
+    step = timedelta(hours=GRID_STEP_HOURS)
+    for symbol, entries in result["per_symbol_entries"].items():
+        grid_episodes = collapse_into_episodes(
+            entries, lambda prev_dt, dt: dt == prev_dt + step
+        )
+        by_boundary = dict(entries)
+        for start_dt, end_dt in grid_episodes:
+            first_signal = by_boundary[start_dt]
+            last_signal = by_boundary[end_dt]
+            start_date = start_dt.date()
+            end_date = end_dt.date()
+            episodes.append(
+                Episode(
+                    signal_name="oi_divergence",
+                    protocol_slug=symbol,
+                    episode_start_date=start_date.isoformat(),
+                    episode_end_date=end_date.isoformat(),
+                    duration_days=(end_date - start_date).days + 1,
+                    is_open=False,
+                    first_metric_value=first_signal.oi_growth_pct,
+                    first_details_json=_oi_divergence_details_json(first_signal, result),
+                    last_metric_value=last_signal.oi_growth_pct,
+                    last_details_json=_oi_divergence_details_json(last_signal, result),
+                    last_triggered_at=end_dt.isoformat(),
+                )
+            )
+    return episodes
+
+
+def _oi_divergence_details_json(signal, result: dict) -> str:
+    """Same field set main.py's run_binance_futures_cycle puts into
+    signal_events.details_json for signal_name="oi_divergence" (see
+    main.py, next to its save_signal_event(..., signal_name="oi_divergence",
+    ...) call) - see _revenue_price_gap_details_json above for why.
+    """
+    return json.dumps({
+        "lookback_hours": signal.lookback_hours,
+        "oi_growth_pct": signal.oi_growth_pct,
+        "price_change_pct": signal.price_change_pct,
+        "oi_now": signal.oi_now,
+        "oi_before": signal.oi_before,
+        "price_now": signal.price_now,
+        "price_before": signal.price_before,
+        "oi_growth_threshold_pct": result["oi_threshold"],
+        "price_change_threshold_pct": result["price_threshold"],
+    })
+
+
 # --------------------------------------------------------------------------
 # volume_breakout replay
 # --------------------------------------------------------------------------
@@ -788,8 +986,13 @@ def replay_volume_breakout(
     Returns:
         Dict with aggregate counts (including a separate early-window vs.
         mature-window breakdown - see module docstring), a per-protocol
-        breakdown, and the raw volume_ratio values seen across all evaluated
-        points.
+        breakdown, the raw volume_ratio values seen across all evaluated
+        points, and per_protocol_entries (slug -> a (date,
+        VolumeBreakoutSignal | False | None) list, one entry per row this
+        function's own loop iterates - exposed so
+        build_volume_breakout_episodes can turn it into dated Episode
+        objects without a second pass over storage; no equivalent list
+        existed here before this, unlike the other two replay_* functions).
     """
     resistance_days = signal_cfg["resistance_lookback_days"]
     volume_days = signal_cfg["volume_avg_lookback_days"]
@@ -799,6 +1002,17 @@ def replay_volume_breakout(
     min_volume_avg_usd = signal_cfg.get("min_volume_avg_usd", 0)
 
     per_protocol: dict[str, dict] = {}
+    # slug -> (date, VolumeBreakoutSignal | False | None) list, one entry
+    # per row iterated below (not just evaluated ones - see the None
+    # appends at each skip point) - NEW tracking, unlike
+    # replay_revenue_price_gap/replay_oi_divergence's per_protocol_entries/
+    # per_symbol_entries above (which already had an equivalent list to
+    # extend): replay_volume_breakout never counted episodes at all before
+    # this. Built alongside the existing loop below so
+    # build_volume_breakout_episodes can group it with the same
+    # collapse_into_episodes primitive the other two signals use, without a
+    # second pass over storage.
+    per_protocol_entries: dict[str, list] = {}
     latest_dates: dict[str, str] = {}
     evaluated_total = 0
     fired_total = 0
@@ -815,6 +1029,7 @@ def replay_volume_breakout(
         stats = {"evaluated": 0, "fired": 0, "gecko_id": gecko_id}
         if not gecko_id:
             per_protocol[slug] = stats
+            per_protocol_entries[slug] = []
             continue
 
         rows = conn.execute(
@@ -824,8 +1039,13 @@ def replay_volume_breakout(
         if rows:
             latest_dates[slug] = rows[-1]["date"]
 
+        entries: list[tuple[date_cls, object]] = []
+
         for latest in rows:
+            day = date_cls.fromisoformat(latest["date"])
+
             if latest["price"] is None or latest["volume"] is None:
+                entries.append((day, None))
                 continue
 
             resistance_rows = get_coingecko_price_history_before(
@@ -834,12 +1054,14 @@ def replay_volume_breakout(
             resistance_prices = volume_breakout._valid_prices(resistance_rows)
             if len(resistance_prices) < min_resistance_values:
                 insufficient_total += 1
+                entries.append((day, None))
                 continue
 
             volume_rows = get_coingecko_price_history_before(conn, gecko_id, latest["date"], volume_days)
             volume_values = volume_breakout._valid_volumes(volume_rows)
             if len(volume_values) < min_volume_values:
                 insufficient_total += 1
+                entries.append((day, None))
                 continue
 
             # Liquidity/noise floor (TZ section 9) - same check and same
@@ -852,6 +1074,7 @@ def replay_volume_breakout(
             volume_avg = sum(volume_values) / len(volume_values)
             if volume_avg < min_volume_avg_usd:
                 insufficient_liquidity_total += 1
+                entries.append((day, None))
                 continue
 
             evaluated_total += 1
@@ -896,6 +1119,7 @@ def replay_volume_breakout(
                 latest, resistance_prices, volume_values,
                 resistance_days, volume_days, ratio_threshold,
             )
+            entries.append((day, signal if signal is not None else False))
             if signal is not None:
                 fired_total += 1
                 stats["fired"] += 1
@@ -905,6 +1129,7 @@ def replay_volume_breakout(
                     mature_fired += 1
 
         per_protocol[slug] = stats
+        per_protocol_entries[slug] = entries
 
     return {
         "resistance_days": resistance_days,
@@ -922,6 +1147,10 @@ def replay_volume_breakout(
         "per_protocol": per_protocol,
         "latest_dates": latest_dates,
         "volume_ratio_values": volume_ratio_values,
+        # See per_protocol_entries's declaration above this loop - not used
+        # by _report_volume_breakout below, only by
+        # build_volume_breakout_episodes (backtest date-level prep).
+        "per_protocol_entries": per_protocol_entries,
     }
 
 
@@ -984,9 +1213,103 @@ def _report_volume_breakout(result: dict) -> None:
         )
 
 
+def build_volume_breakout_episodes(result: dict) -> list[Episode]:
+    """Turn replay_volume_breakout's per_protocol_entries into dated Episode
+    objects - the volume_breakout counterpart of
+    build_revenue_price_gap_episodes/build_oi_divergence_episodes above (see
+    build_revenue_price_gap_episodes's docstring for the shared backtest-
+    prep motivation).
+
+    Groups on plain consecutive calendar days (coingecko_price_history has
+    at most one row per date already), the same contiguity rule
+    build_revenue_price_gap_episodes uses - unlike revenue_price_gap this
+    signal has no rolling-window "stays visible as fired for several days"
+    behavior of its own, but consecutive days CAN still legitimately both
+    fire (e.g. a breakout that holds for 2-3 days running), and those should
+    still be one episode, not several.
+
+    Args:
+        result: replay_volume_breakout's return value.
+
+    Returns:
+        Episode objects, oldest first within each protocol. `is_open` is
+        always False - see build_revenue_price_gap_episodes.
+    """
+    episodes: list[Episode] = []
+    for slug, entries in result["per_protocol_entries"].items():
+        day_episodes = collapse_into_episodes(
+            entries, lambda prev_day, day: day == prev_day + timedelta(days=1)
+        )
+        by_day = dict(entries)
+        for start_day, end_day in day_episodes:
+            first_signal = by_day[start_day]
+            last_signal = by_day[end_day]
+            episodes.append(
+                Episode(
+                    signal_name="volume_breakout",
+                    protocol_slug=slug,
+                    episode_start_date=start_day.isoformat(),
+                    episode_end_date=end_day.isoformat(),
+                    duration_days=(end_day - start_day).days + 1,
+                    is_open=False,
+                    first_metric_value=first_signal.volume_ratio,
+                    first_details_json=_volume_breakout_details_json(first_signal, result),
+                    last_metric_value=last_signal.volume_ratio,
+                    last_details_json=_volume_breakout_details_json(last_signal, result),
+                    last_triggered_at=f"{end_day.isoformat()}T00:00:00+00:00",
+                )
+            )
+    return episodes
+
+
+def _volume_breakout_details_json(signal, result: dict) -> str:
+    """Same field set main.py's _run_volume_breakout puts into
+    signal_events.details_json for signal_name="volume_breakout" (see
+    main.py, next to its save_signal_event(..., signal_name=
+    "volume_breakout", ...) call) - see _revenue_price_gap_details_json
+    above for why.
+    """
+    return json.dumps({
+        "gecko_id": signal.gecko_id,
+        "date": signal.date,
+        "price_now": signal.price_now,
+        "resistance_level": signal.resistance_level,
+        "resistance_lookback_days": signal.resistance_lookback_days,
+        "resistance_window_days_available": signal.resistance_window_days_available,
+        "volume_now": signal.volume_now,
+        "volume_avg": signal.volume_avg,
+        "volume_avg_lookback_days": signal.volume_avg_lookback_days,
+        "volume_window_days_available": signal.volume_window_days_available,
+        "volume_ratio": signal.volume_ratio,
+        "volume_ratio_threshold": result["ratio_threshold"],
+    })
+
+
 # --------------------------------------------------------------------------
-# main
+# Episode-with-dates prep for the backtest (BACKLOG.md's "Бэктест сегодня
+# посчитать нельзя..." entry) - see build_revenue_price_gap_episodes/
+# build_oi_divergence_episodes/build_volume_breakout_episodes above. This
+# script itself doesn't compute any backtest hit-rate - it only logs a
+# sample of the dated episodes each builder produces, so a human (or
+# signal-validator) can sanity-check dates/values before they're used for
+# real by the backtest measurement.
 # --------------------------------------------------------------------------
+
+def _report_episode_sample(signal_name: str, episodes: list[Episode], sample_size: int = 3) -> None:
+    """Log the total episode count and up to `sample_size` example episodes
+    (oldest first) for one signal's build_*_episodes() output.
+    """
+    logger.info(
+        "  %s: %d dated episode(s) built across the whole watchlist.",
+        signal_name, len(episodes),
+    )
+    for ep in episodes[:sample_size]:
+        logger.info(
+            "    sample: %s %s..%s (%dd) first=%.2f last=%.2f",
+            ep.protocol_slug, ep.episode_start_date, ep.episode_end_date,
+            ep.duration_days, ep.first_metric_value, ep.last_metric_value,
+        )
+
 
 def main() -> None:
     cfg = load_config()
@@ -1008,6 +1331,8 @@ def main() -> None:
             conn, watchlist_defillama, cfg["signals"]["revenue_price_gap"]
         )
         _report_revenue_price_gap(rev_result)
+        rev_episodes = build_revenue_price_gap_episodes(rev_result)
+        _report_episode_sample("revenue_price_gap", rev_episodes)
 
         logger.info("")
         logger.info("--- oi_divergence (TZ 4.1) ---")
@@ -1015,6 +1340,8 @@ def main() -> None:
             conn, watchlist_binance, cfg["signals"]["oi_divergence"]
         )
         _report_oi_divergence(oi_result)
+        oi_episodes = build_oi_divergence_episodes(oi_result)
+        _report_episode_sample("oi_divergence", oi_episodes)
 
         logger.info("")
         logger.info("--- volume_breakout (TZ 4.7) ---")
@@ -1023,6 +1350,8 @@ def main() -> None:
             conn, watchlist_defillama, cfg["signals"]["volume_breakout"], slug_to_gecko_id
         )
         _report_volume_breakout(vb_result)
+        vb_episodes = build_volume_breakout_episodes(vb_result)
+        _report_episode_sample("volume_breakout", vb_episodes)
 
         logger.info("")
         logger.info("=== replay complete ===")
