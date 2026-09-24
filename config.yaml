@@ -251,6 +251,16 @@ episode_review:
   # to judge whether it's the right cadence.
   reopen_after_days: 14
 
+  # Days since episode start at which an episode labeled "рано судить"
+  # ("ask me later") comes back to get_reviewable_episodes(): it returns
+  # when its age reaches the NEAREST horizon here that had not yet arrived at
+  # the moment of labeling (after the last horizon: that many days after
+  # the label). These are the 7/14/30 observation horizons named in
+  # BACKLOG.md's backtest entry, not fitted to any observed case. With
+  # min_age_days=7 an episode is never offered before day 7, so in practice
+  # the first return is at day 14; 7 stays in the list as the named horizon.
+  recheck_horizon_days: [7, 14, 30]
+
   # get_open_episodes()'s minimum age before an episode is even offered for
   # labeling - a very recent episode hasn't had time to show whether it
   # "worked" yet. Like reopen_after_days above, 7 is a starting point, not

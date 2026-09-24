@@ -1,4 +1,4 @@
-"""FastAPI backend for the internal web UI (TZ section 6/10; see
+r"""FastAPI backend for the internal web UI (TZ section 6/10; see
 `.claude/agents/web-dev.md` for the boundaries this file has to respect).
 
 Scope of THIS file, right now: the manual episode-labeling screen only
@@ -14,7 +14,7 @@ ever needs a number this module can't get from storage/ as-is, that's a gap
 to flag to python-dev, not something to approximate here.
 
 Run with (from the project root, using the project's own Python):
-    python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
+    .venv\Scripts\python.exe -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 
 Deliberately bound to 127.0.0.1 only (see the run instructions above and
 docs/README) - this has no authentication and must never be reachable from
@@ -56,6 +56,7 @@ from storage.episodes import (  # noqa: E402
     Episode,
     REVENUE_PRICE_GAP_FORMULA_CHANGE_DATE,
     ReviewableEpisode,
+    get_market_comparison,
     get_open_episodes,
     get_reviewable_episodes,
 )
@@ -80,7 +81,14 @@ def _fmt_mcap(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+def _fmt_signed(value: float, suffix: str = "%") -> str:
+    # Explicit sign always; no colouring - the screen must not look like a
+    # "good/bad" verdict, only sign and numbers. U+2212 minus for readability.
+    return f"{value:+.2f}{suffix}".replace("-", "−")
+
+
 templates.env.filters["fmt_price"] = _fmt_price
+templates.env.filters["fmt_signed"] = _fmt_signed
 templates.env.filters["fmt_mcap"] = _fmt_mcap
 
 
@@ -153,6 +161,10 @@ class EpisodeView(BaseModel):
     prior_outcome: str | None = None
     prior_outcome_comment: str | None = None
     prior_outcome_at: str | None = None
+    coin_change_pct: float | None = None
+    market_change_pct: float | None = None
+    market_coins_used: int | None = None
+    vs_market_pp: float | None = None  # coin - market, percentage points
 
 
 def _price_mcap_for(conn, episode: Episode, first_details: dict, last_details: dict) -> dict:
@@ -210,7 +222,9 @@ def _price_mcap_for(conn, episode: Episode, first_details: dict, last_details: d
     )
 
 
-def _build_view(conn, episode: Episode, prior: ReviewableEpisode | None = None) -> EpisodeView:
+def _build_view(
+    conn, config: dict, episode: Episode, prior: ReviewableEpisode | None = None
+) -> EpisodeView:
     first_details = _parse_details(episode.first_details_json)
     last_details = _parse_details(episode.last_details_json)
 
@@ -221,7 +235,20 @@ def _build_view(conn, episode: Episode, prior: ReviewableEpisode | None = None) 
 
     price_mcap = _price_mcap_for(conn, episode, first_details, last_details)
 
+    market = get_market_comparison(
+        conn, config, episode.signal_name, episode.protocol_slug, episode.episode_start_date
+    )
+    market_kwargs = {}
+    if market is not None:
+        market_kwargs = dict(
+            coin_change_pct=market.coin_change_pct,
+            market_change_pct=market.market_change_pct,
+            market_coins_used=market.coins_used,
+            vs_market_pp=market.coin_change_pct - market.market_change_pct,
+        )
+
     return EpisodeView(
+        **market_kwargs,
         signal_name=episode.signal_name,
         protocol_slug=episode.protocol_slug,
         label=_label_for(episode, first_details),
@@ -253,9 +280,9 @@ def episodes_page(request: Request, show_old_formula: bool = True) -> HTMLRespon
     try:
         open_episodes = get_open_episodes(conn, config)
         reviewable_episodes = get_reviewable_episodes(conn, config)
-        new_views = [_build_view(conn, ep) for ep in open_episodes]
+        new_views = [_build_view(conn, config, ep) for ep in open_episodes]
         reviewable_views = [
-            _build_view(conn, r.episode, prior=r) for r in reviewable_episodes
+            _build_view(conn, config, r.episode, prior=r) for r in reviewable_episodes
         ]
     finally:
         conn.close()

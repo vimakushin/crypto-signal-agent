@@ -25,6 +25,7 @@ done anywhere.
 from __future__ import annotations
 
 import sqlite3
+import statistics
 import sys
 from dataclasses import dataclass
 from datetime import date as date_cls
@@ -41,6 +42,12 @@ from typing import Callable, TypeVar
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scoring.ranker import default_since_by_signal  # noqa: E402
+from storage.db import (  # noqa: E402
+    get_binance_oi_snapshot_hours_before,
+    get_coingecko_price_before,
+    get_latest_binance_oi_snapshot,
+    get_latest_coingecko_price_history_by_slug,
+)
 
 T = TypeVar("T")
 
@@ -277,6 +284,81 @@ def get_open_episodes(
 
 
 @dataclass
+class MarketComparison:
+    coin_change_pct: float  # episode's coin: price at episode start -> latest known price
+    market_change_pct: float  # MEDIAN of the same change over the other watchlist coins
+    coins_used: int  # how many other coins the median was computed over
+
+
+def _price_change_pct(start_price: float | None, now_price: float | None) -> float | None:
+    """(now - start) / start * 100, or None if either price is missing or
+    start is not positive."""
+    if start_price is None or now_price is None or start_price <= 0:
+        return None
+    return (now_price - start_price) / start_price * 100
+
+
+def get_market_comparison(
+    conn: sqlite3.Connection,
+    config: dict,
+    signal_name: str,
+    protocol_slug: str,
+    episode_start_date: str,
+) -> MarketComparison | None:
+    """Compare a coin's price change since episode start with the median
+    change of the rest of the watchlist over the same period (so the
+    labeler can tell "the signal found the coin" from "the whole market
+    rose"). Only reads already-collected prices; computes no signal.
+
+    Args:
+        conn: open storage/db.py connection.
+        config: parsed config.yaml - source of the watchlist universe
+            (defillama_protocols for revenue_price_gap / volume_breakout,
+            binance_futures_symbols for oi_divergence).
+        signal_name: which signal the episode belongs to.
+        protocol_slug: DeFiLlama slug, or Binance ticker for oi_divergence.
+        episode_start_date: "YYYY-MM-DD".
+
+    Returns:
+        MarketComparison, or None if signal_name is unknown, the coin itself
+        has no start/latest price, or no other coin could be computed.
+        Other coins lacking a price are skipped silently (see coins_used).
+    """
+    watchlist = config.get("watchlist", {})
+    if signal_name in ("revenue_price_gap", "volume_breakout"):
+        universe = watchlist.get("defillama_protocols", [])
+
+        def change(slug: str) -> float | None:
+            start = get_coingecko_price_before(conn, slug, episode_start_date)
+            now = get_latest_coingecko_price_history_by_slug(conn, slug)
+            if start is None or now is None:
+                return None
+            return _price_change_pct(start["price"], now["price"])
+
+    elif signal_name == "oi_divergence":
+        universe = watchlist.get("binance_futures_symbols", [])
+        start_iso = f"{episode_start_date}T00:00:00+00:00"
+
+        def change(slug: str) -> float | None:
+            start = get_binance_oi_snapshot_hours_before(conn, slug, start_iso, 0)
+            now = get_latest_binance_oi_snapshot(conn, slug)
+            if start is None or now is None:
+                return None
+            return _price_change_pct(start["price"], now["price"])
+
+    else:
+        return None
+
+    coin_change = change(protocol_slug)
+    if coin_change is None:
+        return None
+    others = [c for c in (change(s) for s in universe if s != protocol_slug) if c is not None]
+    if not others:
+        return None
+    return MarketComparison(coin_change, statistics.median(others), len(others))
+
+
+@dataclass
 class ReviewableEpisode:
     episode: Episode
     prior_outcome: str
@@ -284,19 +366,45 @@ class ReviewableEpisode:
     prior_outcome_at: str
 
 
+def _recheck_due_date(
+    episode_start_date: str, outcome_at: datetime, horizons: list[int]
+) -> date_cls:
+    """Date on which an episode labeled "рано судить" at `outcome_at` should
+    come back: episode start + the smallest horizon greater than the
+    episode's age (in days, UTC) at labeling time; if the label was made at
+    or after the last horizon, `outcome_at` date + the last horizon.
+    """
+    start = date_cls.fromisoformat(episode_start_date)
+    labeled_day = outcome_at.astimezone(timezone.utc).date()
+    age = (labeled_day - start).days
+    later = [h for h in sorted(horizons) if h > age]
+    if later:
+        return start + timedelta(days=later[0])
+    return labeled_day + timedelta(days=max(horizons))
+
+
 def get_reviewable_episodes(
     conn: sqlite3.Connection, config: dict, reopen_after_days: int | None = None
 ) -> list[ReviewableEpisode]:
-    """Already-labeled episodes worth a second look: labeled while still
-    open, still open now, and enough time (`reopen_after_days`) has passed
-    since that label was recorded that the earlier call might no longer
-    hold.
+    """Already-labeled episodes worth a second look. Two kinds; an episode
+    appears at most once per call, and every re-label restarts its clock
+    (save_episode_outcome overwrites outcome_at), so an episode that is
+    still open and keeps being re-labeled comes back every
+    `reopen_after_days`:
+      1. labeled while still open, still open now, and at least
+         `reopen_after_days` have passed since that label (the earlier call
+         might no longer hold);
+      2. labeled "рано судить" (open OR closed, regardless of
+         labeled_when_open) whose recheck date has arrived - see
+         _recheck_due_date. The screen can tell them apart by
+         `prior_outcome == "рано судить"`.
 
     Args:
         conn: open storage/db.py connection.
         config: parsed config.yaml - source of the reopen_after_days
             default (config.yaml's episode_review.reopen_after_days) when
-            the caller doesn't pass one explicitly, and passed through to
+            the caller doesn't pass one explicitly, of
+            episode_review.recheck_horizon_days, and passed through to
             default_since_by_signal() for the freshness cursor.
         reopen_after_days: overrides config.yaml's
             episode_review.reopen_after_days when given; falls back to that
@@ -315,6 +423,8 @@ def get_reviewable_episodes(
     all_episodes = _build_all_episodes(conn, since_by_signal)
     labeled = _labeled_keys(conn)
 
+    horizons = config.get("episode_review", {}).get("recheck_horizon_days", [7, 14, 30])
+
     now = datetime.now(timezone.utc)
     reopen_cutoff = now - timedelta(days=reopen_after_days)
 
@@ -324,12 +434,17 @@ def get_reviewable_episodes(
         prior = labeled.get(key)
         if prior is None:
             continue
-        if not prior["labeled_when_open"]:
-            continue
-        if not ep.is_open:
-            continue
         outcome_at = datetime.fromisoformat(prior["outcome_at"])
-        if outcome_at > reopen_cutoff:
+        reopen_due = (
+            prior["labeled_when_open"]
+            and ep.is_open
+            and outcome_at <= reopen_cutoff
+        )
+        recheck_due = (
+            prior["outcome"] == "рано судить"
+            and now.date() >= _recheck_due_date(ep.episode_start_date, outcome_at, horizons)
+        )
+        if not (reopen_due or recheck_due):
             continue
         result.append(
             ReviewableEpisode(

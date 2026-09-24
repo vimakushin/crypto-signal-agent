@@ -31,9 +31,24 @@
       {{ ep.mcap_now|fmt_mcap }}
     {% endif %}
   </td>
+  <td>
+    {% if ep.coin_change_pct is none %}
+      нет данных
+    {% else %}
+      монета {{ ep.coin_change_pct|fmt_signed }} &middot;
+      рынок {{ ep.market_change_pct|fmt_signed }} (медиана по {{ ep.market_coins_used }} монетам) &middot;
+      {{ ep.vs_market_pp|fmt_signed(" п.п.") }}
+    {% endif %}
+  </td>
   {% if ep.prior_outcome %}
   <td class="wrap prior">
-    было: <strong>{{ ep.prior_outcome }}</strong> ({{ ep.prior_outcome_at[:10] }}, пока эпизод ещё продолжался){% if ep.prior_outcome_comment %}<br>«{{ ep.prior_outcome_comment }}»{% endif %}
+    было: <strong>{{ ep.prior_outcome }}</strong> ({{ ep.prior_outcome_at[:10] }}){% if ep.prior_outcome_comment %}<br>«{{ ep.prior_outcome_comment }}»{% endif %}
+    <br>
+    {% if ep.prior_outcome == "рано судить" %}
+      Вы отложили решение («рано судить») — наступил следующий срок наблюдения, посмотрите ещё раз.
+    {% else %}
+      Размечено, пока эпизод ещё шёл; он продолжается и сейчас.
+    {% endif %}
   </td>
   {% endif %}
   <td class="actions">
