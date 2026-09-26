@@ -23,9 +23,11 @@ parsing.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import sys
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
@@ -43,6 +45,7 @@ from scoring.ranker import (  # noqa: E402
     rank_candidates,
     signal_weights_from_config,
 )
+from storage.episodes import _build_all_episodes  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -293,43 +296,188 @@ def _format_contribution(contribution) -> str:
         return f"{contribution.signal_name}: metric_value={contribution.metric_value}"
 
 
-def format_digest(results: list[CandidateScore], today_str: str) -> str:
-    """Turn rank_candidates()'s output into the actual Telegram message text.
+# --- Telegram-only wording -------------------------------------------------
+# The _format_* functions above are NOT used for the Telegram text: their
+# output goes into observations.md (and web/app.py), and
+# observations.backfill_seven_day_outcomes finds the data source by the
+# substring "oi_divergence" in that text, so they must stay as they are.
+# The digest reads for a person who doesn't know signal names or thresholds,
+# so it gets its own plain-language functions below (no thresholds, no
+# signal identifiers - only the measured facts).
 
-    Only facts: candidate name, total score, and per-signal breakdown of
-    what fired and with what values (TZ sections 1/9 and this task's own
-    instructions - no "buy/sell", no price targets, no promises of
-    returns). If `results` is empty, still returns a short message saying
-    so explicitly - silence is indistinguishable from a broken pipeline if
-    it isn't turned into an explicit message (same reasoning as main.py's
-    data-freshness diagnostics).
+_MONTHS_GENITIVE = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def _date_ru(day: date) -> str:
+    """'2026-09-26' as a date -> '26 сентября' (genitive month, no year)."""
+    return f"{day.day} {_MONTHS_GENITIVE[day.month - 1]}"
+
+
+def _signed(value: float, digits: int = 1) -> str:
+    """Number with an explicit sign, using the real minus sign U+2212."""
+    text = f"{abs(value):.{digits}f}"
+    return f"−{text}" if value < 0 else f"+{text}"
+
+
+def _price_level(value: float) -> str:
+    """Price with a dollar sign and ~3 significant digits, never in
+    exponent notation: 0.4481 -> '$0.448', 0.0123 -> '$0.0123',
+    145.8 -> '$146', 1234.5 -> '$1234'.
+    """
+    if value >= 100:
+        return f"${value:.0f}"
+    decimals = 2 - math.floor(math.log10(value))
+    return f"${value:.{decimals}f}"
+
+
+def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
+    baseline_days = config["signals"]["revenue_price_gap"]["baseline_window_days"]
+    lookback_days = details["lookback_days"]
+    return (
+        f"Медианная дневная выручка за {lookback_days} дней на "
+        f"{details['revenue_growth_pct']:.0f}% выше, чем за последние {baseline_days} дней, "
+        f"а капитализация токена за эти {lookback_days} дней изменилась на "
+        f"{_signed(details['mcap_growth_pct'])}%."
+    )
+
+
+def _digest_text_volume_breakout(details: dict, config: dict) -> str:
+    return (
+        f"Цена пробила уровень, державшийся {details['resistance_lookback_days']} дней "
+        f"({_price_level(details['resistance_level'])}), на объёме в "
+        f"{details['volume_ratio']:.1f} раза выше среднего за "
+        f"{details['volume_avg_lookback_days']} дней."
+    )
+
+
+def _digest_text_oi_divergence(details: dict, config: dict) -> str:
+    return (
+        f"Открытый интерес по фьючерсам Binance вырос на {details['oi_growth_pct']:.0f}% "
+        f"за {details['lookback_hours']:.0f} ч, а цена за это время изменилась на "
+        f"{_signed(details['price_change_pct'])}%."
+    )
+
+
+_DIGEST_TEXTS = {
+    "revenue_price_gap": _digest_text_revenue_price_gap,
+    "volume_breakout": _digest_text_volume_breakout,
+    "oi_divergence": _digest_text_oi_divergence,
+}
+
+
+def _digest_signal_text(contribution, config: dict) -> str:
+    """Plain-language sentence for one SignalContribution. Unknown
+    signal_name or a broken details dict falls back to the generic line
+    (and a warning) so one bad row can't sink the whole digest.
+    """
+    generic = f"{contribution.signal_name}: metric_value={contribution.metric_value}"
+    text_fn = _DIGEST_TEXTS.get(contribution.signal_name)
+    if text_fn is None:
+        logger.warning("Digest: no plain-language text for signal %s", contribution.signal_name)
+        return generic
+    try:
+        return text_fn(contribution.details, config)
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.warning("Digest: could not format details for %s: %s", contribution.signal_name, exc)
+        return generic
+
+
+def _coin_label(conn, candidate: CandidateScore) -> str:
+    """'LDO (Lido)' from the latest defillama_snapshots row; only the ticker
+    if the name is empty or equal to it; the Binance ticker without the USDT
+    suffix when there is no DeFiLlama row but oi_divergence fired; otherwise
+    the raw protocol_slug.
+    """
+    row = conn.execute(
+        "SELECT symbol, name FROM defillama_snapshots WHERE protocol_slug = ? "
+        "ORDER BY fetched_at DESC LIMIT 1",
+        (candidate.protocol_slug,),
+    ).fetchone()
+    if row is not None and row["symbol"]:
+        symbol, name = row["symbol"], row["name"]
+        return f"{symbol} ({name})" if name and name != symbol else symbol
+    if any(c.signal_name == "oi_divergence" for c in candidate.contributions):
+        return candidate.protocol_slug.removesuffix("USDT")
+    return candidate.protocol_slug
+
+
+def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
+    """'новая в сводке' or 'была и вчера, идёт с <дата>', judged by the
+    episode (run of consecutive days) each contribution belongs to.
+    """
+    starts = []
+    for contribution in candidate.contributions:
+        day = datetime.fromisoformat(contribution.triggered_at).date().isoformat()
+        for episode in episodes:
+            if (
+                episode.signal_name == contribution.signal_name
+                and episode.protocol_slug == candidate.protocol_slug
+                and episode.episode_end_date == day
+                and episode.episode_start_date < day
+            ):
+                starts.append(episode.episode_start_date)
+    if not starts:
+        return "новая в сводке"
+    return f"была и вчера, идёт с {_date_ru(date.fromisoformat(min(starts)))}"
+
+
+def format_digest(
+    results: list[CandidateScore],
+    today: date,
+    conn,
+    config: dict,
+    since_by_signal: dict[str, str],
+) -> str:
+    """Turn rank_candidates()'s output into the Telegram message text.
+
+    Only facts, in plain language (TZ sections 1/9 - no advice). Coins with
+    two or more different signals go first in a separate block, and only
+    there the score is shown. An empty `results` still yields an explicit
+    message - silence is indistinguishable from a broken pipeline.
 
     Args:
-        results: rank_candidates()'s return value.
-        today_str: a human-readable date string for the digest header
-            (e.g. "2026-09-10").
+        results: rank_candidates()'s return value (order kept as is).
+        today: date for the header.
+        conn: open storage/db.py connection (coin names, episodes).
+        config: parsed config.yaml (baseline window for the wording).
+        since_by_signal: default_since_by_signal()'s cursor, for episodes.
 
     Returns:
-        The full digest text, not yet truncated for Telegram's length limit
-        (send_telegram_message() truncates at send time).
+        The full text, not yet truncated (send_telegram_message() does that).
     """
+    header = f"Сводка за {_date_ru(today)}"
     if not results:
-        return (
-            f"Сводка за {today_str}: кандидатов сегодня нет. "
-            "Система работает, данные собираются."
-        )
+        return f"{header}: сегодня сигналов нет. Система работает, данные собираются."
 
-    lines = [f"Сводка за {today_str}: {len(results)} кандидат(ов)."]
+    episodes = _build_all_episodes(conn, since_by_signal)
+    multi: list[str] = []
+    single: list[str] = []
     for candidate in results:
-        lines.append(f"\n{candidate.protocol_slug} — скор {candidate.total_score:.2f}")
-        for contribution in candidate.contributions:
-            lines.append(f"  {_format_contribution(contribution)}")
+        title = f"{_coin_label(conn, candidate)} · {_freshness_label(candidate, episodes)}"
+        texts = [_digest_signal_text(c, config) for c in candidate.contributions]
+        if len({c.signal_name for c in candidate.contributions}) >= 2:
+            body = "\n".join(f"• {t}" for t in texts)
+            multi.append(f"{title} · скор {candidate.total_score:.2f}\n{body}")
+        else:
+            single.append(f"{title}\n{texts[0]}")
 
-    return "\n".join(lines)
+    blocks = [header]
+    if multi:
+        blocks.append(
+            "Совпадение сигналов — несколько разных сигналов на одной монете\n"
+            + "\n\n".join(multi)
+        )
+        if single:
+            blocks.append("Остальные\n" + "\n\n".join(single))
+    elif single:
+        blocks.append("\n\n".join(single))
+    return "\n\n".join(blocks)
 
 
 if __name__ == "__main__":
-    from datetime import date
     from logging.handlers import RotatingFileHandler
 
     import yaml
@@ -422,10 +570,20 @@ if __name__ == "__main__":
             backfill_seven_day_outcomes(conn)
         except Exception:
             logger.exception("observations.md: backfill_seven_day_outcomes failed")
+
+        try:
+            digest_text = format_digest(results, date.today(), conn, config, since_by_signal)
+        except Exception:
+            # Without this a bug in the wording code would end the run before
+            # the send below and the digest would silently not arrive.
+            logger.exception("Digest text could not be built")
+            digest_text = (
+                f"Сводка за {_date_ru(date.today())} не построилась из-за ошибки. "
+                "Данные собраны, подробности в logs\\telegram.log."
+            )
     finally:
         conn.close()
 
-    digest_text = format_digest(results, date.today().isoformat())
     logger.info("Digest text built (%d candidate(s), %d char(s))", len(results), len(digest_text))
 
     sent = send_telegram_message(token, chat_id, digest_text)
