@@ -31,3 +31,9 @@ __pycache__/
 # Claude Code session-local runtime state (e.g. scheduled-wakeup lock file) -
 # machine/session-specific, not project data.
 .claude/*.lock
+
+# Claude Code permissions granted on one particular computer. No secrets in
+# it, but it is local settings, not project data - it was tracked by mistake
+# until 5 Oct 2026 (found by the audit; the repository is public). The agent
+# definitions in .claude/agents/ ARE project data and stay tracked.
+.claude/settings.local.json

@@ -217,7 +217,44 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
             len(daily_revenue_records), len({r["protocol_slug"] for r in daily_revenue_records}),
         )
 
-        if revenue_signal_cfg.get("enabled", True):
+        # Guard: no revenue_price_gap scan when today's collection brought no
+        # snapshots or no daily-revenue points.
+        # Without it, an EMPTY DeFiLlama answer (no exception, just nothing)
+        # makes scan_watchlist compute on the OLD snapshots in the database and
+        # write signal_events rows stamped with today's time. The auditor
+        # reproduced exactly that on a copy of the database on 5 Oct 2026: 2
+        # rows (lido, ssv-network) built from 30 Sep data.
+        # Why it matters now: signal_events is the journal from which the hit
+        # rate is computed on 15 Oct 2026. A firing that a live run on fresh
+        # data never made would spoil the very measurement the signal freeze
+        # has been protecting for a month; with the collection retries
+        # (schedule.retry_*) it could happen up to six times a day.
+        # This does not break the freeze: the freeze covers signals/,
+        # thresholds, weights, coin lists and the formula - none of them
+        # changes here, only the decision whether to run the scan at all when
+        # there is no fresh data.
+        # Nothing needed cleaning up: the owner checked signal_events - no rows
+        # at all for 2, 3 and 4 Oct, the last one is from 1 Oct; this fix
+        # is for the future only.
+        # Both sets are needed (market cap comes from the snapshots, revenue
+        # from the daily history), hence "or". Only this block is skipped:
+        # the CoinGecko / volume_breakout part below still runs as before.
+        skip_revenue_scan = not records or not daily_revenue_records
+        if skip_revenue_scan:
+            logger.warning(
+                "revenue_price_gap: today's DeFiLlama collection returned %s - skipping this "
+                "run's scan so nothing is recorded as a fresh \"FIRED\" off yesterday's data.",
+                "no snapshots" if not records else "no daily revenue points",
+            )
+        elif len(records) < len(watchlist) / 2:
+            logger.warning(
+                "revenue_price_gap: today's collection only covered %d/%d watchlist protocols - "
+                "the scan below still runs, but any signal for a protocol NOT in this run's "
+                "collection is based on stale data from a previous run, not today's numbers.",
+                len(records), len(watchlist),
+            )
+
+        if revenue_signal_cfg.get("enabled", True) and not skip_revenue_scan:
             result = revenue_price_gap.scan_watchlist(
                 conn,
                 watchlist,

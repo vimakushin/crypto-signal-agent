@@ -31,16 +31,20 @@ All thresholds, signal weights, the watchlist and the schedule live in `config.y
 
 ## What's working today
 
-MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. A web UI, in-app manual labeling, and a full backtest are deliberately out of scope for MVP — see [`BACKLOG.md`](BACKLOG.md).
+MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six items hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
+
+Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. A first backtest was run on 15 September 2026; its result and its limits are in [`BACKLOG.md`](BACKLOG.md).
 
 ## How the project was built
 
 Every line of code here was written and reviewed through Claude Code, with the work split across specialized subagents (`.claude/agents/`) rather than done in one undifferentiated stream:
 
 - **python-dev** writes and fixes the entire Python core: collectors, signal detectors, scoring, storage, notifications.
-- **web-dev** owns the future web UI, and only the web UI — it never touches the core.
+- **web-dev** owns the web UI, and only the web UI — it never touches the core.
 - **code-reviewer** checks every notable change for correctness — logic bugs, unhandled exceptions, leaked secrets — after it's written and before the next task starts. It only reads and reports; it never edits code itself.
 - **signal-validator** checks something different: not whether the code is right, but whether its output means anything — data freshness, false positives, noise on low-liquidity coins, no look-ahead bias when running calculations against historical data.
+- **auditor** checks whether the project does what its own documents say: it collects every promise from the README, `MVP.md` and the rest, and tests each one by running things, not by reading code. It found the 2–3 October gap.
+- **first-user** looks only at what the owner sees — the Telegram digest and the labeling screen — knowing nothing about the project, and reports where a person would stumble.
 
 The default order is: the relevant agent writes the change → `code-reviewer` checks it → if it's a signal, `signal-validator` checks it too → any blocking finding gets fixed before moving on to the next thing.
 
