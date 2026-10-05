@@ -240,6 +240,18 @@ schedule:
   # CoinGecko's rate limits) and the backup have both had time to finish
   # before the digest queries storage/db.sqlite for that day's candidates.
   telegram_run_time: "12:30"
+  # The DeFiLlama collection and the Telegram digest are not run once a day
+  # but repeated every retry_interval_hours for retry_window_hours after their
+  # run time (11:00, 13:00 ... 21:00 and 12:30 ... 22:30). Why: on 2-3 Oct
+  # 2026 one failed run meant a lost day - on the 2nd the collection hit a
+  # locked database (the backup was copying it), on the 3rd there was no
+  # internet; nothing retried either, so no signals were computed on those
+  # two days. Repeats are harmless: `main.py --skip-if-fresh` exits at once if
+  # today's data are already collected, and the digest exits if today's was
+  # already sent (digest_sends table). Read by
+  # scripts/register_scheduled_task.ps1 - re-run it after changing these.
+  retry_interval_hours: 2
+  retry_window_hours: 10
 
 episode_review:
   # Manual "did it hold up" labeling screen (storage/episodes.py). If an

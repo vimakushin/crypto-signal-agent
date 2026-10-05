@@ -1,8 +1,12 @@
 # Registers FOUR Windows Task Scheduler tasks for crypto-signal-agent
 # (README.md has the plain-language explanation):
-#   - CryptoSignalAgent-DeFiLlama: `main.py --cycle defillama`, once a day,
-#     at schedule.defillama_run_time from config.yaml (TZ section 5 calls
-#     revenue/fees a "slow" signal - daily polling is enough).
+#   - CryptoSignalAgent-DeFiLlama: `main.py --cycle defillama --skip-if-fresh`,
+#     once a day at schedule.defillama_run_time from config.yaml (TZ section 5
+#     calls revenue/fees a "slow" signal - daily polling is enough), repeated
+#     every schedule.retry_interval_hours for schedule.retry_window_hours
+#     (11:00, 13:00 ... 21:00). The repeats are retries: after a failed
+#     collection (2-3 Oct 2026: locked database, no internet) one of them
+#     collects; once today's data exist, --skip-if-fresh makes them exit at once.
 #   - CryptoSignalAgent-BinanceOI: `main.py --cycle binance`, repeating every
 #     schedule.binance_futures_poll_hours hours around the clock (TZ section
 #     5 calls Open Interest a "fast" signal that needs polling every 4-6h,
@@ -14,7 +18,8 @@
 #   - CryptoSignalAgent-TelegramDigest: `notifications\telegram_bot.py`,
 #     once a day, at schedule.telegram_run_time from config.yaml (MVP.md
 #     checklist item 5 - the daily Telegram digest of ranked candidates,
-#     see that script's module docstring).
+#     see that script's module docstring), with the same retry repetition
+#     (12:30 ... 22:30). The script itself sends at most one digest per date.
 #
 # Run this ONCE, from PowerShell, as the Windows user who will normally be
 # logged in on this PC (all four tasks only run while that user is logged
@@ -27,7 +32,8 @@
 # creating duplicates. Also re-run this after changing
 # schedule.defillama_run_time, schedule.binance_futures_poll_hours,
 # schedule.binance_anchor_time, schedule.backup_run_time, or
-# schedule.telegram_run_time in config.yaml, to apply the new schedule.
+# schedule.telegram_run_time, schedule.retry_interval_hours, or
+# schedule.retry_window_hours in config.yaml, to apply the new schedule.
 
 $ErrorActionPreference = "Stop"
 
@@ -50,9 +56,10 @@ if (-not (Test-Path $ConfigPath)) {
     throw "config.yaml not found at $ConfigPath"
 }
 
-# Read all five schedule values from config.yaml (schedule.defillama_run_time,
+# Read all seven schedule values from config.yaml (schedule.defillama_run_time,
 # schedule.binance_futures_poll_hours, schedule.binance_anchor_time,
-# schedule.backup_run_time, schedule.telegram_run_time) instead of
+# schedule.backup_run_time, schedule.telegram_run_time,
+# schedule.retry_interval_hours, schedule.retry_window_hours) instead of
 # hardcoding them here - schedule/thresholds/watchlist live in config.yaml,
 # not in code (CLAUDE.md project rule). Uses the project's own venv Python +
 # PyYAML (already a dependency, see requirements.txt) rather than adding a
@@ -74,13 +81,15 @@ print(cfg["schedule"]["binance_futures_poll_hours"])
 print(cfg["schedule"]["backup_run_time"])
 print(cfg["schedule"]["telegram_run_time"])
 print(cfg["schedule"]["binance_anchor_time"])
+print(cfg["schedule"]["retry_interval_hours"])
+print(cfg["schedule"]["retry_window_hours"])
 '@
 $tempScriptPath = Join-Path $env:TEMP "crypto-signal-agent_read-schedule.py"
 Set-Content -Path $tempScriptPath -Value $readConfigScript -Encoding utf8
 try {
     $ConfigOutput = & $PythonExe $tempScriptPath $ConfigPath
-    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 5) {
-        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time / schedule.telegram_run_time / schedule.binance_anchor_time from $ConfigPath"
+    if ($LASTEXITCODE -ne 0 -or $ConfigOutput.Count -lt 7) {
+        throw "Could not read schedule.defillama_run_time / schedule.binance_futures_poll_hours / schedule.backup_run_time / schedule.telegram_run_time / schedule.binance_anchor_time / schedule.retry_interval_hours / schedule.retry_window_hours from $ConfigPath"
     }
 } finally {
     Remove-Item -Path $tempScriptPath -ErrorAction SilentlyContinue
@@ -90,6 +99,8 @@ $PollHoursRaw = $ConfigOutput[1].Trim()
 $BackupRunTimeRaw = $ConfigOutput[2].Trim()
 $TelegramRunTimeRaw = $ConfigOutput[3].Trim()
 $BinanceAnchorRunTimeRaw = $ConfigOutput[4].Trim()
+$RetryIntervalHoursRaw = $ConfigOutput[5].Trim()
+$RetryWindowHoursRaw = $ConfigOutput[6].Trim()
 
 $timeParts = $RunTimeRaw -split ":"
 if ($timeParts.Count -ne 2) {
@@ -104,6 +115,15 @@ if ($RunHour -lt 0 -or $RunHour -gt 23 -or $RunMinute -lt 0 -or $RunMinute -gt 5
 $PollHours = 0
 if (-not [int]::TryParse($PollHoursRaw, [ref]$PollHours) -or $PollHours -le 0 -or $PollHours -gt 24) {
     throw "schedule.binance_futures_poll_hours in config.yaml must be a whole number between 1 and 24, got '$PollHoursRaw'"
+}
+
+$RetryIntervalHours = 0
+if (-not [int]::TryParse($RetryIntervalHoursRaw, [ref]$RetryIntervalHours) -or $RetryIntervalHours -le 0 -or $RetryIntervalHours -gt 24) {
+    throw "schedule.retry_interval_hours in config.yaml must be a whole number between 1 and 24, got '$RetryIntervalHoursRaw'"
+}
+$RetryWindowHours = 0
+if (-not [int]::TryParse($RetryWindowHoursRaw, [ref]$RetryWindowHours) -or $RetryWindowHours -le 0 -or $RetryWindowHours -gt 23) {
+    throw "schedule.retry_window_hours in config.yaml must be a whole number between 1 and 23, got '$RetryWindowHoursRaw'"
 }
 
 $backupTimeParts = $BackupRunTimeRaw -split ":"
@@ -124,6 +144,22 @@ $TelegramRunHour = [int]$telegramTimeParts[0]
 $TelegramRunMinute = [int]$telegramTimeParts[1]
 if ($TelegramRunHour -lt 0 -or $TelegramRunHour -gt 23 -or $TelegramRunMinute -lt 0 -or $TelegramRunMinute -gt 59) {
     throw "schedule.telegram_run_time in config.yaml is out of range: '$TelegramRunTimeRaw'"
+}
+
+# The repeats must stay within one calendar day: a repeat after midnight sees
+# the NEW date, sends a digest built on yesterday's data and marks the new day
+# as done, so the real 12:30 digest of that day would be skipped. Hence the
+# last repeat (run time + window) has to be before 24:00 for both repeating
+# tasks, and the interval can't exceed the window.
+if ($RetryIntervalHours -gt $RetryWindowHours) {
+    throw "schedule.retry_interval_hours ($RetryIntervalHours) must not be greater than schedule.retry_window_hours ($RetryWindowHours) in config.yaml"
+}
+foreach ($check in @(
+        @{ Name = "schedule.defillama_run_time"; Minutes = $RunHour * 60 + $RunMinute },
+        @{ Name = "schedule.telegram_run_time"; Minutes = $TelegramRunHour * 60 + $TelegramRunMinute })) {
+    if ($check.Minutes + $RetryWindowHours * 60 -ge 24 * 60) {
+        throw "$($check.Name) + schedule.retry_window_hours ($RetryWindowHours h) in config.yaml reaches midnight or later - the last repeat must be before 24:00 (a repeat after midnight would send a digest for the new day on yesterday's data)"
+    }
 }
 
 $binanceAnchorTimeParts = $BinanceAnchorRunTimeRaw -split ":"
@@ -182,21 +218,35 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
 
+# A daily trigger that also repeats every retry_interval_hours for
+# retry_window_hours. In Windows PowerShell 5.1 New-ScheduledTaskTrigger -Daily
+# has no -RepetitionInterval parameter, so the repetition is built on a helper
+# -Once trigger and copied onto the daily one's .Repetition. Verified with
+# Get-ScheduledTask / exported XML after registering, not just assumed.
+function New-DailyRepeatingTrigger([datetime]$At) {
+    $trigger = New-ScheduledTaskTrigger -Daily -At $At
+    $repeating = New-ScheduledTaskTrigger -Once -At $At `
+        -RepetitionInterval (New-TimeSpan -Hours $RetryIntervalHours) `
+        -RepetitionDuration (New-TimeSpan -Hours $RetryWindowHours)
+    $trigger.Repetition = $repeating.Repetition
+    return $trigger
+}
+
 if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false
     Write-Host "Removed legacy task '$LegacyTaskName' (replaced by '$DeFiLlamaTaskName' + '$BinanceTaskName')."
 }
 
 $defillamaAction = New-ScheduledTaskAction -Execute "cmd.exe" `
-    -Argument '/c ".venv\Scripts\python.exe" main.py --cycle defillama' `
+    -Argument '/c ".venv\Scripts\python.exe" main.py --cycle defillama --skip-if-fresh' `
     -WorkingDirectory $ProjectRoot
-$defillamaTrigger = New-ScheduledTaskTrigger -Daily -At $RunTime
+$defillamaTrigger = New-DailyRepeatingTrigger $RunTime
 
 Register-ScheduledTask -TaskName $DeFiLlamaTaskName `
     -Action $defillamaAction `
     -Trigger $defillamaTrigger `
     -Settings $settings `
-    -Description "crypto-signal-agent: daily DeFiLlama snapshot + revenue_price_gap signal scan (see README.md)" `
+    -Description "crypto-signal-agent: DeFiLlama snapshot (daily, retried every $RetryIntervalHours h for $RetryWindowHours h) + revenue_price_gap signal scan (see README.md)" `
     -Force | Out-Null
 
 $binanceAction = New-ScheduledTaskAction -Execute "cmd.exe" `
@@ -243,7 +293,7 @@ Register-ScheduledTask -TaskName $BackupTaskName `
 $telegramAction = New-ScheduledTaskAction -Execute "cmd.exe" `
     -Argument '/c ".venv\Scripts\python.exe" notifications\telegram_bot.py' `
     -WorkingDirectory $ProjectRoot
-$telegramTrigger = New-ScheduledTaskTrigger -Daily -At $TelegramRunTime
+$telegramTrigger = New-DailyRepeatingTrigger $TelegramRunTime
 
 Register-ScheduledTask -TaskName $TelegramTaskName `
     -Action $telegramAction `
@@ -252,10 +302,10 @@ Register-ScheduledTask -TaskName $TelegramTaskName `
     -Description "crypto-signal-agent: daily Telegram digest of ranked candidates via notifications/telegram_bot.py (see README.md)" `
     -Force | Out-Null
 
-Write-Host "Scheduled task '$DeFiLlamaTaskName' registered - runs daily at $RunTimeRaw while this Windows user is logged in."
+Write-Host "Scheduled task '$DeFiLlamaTaskName' registered - runs daily at $RunTimeRaw (repeating every $RetryIntervalHours h for $RetryWindowHours h) while this Windows user is logged in."
 Write-Host "Scheduled task '$BinanceTaskName' registered - runs every $PollHours hour(s) while this Windows user is logged in."
 Write-Host "Scheduled task '$BackupTaskName' registered - runs daily at $BackupRunTimeRaw while this Windows user is logged in."
-Write-Host "Scheduled task '$TelegramTaskName' registered - runs daily at $TelegramRunTimeRaw while this Windows user is logged in."
+Write-Host "Scheduled task '$TelegramTaskName' registered - runs daily at $TelegramRunTimeRaw (repeating every $RetryIntervalHours h for $RetryWindowHours h) while this Windows user is logged in."
 Write-Host "Log files: $ProjectRoot\logs\scheduler_defillama.log (DeFiLlama task), $ProjectRoot\logs\scheduler_binance.log (BinanceOI task), $ProjectRoot\logs\backup.log (Backup task), $ProjectRoot\logs\telegram.log (TelegramDigest task)"
 Write-Host "(separate files on purpose - these are independent processes that can run at the same time, see main.py's module docstring)"
 Write-Host ""

@@ -64,6 +64,7 @@ from storage.db import (
     save_defillama_daily_revenue,
     save_defillama_snapshots,
     save_signal_event,
+    sources_without_fetch_today,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -165,7 +166,18 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> dict:
         return yaml.safe_load(f)
 
 
-def run_defillama_cycle(config: dict) -> None:
+def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
+    """Collect DeFiLlama + CoinGecko data and scan the signals on it.
+
+    Args:
+        config: parsed config.yaml.
+        skip_if_fresh: if True and BOTH DeFiLlama and CoinGecko already have a
+            collection on today's local date (storage.db.sources_without_fetch_today),
+            log one line and return without collecting or scanning. Used by the
+            scheduled task that is retried every few hours (see config.yaml
+            schedule.retry_interval_hours); a manual run leaves it False and
+            always collects.
+    """
     watchlist = config["watchlist"]["defillama_protocols"]
     db_path = Path(config["storage"]["sqlite_path"])
     if not db_path.is_absolute():
@@ -174,6 +186,19 @@ def run_defillama_cycle(config: dict) -> None:
     volume_signal_cfg = config["signals"]["volume_breakout"]
 
     init_db(db_path)
+
+    if skip_if_fresh:
+        check_conn = get_connection(db_path)
+        try:
+            missing = sources_without_fetch_today(check_conn)
+        finally:
+            check_conn.close()
+        if "defillama" not in missing and "coingecko" not in missing:
+            logger.info(
+                "--skip-if-fresh: DeFiLlama and CoinGecko already collected today - "
+                "nothing to do (no collection, no signal scan)"
+            )
+            return
 
     logger.info("Fetching DeFiLlama data for %d protocols...", len(watchlist))
     records = defillama.collect(watchlist)
@@ -534,9 +559,12 @@ def _warn_stale(source: str, elapsed_hours: float, expected_interval_hours: floa
         "%s\n"
         "STALE DATA: %s has not produced a new row in %.1f hours (%.1f days) - "
         "expected roughly every %.1f hours. The scheduled task may have "
-        "silently failed to start (known low-memory issue on this machine, "
-        "see README.md) - check Get-ScheduledTaskInfo and the corresponding "
-        "logs\\scheduler_*.log / logs\\backup.log.\n%s",
+        "silently failed to start or crashed. Look at the matching "
+        "logs\\scheduler_*.log / logs\\backup.log and at "
+        "Get-ScheduledTask -TaskName CryptoSignalAgent-* | Get-ScheduledTaskInfo "
+        "(LastRunTime, LastTaskResult). Causes found so far: battery settings "
+        "in the scheduler (fixed 2026-09-12), a locked database and no "
+        "network (2026-10-02/03).\n%s",
         border, source, elapsed_hours, elapsed_hours / 24, expected_interval_hours, border,
     )
 
@@ -546,11 +574,11 @@ def check_data_freshness(conn, config: dict) -> None:
     quiet for longer than expected (TZ section: transparency about what the
     system is/isn't doing).
 
-    Why this exists at all: on this machine, Windows Task Scheduler has been
-    observed to report LastTaskResult=0 (success) for a task whose process
-    never actually started (a known low-memory condition here) - so nothing
-    in Task Scheduler itself flags the problem, and data collection just
-    quietly stops. Since Task Scheduler can't be trusted to notice this,
+    Why this exists at all: Windows Task Scheduler has been observed to
+    report LastTaskResult=0 (success) for a task whose process never actually
+    started (battery settings, fixed 2026-09-12) - so nothing in Task
+    Scheduler itself flags the problem, and data collection just quietly
+    stops. Since Task Scheduler can't be trusted to notice this,
     main.py checks its OWN evidence instead: how long ago each destination
     table (or the backup folder) last actually received a new row/file. This
     is run on every invocation, regardless of which --cycle was requested,
@@ -638,6 +666,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="all",
         help="which cycle(s) to run (default: all - runs both, for manual use)",
     )
+    parser.add_argument(
+        "--skip-if-fresh",
+        action="store_true",
+        help="with --cycle defillama/all: exit without collecting if DeFiLlama and "
+        "CoinGecko already have a collection today (for the retried scheduled task)",
+    )
     return parser.parse_args(argv)
 
 
@@ -674,7 +708,7 @@ if __name__ == "__main__":
 
     if args.cycle in ("all", "defillama"):
         try:
-            run_defillama_cycle(cfg)
+            run_defillama_cycle(cfg, skip_if_fresh=args.skip_if_fresh)
         except Exception:
             logger.exception("DeFiLlama cycle failed")
             failed = True

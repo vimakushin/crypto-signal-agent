@@ -28,9 +28,11 @@ import re
 import sys
 import time
 from datetime import date, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
+import yaml
 
 # Same sys.path fix as scoring/ranker.py and scripts/backfill_history.py -
 # this module lives one level below the project root, so `from scoring...`
@@ -44,6 +46,13 @@ from scoring.ranker import (  # noqa: E402
     default_since_by_signal,
     rank_candidates,
     signal_weights_from_config,
+)
+from storage.db import (  # noqa: E402
+    get_connection,
+    get_digest_send_stale,
+    init_db,
+    record_digest_sent,
+    sources_without_fetch_today,
 )
 from storage.episodes import _build_all_episodes  # noqa: E402
 
@@ -70,6 +79,16 @@ TRUNCATION_SUFFIX = "\n...(обрезано)"
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 5
 REQUEST_TIMEOUT = 30
+
+# How long to wait for a stale source to get today's collection before
+# building the digest anyway. After a late PC start Task Scheduler launches the
+# collection and the digest at the same moment; without waiting the digest
+# would go out with "data are stale" minutes before the fresh data appears.
+# Measured in logs/scheduler_defillama.log (28 Sep - 5 Oct 2026): the whole
+# DeFiLlama + CoinGecko cycle takes 6.7-8.2 minutes (CoinGecko's rate limit is
+# most of it); 30 minutes is ~3.5x that, and under the task's 1-hour limit.
+FRESH_DATA_MAX_WAIT_MINUTES = 30
+FRESH_DATA_POLL_SECONDS = 60
 
 # Matches the bot token embedded in the request URL's path, e.g.
 # "/bot123456789:AAExampleTokenText" - see _redact_token below.
@@ -424,12 +443,48 @@ def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
     return f"была и вчера, идёт с {_date_ru(date.fromisoformat(min(starts)))}"
 
 
+_STALE_SOURCE_LABELS = {
+    "defillama": "выручка и капитализация протоколов (DeFiLlama)",
+    "coingecko": "цены и объёмы (CoinGecko)",
+    "binance": "фьючерсы (Binance)",
+}
+
+
+def _stale_warning(stale_sources: dict[str, str | None]) -> str:
+    """The warning paragraph that opens the digest when a source has no
+    collection today. "No collection today" and not "older than 24 hours" on
+    purpose: yesterday's collection ran late (12:44), today's failed, the
+    digest runs at 12:30 - the data are 23.8 hours old and a 24-hour rule
+    would stay silent about a source that has not updated today.
+
+    Args:
+        stale_sources: {source key: last fetched_at ISO (UTC) or None}.
+
+    Returns:
+        Two lines: which sources did not update today (with their last
+        collection date) and a note that the digest is built on that data.
+    """
+    parts = []
+    for source, last_iso in stale_sources.items():
+        if last_iso is None:
+            when = "ещё ни разу не собирались"
+        else:
+            last_day = datetime.fromisoformat(last_iso).astimezone().date()
+            when = f"последний сбор {_date_ru(last_day)}"
+        parts.append(f"{_STALE_SOURCE_LABELS[source]} — {when}")
+    return (
+        f"Внимание: данные устарели. Сегодня не обновлялись: {'; '.join(parts)}.\n"
+        "Сводка ниже построена на этих данных."
+    )
+
+
 def format_digest(
     results: list[CandidateScore],
     today: date,
     conn,
     config: dict,
     since_by_signal: dict[str, str],
+    stale_sources: dict[str, str | None] | None = None,
 ) -> str:
     """Turn rank_candidates()'s output into the Telegram message text.
 
@@ -444,12 +499,22 @@ def format_digest(
         conn: open storage/db.py connection (coin names, episodes).
         config: parsed config.yaml (baseline window for the wording).
         since_by_signal: default_since_by_signal()'s cursor, for episodes.
+        stale_sources: storage.db.sources_without_fetch_today()'s result at
+            the moment of building. Non-empty -> the text starts with a
+            warning paragraph, and an empty digest no longer claims the
+            system works. Empty/None -> the text is exactly as without it.
 
     Returns:
         The full text, not yet truncated (send_telegram_message() does that).
     """
     header = f"Сводка за {_date_ru(today)}"
+    warning = f"{_stale_warning(stale_sources)}\n\n" if stale_sources else ""
     if not results:
+        if stale_sources:
+            return (
+                f"{warning}{header}: сигналов не видно, но по устаревшим данным "
+                "судить об этом нельзя."
+            )
         return f"{header}: сегодня сигналов нет. Система работает, данные собираются."
 
     episodes = _build_all_episodes(conn, since_by_signal)
@@ -464,7 +529,7 @@ def format_digest(
         else:
             single.append(f"{title}\n{texts[0]}")
 
-    blocks = [header]
+    blocks = [warning + header]
     if multi:
         blocks.append(
             "Совпадение сигналов — несколько разных сигналов на одной монете\n"
@@ -477,58 +542,102 @@ def format_digest(
     return "\n\n".join(blocks)
 
 
-if __name__ == "__main__":
-    from logging.handlers import RotatingFileHandler
+def load_config(path: Path | str = PROJECT_ROOT / "config.yaml") -> dict:
+    """Load config.yaml (duplicated from main.py/scoring/ranker.py's own
+    load_config, not imported, for the same reason those scripts duplicate
+    it: importing main.py would run its module-level logging setup as an
+    import side effect).
+    """
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    import yaml
 
-    LOG_DIR = PROJECT_ROOT / "logs"
-    DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
-
-    def _setup_logging() -> None:
-        """Console + a rotating file in logs/telegram.log, same convention
-        as scripts/backup_db.py's own _setup_logging - each distinct
-        operation gets its own log file rather than sharing one.
-        """
-        handlers: list[logging.Handler] = [logging.StreamHandler()]
-        try:
-            LOG_DIR.mkdir(exist_ok=True)
-            handlers.append(
-                RotatingFileHandler(
-                    LOG_DIR / "telegram.log",
-                    maxBytes=5_000_000,
-                    backupCount=3,
-                    encoding="utf-8",
-                )
+def _setup_logging() -> None:
+    """Console + a rotating file in logs/telegram.log, same convention as
+    scripts/backup_db.py's own _setup_logging - each distinct operation gets
+    its own log file rather than sharing one.
+    """
+    log_dir = PROJECT_ROOT / "logs"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_dir.mkdir(exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                log_dir / "telegram.log",
+                maxBytes=5_000_000,
+                backupCount=3,
+                encoding="utf-8",
             )
-        except OSError as exc:
-            print(
-                f"WARNING: could not set up file logging at {LOG_DIR} ({exc}); "
-                "continuing with console-only logging.",
-                file=sys.stderr,
-            )
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            handlers=handlers,
+        )
+    except OSError as exc:
+        print(
+            f"WARNING: could not set up file logging at {log_dir} ({exc}); "
+            "continuing with console-only logging.",
+            file=sys.stderr,
         )
 
-    _setup_logging()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
-    def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> dict:
-        """Load config.yaml (duplicated from main.py/scoring/ranker.py's own
-        load_config, not imported, for the same reason those scripts
-        duplicate it: importing main.py would run its module-level logging
-        setup as an import side effect).
-        """
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f)
 
-    # sys.path already has the project root on it (see the module-level
-    # sys.path.insert above), so this is a plain import, not a deferred one.
-    from storage.db import get_connection
+def wait_for_fresh_data(
+    db_path: Path,
+    today: date,
+    poll_seconds: float = FRESH_DATA_POLL_SECONDS,
+    max_wait_seconds: float = FRESH_DATA_MAX_WAIT_MINUTES * 60,
+) -> dict[str, str | None]:
+    """Wait until every source has a collection on `today`, but no longer
+    than `max_wait_seconds`. Opens a short connection per check and closes it
+    before sleeping, so the waiting digest never blocks the collector's writes.
 
+    Args:
+        db_path: the live database.
+        today: the local date the digest is for.
+        poll_seconds: pause between checks (a parameter so a test need not
+            wait real minutes).
+        max_wait_seconds: upper limit of the wait (same reason).
+
+    Returns:
+        sources_without_fetch_today()'s result at the last check: empty if
+        everything became fresh, otherwise what is still stale.
+    """
+    deadline = time.monotonic() + max_wait_seconds
+    announced = False
+    while True:
+        conn = get_connection(db_path)
+        try:
+            stale = sources_without_fetch_today(conn, today)
+        finally:
+            conn.close()
+        remaining = deadline - time.monotonic()
+        if not stale or remaining <= 0:
+            return stale
+        if not announced:
+            logger.info(
+                "Waiting up to %.0f s for fresh data; no collection today yet for: %s",
+                max_wait_seconds, ", ".join(stale),
+            )
+            announced = True
+        time.sleep(min(poll_seconds, remaining))
+
+
+def main() -> int:
+    """Build today's digest and send it to Telegram: once per date, or twice
+    if the first one had to go out on stale data and fresh data arrived later.
+
+    Steps: read .env; exit quietly if the digest for today was already sent
+    (this task is retried every few hours - see config.yaml schedule); wait
+    for fresh data; rank candidates and update observations.md; build the
+    text (with a stale-data warning if needed); send; on success remember it.
+    A failed send leaves no mark, so the next scheduled run tries again.
+
+    Returns:
+        Process exit code: 0 - sent, or nothing left to send today; 1 - no
+        credentials, the send failed, or the sent mark could not be written.
+    """
     env_values = _read_env_file()
     token = env_values.get("TELEGRAM_BOT_TOKEN")
     chat_id = env_values.get("TELEGRAM_CHAT_ID")
@@ -538,15 +647,51 @@ if __name__ == "__main__":
             "cannot send the Telegram digest. Copy .env.example to .env and "
             "fill in the real values (see README.md)."
         )
-        sys.exit(1)
+        return 1
 
     config = load_config()
     db_path = Path(config["storage"]["sqlite_path"])
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
-    signal_weights = signal_weights_from_config(config)
+    today = date.today()
+    # init_db: this script is the first to touch the digest_sends table, and
+    # it may run before main.py ever did after an upgrade.
+    init_db(db_path)
+    conn = get_connection(db_path)
+    try:
+        sent_stale = get_digest_send_stale(conn, today)
+    finally:
+        conn.close()
 
+    # At most two digests per date: the first one may go out on stale data
+    # (after the wait below ran out); if so, a second one - on fresh data -
+    # is allowed later the same day, without waiting, and it replaces the mark.
+    is_resend = sent_stale is True
+    if sent_stale is False:
+        logger.info("Digest for %s was already sent today - nothing to do", today.isoformat())
+        return 0
+    if is_resend:
+        conn = get_connection(db_path)
+        try:
+            stale_sources = sources_without_fetch_today(conn, today)
+        finally:
+            conn.close()
+        if stale_sources:
+            logger.info(
+                "Digest for %s went out on stale data and %s still has no collection today - nothing to do",
+                today.isoformat(), ", ".join(stale_sources),
+            )
+            return 0
+        logger.info("Data are fresh now - sending the second digest for %s", today.isoformat())
+    else:
+        stale_sources = wait_for_fresh_data(db_path, today)
+        if stale_sources:
+            logger.warning(
+                "Building the digest on stale data, no collection today for: %s", ", ".join(stale_sources)
+            )
+
+    signal_weights = signal_weights_from_config(config)
     conn = get_connection(db_path)
     try:
         since_by_signal = default_since_by_signal(conn, config)
@@ -561,9 +706,8 @@ if __name__ == "__main__":
             backfill_seven_day_outcomes,
         )
 
-        today_str = date.today().isoformat()
         try:
-            append_new_observations(conn, results, today_str)
+            append_new_observations(conn, results, today.isoformat())
         except Exception:
             logger.exception("observations.md: append_new_observations failed")
         try:
@@ -571,21 +715,59 @@ if __name__ == "__main__":
         except Exception:
             logger.exception("observations.md: backfill_seven_day_outcomes failed")
 
+        fallback_text = False
         try:
-            digest_text = format_digest(results, date.today(), conn, config, since_by_signal)
+            digest_text = format_digest(results, today, conn, config, since_by_signal, stale_sources)
         except Exception:
+            fallback_text = True
             # Without this a bug in the wording code would end the run before
             # the send below and the digest would silently not arrive.
             logger.exception("Digest text could not be built")
             digest_text = (
-                f"Сводка за {_date_ru(date.today())} не построилась из-за ошибки. "
+                f"Сводка за {_date_ru(today)} не построилась из-за ошибки. "
                 "Данные собраны, подробности в logs\\telegram.log."
             )
     finally:
         conn.close()
 
+    if is_resend:
+        digest_text = (
+            "Данные обновились. Это повторная сводка за сегодня, уже на свежих данных.\n\n"
+            + digest_text
+        )
     logger.info("Digest text built (%d candidate(s), %d char(s))", len(results), len(digest_text))
 
-    sent = send_telegram_message(token, chat_id, digest_text)
-    if not sent:
-        sys.exit(1)
+    if not send_telegram_message(token, chat_id, digest_text):
+        return 1
+
+    # The fallback "не построилась" text is final (stale=False): repeating it
+    # every two hours would only mean several identical error messages.
+    try:
+        conn = get_connection(db_path)
+        try:
+            record_digest_sent(
+                conn, today, datetime.now().astimezone().isoformat(timespec="seconds"),
+                stale=bool(stale_sources) and not fallback_text,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception(
+            "The digest for %s WAS SENT to Telegram, but the mark could not be written to the "
+            "database - the next scheduled run (in ~2 hours) may send a duplicate",
+            today.isoformat(),
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    _setup_logging()
+    # The task runs through cmd.exe with no output redirection, so an
+    # unhandled exception would vanish; log it to telegram.log instead.
+    try:
+        exit_code = main()
+    except Exception:
+        logger.exception("Digest run crashed")
+        exit_code = 1
+    sys.exit(exit_code)

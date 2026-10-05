@@ -18,9 +18,25 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "db.sqlite"
+
+# How long a process waits for another process's lock on the database before
+# failing with "database is locked" (sqlite3's default is 5 s). On 2 Oct 2026
+# the PC was switched on late, Task Scheduler (StartWhenAvailable) launched
+# the backup, the DeFiLlama collection and the digest at the same moment, and
+# the collection died with "database is locked" because the backup was
+# copying the file. Spreading the tasks out in time doesn't help: after a
+# late start the scheduler runs ALL missed tasks at once, whatever times they
+# are set to. So the writer waits instead. Measured in logs/backup.log: a
+# backup takes 2-19 s normally and took 95 s that very morning (Google Drive,
+# three jobs competing); 300 s is ~3x that worst case, and well under the
+# tasks' own 1-hour limit. WAL mode is deliberately NOT used: it adds -wal/-shm
+# files next to the database, which backup and the restore instructions
+# don't expect.
+SQLITE_BUSY_TIMEOUT_SECONDS = 300
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS defillama_snapshots (
@@ -128,6 +144,18 @@ CREATE TABLE IF NOT EXISTS defillama_daily_revenue (
 CREATE INDEX IF NOT EXISTS idx_defillama_daily_revenue_slug_date
     ON defillama_daily_revenue (protocol_slug, date);
 
+-- One row per calendar date for which the Telegram digest was actually sent:
+-- the digest task is retried every 2 hours (see config.yaml schedule), and
+-- this mark is what makes the later runs exit without sending a second one.
+-- stale=1 means it went out with the "data are stale" warning; then one more
+-- digest (at most two per date) is allowed once the data are fresh, and the
+-- row is updated to stale=0.
+CREATE TABLE IF NOT EXISTS digest_sends (
+    digest_date TEXT PRIMARY KEY,
+    sent_at TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS signal_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     signal_name TEXT NOT NULL,
@@ -160,7 +188,7 @@ CREATE TABLE IF NOT EXISTS episode_outcomes (
 
 
 def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -594,6 +622,73 @@ def get_latest_coingecko_fetch_time(conn: sqlite3.Connection) -> str | None:
         empty (collector has never run yet - not an error).
     """
     return conn.execute("SELECT MAX(fetched_at) FROM coingecko_price_history").fetchone()[0]
+
+
+def sources_without_fetch_today(
+    conn: sqlite3.Connection, today: date | None = None
+) -> dict[str, str | None]:
+    """The project's single rule for "this source is stale": it has no
+    successful collection on today's LOCAL calendar date. Used by the
+    Telegram digest (warning + waiting) and by `main.py --skip-if-fresh`.
+
+    Args:
+        conn: open connection to the live database.
+        today: the local date to compare with; defaults to date.today().
+            The digest passes its own date (wait_for_fresh_data), so one run
+            judges every check against the same day.
+
+    Known limit of the rule: a source counts as fresh if it has AT LEAST ONE
+    row from today, so a partial collection counts as a collection.
+
+    Returns:
+        {"defillama" | "coingecko" | "binance": last fetched_at ISO string
+        (UTC) or None if the table is empty} for every source that has no
+        fetch on `today`. Empty dict when all three are fresh.
+    """
+    today = today or date.today()
+    latest = {
+        "defillama": get_latest_defillama_fetch_time(conn),
+        "coingecko": get_latest_coingecko_fetch_time(conn),
+        "binance": get_latest_binance_oi_fetch_time(conn),
+    }
+    return {
+        source: iso
+        for source, iso in latest.items()
+        if iso is None or datetime.fromisoformat(iso).astimezone().date() != today
+    }
+
+
+def get_digest_send_stale(conn: sqlite3.Connection, digest_date: date) -> bool | None:
+    """State of the digest_sends mark for `digest_date`.
+
+    Returns:
+        None if no digest was sent for that date; True if it was sent on
+        stale data (a fresh one may follow); False if it was sent and is final.
+    """
+    row = conn.execute(
+        "SELECT stale FROM digest_sends WHERE digest_date = ?", (digest_date.isoformat(),)
+    ).fetchone()
+    return None if row is None else bool(row["stale"])
+
+
+def record_digest_sent(
+    conn: sqlite3.Connection, digest_date: date, sent_at: str, stale: bool
+) -> None:
+    """Remember that the digest for `digest_date` went out; a second call for
+    the same date (the fresh digest after a stale one) updates the row.
+
+    Args:
+        conn: open connection to the live database.
+        digest_date: the local date the digest is for.
+        sent_at: ISO 8601 timestamp of the send.
+        stale: True if it was built on stale data (a fresh one may follow).
+    """
+    conn.execute(
+        "INSERT INTO digest_sends (digest_date, sent_at, stale) VALUES (?, ?, ?) "
+        "ON CONFLICT(digest_date) DO UPDATE SET sent_at = excluded.sent_at, stale = excluded.stale",
+        (digest_date.isoformat(), sent_at, int(stale)),
+    )
+    conn.commit()
 
 
 def save_signal_event(

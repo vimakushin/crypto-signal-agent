@@ -102,6 +102,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import yaml  # noqa: E402
 
+from storage.db import SQLITE_BUSY_TIMEOUT_SECONDS  # noqa: E402
+
 # Default location for backups: a folder inside the project itself, NOT
 # tracked by git (see .gitignore) - see the module docstring's "Where
 # backups are stored" section for why this is the simple default rather than
@@ -201,7 +203,10 @@ def backup_database(db_path: Path, backup_dir: Path) -> Path:
     backup_filename = datetime.now().strftime(BACKUP_FILENAME_FORMAT)
     backup_path = backup_dir / backup_filename
 
-    source_conn = sqlite3.connect(str(db_path))
+    # Same wait-for-the-lock timeout as storage/db.py's get_connection (see
+    # the comment on that constant): this script is one of the jobs the
+    # scheduler launches all at once after a late PC start.
+    source_conn = sqlite3.connect(str(db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     try:
         target_conn = sqlite3.connect(str(backup_path))
         try:

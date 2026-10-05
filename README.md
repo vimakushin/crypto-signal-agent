@@ -90,10 +90,16 @@ Slow (CoinGecko's rate limits), meant to be run once by hand, not part of the da
 
 Four separate Windows Task Scheduler tasks:
 
-- **`CryptoSignalAgent-DeFiLlama`** — once a day, `main.py --cycle defillama`.
+- **`CryptoSignalAgent-DeFiLlama`** — once a day, `main.py --cycle defillama --skip-if-fresh`, then retried every 2 hours for 10 hours.
 - **`CryptoSignalAgent-BinanceOI`** — every few hours, `main.py --cycle binance`.
 - **`CryptoSignalAgent-Backup`** — once a day, `scripts\backup_db.py`.
-- **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`).
+- **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`), then retried every 2 hours for 10 hours.
+
+The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date (a row in the `digest_sends` table marks it as sent). A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. The one case with a second message: if the digest had to go out with the stale-data warning and the data arrives later that day, one more digest follows, saying it is a repeat on fresh data.
+
+What a retry does not fix: "today's data is in" means at least one row was collected today. A collection that got only some of the coins (CoinGecko's rate limit, for instance) counts as done and is not repeated.
+
+Because of this, starting these two tasks by hand may do nothing: `Start-ScheduledTask` on the DeFiLlama task exits within a second if today's data is already collected, and on the digest task if today's digest has already gone out. To collect regardless, run `main.py --cycle defillama` yourself (without `--skip-if-fresh`). To send today's digest again, delete today's row from `digest_sends` first.
 
 Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.yaml`, re-run this once to apply it:
 
@@ -101,7 +107,7 @@ Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.
 powershell -ExecutionPolicy Bypass -File scripts\register_scheduled_task.ps1
 ```
 
-If the computer is off at the scheduled time, that run is simply skipped — it'll run at the next opportunity once the computer is back on.
+If the computer is off at the scheduled time, the missed runs start once it is back on — all of them at the same moment, whatever times they were set to. Two things keep that from breaking a day: a process that finds the database busy waits for it (up to 5 minutes) instead of failing, and the digest, if today's data isn't in yet, waits for the collection (up to 30 minutes) before it is built.
 
 Check status:
 
@@ -130,7 +136,7 @@ Logs:
 - `logs\scheduler.log` — manual `main.py` runs without `--cycle` only.
 - `logs\backfill.log` — the one-off `backfill_history.py`.
 
-The log always explains exactly why a coin got a signal, and separately distinguishes "not enough history yet" from "there's plenty of data, it just didn't cross the threshold." If a day's data collection failed outright, the log flags it as its own line instead of silently scoring against stale data. Every `main.py` run also checks whether any source's data — or the backup file — has gone stale longer than expected; if so, it prints and logs a hard-to-miss warning instead of failing silently.
+The log always explains exactly why a coin got a signal, and separately distinguishes "not enough history yet" from "there's plenty of data, it just didn't cross the threshold." If a day's data collection failed outright, the log flags it as its own line instead of silently scoring against stale data. Every `main.py` run also checks whether any source's data — or the backup file — has gone stale longer than expected; if so, it writes a boxed warning to that run's log file. That warning lives in the logs only. What reaches the owner is the digest itself: if any source has no collection today, the Telegram message opens with a line saying which data is stale and since when, before any coin is listed.
 
 If the scheduled tasks ever disappear (a Windows reinstall, moving to a new machine), recreate them with the same `register_scheduled_task.ps1` command above.
 
@@ -146,7 +152,7 @@ The first screen of the internal web UI (TZ section 6): manual "did it hold up" 
 .venv\Scripts\python.exe -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 ```
 
-Then open `http://127.0.0.1:8000/episodes` in a browser. Listens on `127.0.0.1` only — never reachable from outside the machine, no login, none planned (see `.claude/agents/web-dev.md`'s boundaries).
+Then open `http://127.0.0.1:8000/episodes` in a browser. Listens on `127.0.0.1` only — never reachable from outside the machine, no login, none planned (see `.claude/agents/web-dev.md`'s boundaries). If the page or a button seems to hang, wait: the database is busy with the daily collection (around 11:00) or the backup (around 12:00), and the page waits for it — up to 5 minutes — instead of showing an error.
 
 The same signal firing a day apart for weeks (one protocol can stay "fired" for weeks under `revenue_price_gap`) is grouped into one episode, not one row per day — `storage/episodes.py` does the grouping, reusing the same freshness logic `scoring/ranker.py` already uses for the daily digest. The screen only lists episodes old enough to judge (7+ days since they started by default, `config.yaml`'s `episode_review.min_age_days`) and not yet labeled; three buttons record "worked / didn't work / too early to tell" straight into a new `episode_outcomes` table (`storage/db.py`) — `observations.md` is untouched by this screen, it stays a separate, read-only journal. An episode labeled while still active gets resurfaced for a second look if it's still going `episode_review.reopen_after_days` (14 by default) later, since the first call may not have held.
 
@@ -154,7 +160,7 @@ The same signal firing a day apart for weeks (one protocol can stay "fired" for 
 
 ### Database backups
 
-`storage\db.sqlite` isn't tracked in git (see `.gitignore`) — too large and it changes constantly. `scripts\backup_db.py` uses SQLite's own safe way of snapshotting a live database (`sqlite3.Connection.backup`), which doesn't break even if a write is happening at that exact moment.
+`storage\db.sqlite` isn't tracked in git (see `.gitignore`) — too large and it changes constantly. `scripts\backup_db.py` uses SQLite's own safe way of snapshotting a live database (`sqlite3.Connection.backup`), so the copy stays consistent even if a write is happening at that exact moment. The copy does hold the database while it runs (seconds normally, 95 seconds once on a busy morning), so the other tasks wait for it rather than fail.
 
 ```powershell
 .venv\Scripts\python.exe scripts\backup_db.py
@@ -191,10 +197,10 @@ See "Setup" above. Once you've cloned it, the code and `config.yaml` are in plac
 - **The database history is empty** — restore it from a backup:
 
 ```powershell
-copy "backups\db_20260909_080000.sqlite" "storage\db.sqlite"
+copy "<backup_dir>\db_YYYYMMDD_HHMMSS.sqlite" "storage\db.sqlite"
 ```
 
-  (use the filename of your most recent backup).
+  `<backup_dir>` is the folder set by `backup.backup_dir` in `config.yaml`; files there are named `db_<date>_<time>.sqlite` — put in the name of the newest one.
 
 - **Secrets** — `.env` isn't tracked in git; recreate it from `.env.example` (see "Setup").
 - The scheduled tasks need to be registered again (`scripts\register_scheduled_task.ps1`) — they don't travel with the code.
