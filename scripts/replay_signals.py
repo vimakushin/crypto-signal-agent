@@ -105,7 +105,7 @@ from storage.db import (  # noqa: E402
     get_binance_oi_snapshot_hours_before,
     get_coingecko_price_history_before,
     get_connection,
-    get_defillama_daily_revenue_window,
+    get_defillama_daily_revenue_window_as_of,
     get_defillama_daily_revenue_window_restated,
     get_latest_complete_restated_fetch,
     get_snapshot_days_before,
@@ -418,23 +418,42 @@ def replay_revenue_price_gap(
                 continue
 
             # Same coverage/liquidity prefilters signals/revenue_price_gap.py's
-            # scan_watchlist() applies live, using the same
-            # get_defillama_daily_revenue_window() production function - so
-            # replay never scores a point production would never even have
-            # evaluated, and can never silently diverge from what windowing
-            # production would have picked.
+            # scan_watchlist() applies live, so replay never scores a point
+            # production would never even have evaluated. The window rule
+            # (end_date inclusive, N days back) is the production one of
+            # get_defillama_daily_revenue_window(), restricted below to what
+            # was visible at the time - that SQL now exists in two copies
+            # (the live function and the _as_of one in storage/db.py): if
+            # the live window rule ever changes, change _as_of with it.
             end_date = latest_date.isoformat()
+            # As-of rule: this run sees only revenue received before the NEXT
+            # snapshot of this protocol was saved (nothing at all is cut for
+            # the last snapshot). Not "before this snapshot's own fetched_at":
+            # within one live run main.py saves the market-cap snapshot first
+            # and that run's daily revenue right after it (0.06-4.7 s later in
+            # the data, median 0.16 s), so this snapshot's own time would
+            # hide the very revenue the run used. The rule rests on that
+            # saving ORDER in main.py, not on the size of the gap. Known limit: history
+            # before live collection began (~10 Sep 2026) was backfilled, and
+            # its rows carry midnight-UTC-of-the-day fetched_at, so there the
+            # value for the evaluated day itself stays visible; the rule is
+            # exact for the live era (the whole freeze window from 15 Sep),
+            # an approximation for backfilled history, which had no live run.
+            cutoff = deduped[i + 1]["fetched_at"] if i + 1 < len(deduped) else None
             if restated_fetched_at is None:
-                recent_rows = get_defillama_daily_revenue_window(conn, slug, end_date, lookback_days)
-                baseline_rows = get_defillama_daily_revenue_window(
-                    conn, slug, end_date, baseline_window_days
+                recent_rows = get_defillama_daily_revenue_window_as_of(
+                    conn, slug, end_date, lookback_days, cutoff
+                )
+                baseline_rows = get_defillama_daily_revenue_window_as_of(
+                    conn, slug, end_date, baseline_window_days, cutoff
                 )
             else:
                 recent_rows = get_defillama_daily_revenue_window_restated(
-                    conn, slug, end_date, lookback_days, restated_fetched_at
+                    conn, slug, end_date, lookback_days, restated_fetched_at, visible_before=cutoff
                 )
                 baseline_rows = get_defillama_daily_revenue_window_restated(
-                    conn, slug, end_date, baseline_window_days, restated_fetched_at
+                    conn, slug, end_date, baseline_window_days, restated_fetched_at,
+                    visible_before=cutoff,
                 )
             valid_recent = [r["revenue_usd"] for r in recent_rows if r["revenue_usd"] is not None]
             valid_baseline = [r["revenue_usd"] for r in baseline_rows if r["revenue_usd"] is not None]
@@ -1381,7 +1400,10 @@ def main() -> None:
 
         logger.info("")
         logger.info("--- revenue_price_gap (TZ 4.5) ---")
-        logger.info("  %s", revenue_data_line)
+        logger.info(
+            "  %s; windows visible as of the end of each run (nothing fetched later is visible)",
+            revenue_data_line,
+        )
         rev_result = replay_revenue_price_gap(
             conn, watchlist_defillama, cfg["signals"]["revenue_price_gap"], restated_fetched_at
         )

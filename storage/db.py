@@ -419,8 +419,49 @@ def get_defillama_daily_revenue_window(
     ).fetchall()
 
 
+def get_defillama_daily_revenue_window_as_of(
+    conn: sqlite3.Connection,
+    protocol_slug: str,
+    end_date: str,
+    days: int,
+    fetched_before: str | None,
+) -> list[sqlite3.Row]:
+    """Same window as get_defillama_daily_revenue_window, but only rows we had
+    ALREADY RECEIVED before `fetched_before` (strictly earlier `fetched_at`).
+
+    Only for scripts/replay_signals.py: a live run sees only values received
+    up to that moment, while the table also holds values for the same dates
+    received later (stored "first received" via INSERT OR IGNORE, so
+    `fetched_at` is the first-receipt time). The live signal does not use this.
+
+    Args:
+        protocol_slug: DeFiLlama protocol slug.
+        end_date: "YYYY-MM-DD", the most recent date in the window.
+        days: window length in calendar days.
+        fetched_before: ISO timestamp; None means no cutoff.
+
+    Returns:
+        Rows oldest-to-newest, at most `days` of them.
+    """
+    if fetched_before is None:
+        return get_defillama_daily_revenue_window(conn, protocol_slug, end_date, days)
+    return conn.execute(
+        """
+        SELECT * FROM defillama_daily_revenue
+        WHERE protocol_slug = ? AND date <= ? AND date > date(?, ?) AND fetched_at < ?
+        ORDER BY date ASC
+        """,
+        (protocol_slug, end_date, end_date, f"-{days} days", fetched_before),
+    ).fetchall()
+
+
 def get_defillama_daily_revenue_window_restated(
-    conn: sqlite3.Connection, protocol_slug: str, end_date: str, days: int, fetched_at: str
+    conn: sqlite3.Connection,
+    protocol_slug: str,
+    end_date: str,
+    days: int,
+    fetched_at: str,
+    visible_before: str | None = None,
 ) -> list[sqlite3.Row]:
     """Same window as get_defillama_daily_revenue_window (end_date inclusive,
     `days` calendar days back, oldest first), but read from
@@ -434,17 +475,31 @@ def get_defillama_daily_revenue_window_restated(
         end_date: "YYYY-MM-DD", the most recent date in the window.
         days: window length in calendar days.
         fetched_at: the re-fetch to read (see get_latest_complete_restated_fetch).
+        visible_before: ISO timestamp or None. If set, a restated row is
+            returned only if defillama_daily_revenue has a row for the same
+            (protocol, date) received before it - the values are the restated
+            ones, but the set of visible dates is exactly what
+            get_defillama_daily_revenue_window_as_of shows.
 
     Returns:
         Rows oldest-to-newest, at most `days` of them.
     """
+    visible_clause = ""
+    params: list = [protocol_slug, fetched_at, end_date, end_date, f"-{days} days"]
+    if visible_before is not None:
+        visible_clause = """
+          AND EXISTS (
+              SELECT 1 FROM defillama_daily_revenue d
+              WHERE d.protocol_slug = r.protocol_slug AND d.date = r.date AND d.fetched_at < ?
+          )"""
+        params.append(visible_before)
     return conn.execute(
-        """
-        SELECT * FROM defillama_daily_revenue_restated
-        WHERE protocol_slug = ? AND fetched_at = ? AND date <= ? AND date > date(?, ?)
-        ORDER BY date ASC
+        f"""
+        SELECT r.* FROM defillama_daily_revenue_restated r
+        WHERE r.protocol_slug = ? AND r.fetched_at = ? AND r.date <= ? AND r.date > date(?, ?){visible_clause}
+        ORDER BY r.date ASC
         """,
-        (protocol_slug, fetched_at, end_date, end_date, f"-{days} days"),
+        params,
     ).fetchall()
 
 
