@@ -419,6 +419,63 @@ def get_defillama_daily_revenue_window(
     ).fetchall()
 
 
+def get_defillama_daily_revenue_window_restated(
+    conn: sqlite3.Connection, protocol_slug: str, end_date: str, days: int, fetched_at: str
+) -> list[sqlite3.Row]:
+    """Same window as get_defillama_daily_revenue_window (end_date inclusive,
+    `days` calendar days back, oldest first), but read from
+    defillama_daily_revenue_restated and only the rows of ONE re-fetch.
+
+    Only for scripts/replay_signals.py's `--revenue-source restated`; the live
+    signal never reads this table.
+
+    Args:
+        protocol_slug: DeFiLlama protocol slug.
+        end_date: "YYYY-MM-DD", the most recent date in the window.
+        days: window length in calendar days.
+        fetched_at: the re-fetch to read (see get_latest_complete_restated_fetch).
+
+    Returns:
+        Rows oldest-to-newest, at most `days` of them.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM defillama_daily_revenue_restated
+        WHERE protocol_slug = ? AND fetched_at = ? AND date <= ? AND date > date(?, ?)
+        ORDER BY date ASC
+        """,
+        (protocol_slug, fetched_at, end_date, end_date, f"-{days} days"),
+    ).fetchall()
+
+
+def get_latest_complete_restated_fetch(
+    conn: sqlite3.Connection, protocol_count: int
+) -> tuple[str, int] | None:
+    """Newest re-fetch of daily revenue that covers every watchlist protocol
+    (BACKLOG.md: complete = COUNT(DISTINCT protocol_slug) equals the number
+    of watchlist protocols; an interrupted run leaves fewer).
+
+    Args:
+        protocol_count: number of protocols in config.yaml's watchlist.
+
+    Returns:
+        (fetched_at, protocol count) of the newest complete re-fetch, or None
+        if there is none.
+    """
+    row = conn.execute(
+        """
+        SELECT fetched_at, COUNT(DISTINCT protocol_slug) AS n
+        FROM defillama_daily_revenue_restated
+        GROUP BY fetched_at
+        HAVING n = ?
+        ORDER BY fetched_at DESC
+        LIMIT 1
+        """,
+        (protocol_count,),
+    ).fetchone()
+    return (row["fetched_at"], row["n"]) if row else None
+
+
 def save_binance_oi_snapshots(conn: sqlite3.Connection, records: list[dict]) -> None:
     """Persist Open-Interest/price points from collectors/binance_futures.py.
 

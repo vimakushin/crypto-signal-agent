@@ -31,6 +31,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import yaml
 from pydantic import BaseModel
 
 # web/app.py lives one level below the project root - same sys.path fix as
@@ -137,6 +138,30 @@ def _label_for(episode: Episode, first_details: dict) -> str:
     return episode.protocol_slug
 
 
+NOTES_PATH = Path(__file__).resolve().parent / "episode_notes.yaml"
+
+
+def _load_notes() -> tuple[dict[tuple[str, str, str], str], str | None]:
+    """Human-written notes per episode, read on every request (tiny file; an
+    edit shows up without a server restart). Returns (notes by the same
+    (signal_name, protocol_slug, episode_start_date) key as episode_outcomes,
+    error text or None). A missing file means "no notes"; an unparseable one
+    is reported on the page so the owner doesn't take it for "no notes".
+    """
+    if not NOTES_PATH.exists():
+        return {}, None
+    try:
+        items = yaml.safe_load(NOTES_PATH.read_text(encoding="utf-8")) or []
+        return {
+            (i["signal_name"], i["protocol_slug"], str(i["episode_start_date"])): i["note"].strip()
+            for i in items
+        }, None
+    except (yaml.YAMLError, ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+        # ValueError covers UnicodeDecodeError: the file saved by hand in a
+        # non-UTF-8 encoding must show up as an error on the page, not a 500.
+        return {}, str(exc)
+
+
 class EpisodeView(BaseModel):
     """Everything one row of the episode-labeling table needs to render -
     the same shape this route would hand to a future React frontend as JSON
@@ -165,6 +190,7 @@ class EpisodeView(BaseModel):
     market_change_pct: float | None = None
     market_coins_used: int | None = None
     vs_market_pp: float | None = None  # coin - market, percentage points
+    note: str | None = None
 
 
 def _price_mcap_for(conn, episode: Episode, first_details: dict, last_details: dict) -> dict:
@@ -223,7 +249,7 @@ def _price_mcap_for(conn, episode: Episode, first_details: dict, last_details: d
 
 
 def _build_view(
-    conn, config: dict, episode: Episode, prior: ReviewableEpisode | None = None
+    conn, config: dict, episode: Episode, notes: dict, prior: ReviewableEpisode | None = None
 ) -> EpisodeView:
     first_details = _parse_details(episode.first_details_json)
     last_details = _parse_details(episode.last_details_json)
@@ -258,6 +284,7 @@ def _build_view(
         duration_days=episode.duration_days,
         is_open=episode.is_open,
         old_formula_badge=old_formula_badge,
+        note=notes.get((episode.signal_name, episode.protocol_slug, episode.episode_start_date)),
         prior_outcome=prior.prior_outcome if prior else None,
         prior_outcome_comment=prior.prior_outcome_comment if prior else None,
         prior_outcome_at=prior.prior_outcome_at if prior else None,
@@ -276,13 +303,14 @@ def root() -> HTMLResponse:
 @app.get("/episodes", response_class=HTMLResponse)
 def episodes_page(request: Request, show_old_formula: bool = True) -> HTMLResponse:
     config = load_config()
+    notes, notes_error = _load_notes()
     conn = get_connection(_get_db_path(config))
     try:
         open_episodes = get_open_episodes(conn, config)
         reviewable_episodes = get_reviewable_episodes(conn, config)
-        new_views = [_build_view(conn, config, ep) for ep in open_episodes]
+        new_views = [_build_view(conn, config, ep, notes) for ep in open_episodes]
         reviewable_views = [
-            _build_view(conn, config, r.episode, prior=r) for r in reviewable_episodes
+            _build_view(conn, config, r.episode, notes, prior=r) for r in reviewable_episodes
         ]
     finally:
         conn.close()
@@ -298,6 +326,7 @@ def episodes_page(request: Request, show_old_formula: bool = True) -> HTMLRespon
             "new_episodes": new_views,
             "reviewable_episodes": reviewable_views,
             "show_old_formula": show_old_formula,
+            "notes_error": notes_error,
             "valid_outcomes": VALID_EPISODE_OUTCOMES,
         },
     )

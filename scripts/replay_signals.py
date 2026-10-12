@@ -17,6 +17,11 @@ main.py cycle - run manually, once (or again later, once more history has
 accumulated):
 
     .venv\\Scripts\\python.exe scripts\\replay_signals.py
+    .venv\\Scripts\\python.exe scripts\\replay_signals.py --revenue-source restated
+
+The second form reads daily revenue from the newest COMPLETE re-fetch
+(defillama_daily_revenue_restated) instead of the first values we received;
+the report says which one was used.
 
 Three pitfalls specific to replaying stored history (as opposed to scanning
 only the latest point, which is all signals/*.py's scan_watchlist() do
@@ -71,6 +76,7 @@ every historical point in turn instead of only the newest one.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -100,6 +106,8 @@ from storage.db import (  # noqa: E402
     get_coingecko_price_history_before,
     get_connection,
     get_defillama_daily_revenue_window,
+    get_defillama_daily_revenue_window_restated,
+    get_latest_complete_restated_fetch,
     get_snapshot_days_before,
 )
 from storage.episodes import Episode, collapse_into_episodes  # noqa: E402
@@ -276,7 +284,9 @@ def _collapse_daily_episodes(entries: list[tuple[date_cls, bool | None]]) -> int
     return len(episodes)
 
 
-def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> dict:
+def replay_revenue_price_gap(
+    conn, watchlist: list[str], signal_cfg: dict, restated_fetched_at: str | None = None
+) -> dict:
     """Replay signals/revenue_price_gap.py's `_evaluate_snapshots` over every
     stored defillama_snapshots day for every watchlist protocol.
 
@@ -292,6 +302,11 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
         conn: open storage/db.py connection.
         watchlist: config.yaml watchlist.defillama_protocols.
         signal_cfg: config.yaml signals.revenue_price_gap.
+        restated_fetched_at: None (default) reads daily revenue from
+            defillama_daily_revenue (first values we received - what the
+            live signal saw). A re-fetch's fetched_at reads it from
+            defillama_daily_revenue_restated instead (what the source
+            reports now); everything else is identical.
 
     Returns:
         Dict with aggregate raw-day-level and episode counts (see
@@ -409,10 +424,18 @@ def replay_revenue_price_gap(conn, watchlist: list[str], signal_cfg: dict) -> di
             # evaluated, and can never silently diverge from what windowing
             # production would have picked.
             end_date = latest_date.isoformat()
-            recent_rows = get_defillama_daily_revenue_window(conn, slug, end_date, lookback_days)
-            baseline_rows = get_defillama_daily_revenue_window(
-                conn, slug, end_date, baseline_window_days
-            )
+            if restated_fetched_at is None:
+                recent_rows = get_defillama_daily_revenue_window(conn, slug, end_date, lookback_days)
+                baseline_rows = get_defillama_daily_revenue_window(
+                    conn, slug, end_date, baseline_window_days
+                )
+            else:
+                recent_rows = get_defillama_daily_revenue_window_restated(
+                    conn, slug, end_date, lookback_days, restated_fetched_at
+                )
+                baseline_rows = get_defillama_daily_revenue_window_restated(
+                    conn, slug, end_date, baseline_window_days, restated_fetched_at
+                )
             valid_recent = [r["revenue_usd"] for r in recent_rows if r["revenue_usd"] is not None]
             valid_baseline = [r["revenue_usd"] for r in baseline_rows if r["revenue_usd"] is not None]
 
@@ -1312,6 +1335,15 @@ def _report_episode_sample(signal_name: str, episodes: list[Episode], sample_siz
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Read-only historical replay of the three signals.")
+    parser.add_argument(
+        "--revenue-source", choices=("stored", "restated"), default="stored",
+        help="daily revenue for revenue_price_gap: 'stored' = first values we received "
+        "(defillama_daily_revenue, default); 'restated' = the newest complete re-fetch "
+        "(defillama_daily_revenue_restated, scripts/refetch_daily_revenue.py)",
+    )
+    args = parser.parse_args()
+
     cfg = load_config()
     db_path = Path(cfg["storage"]["sqlite_path"])
     if not db_path.is_absolute():
@@ -1325,10 +1357,33 @@ def main() -> None:
         watchlist_defillama = cfg["watchlist"]["defillama_protocols"]
         watchlist_binance = cfg["watchlist"]["binance_futures_symbols"]
 
+        restated_fetched_at = None
+        if args.revenue_source == "restated":
+            complete = get_latest_complete_restated_fetch(conn, len(watchlist_defillama))
+            if complete is None:
+                logger.error(
+                    "--revenue-source restated: no complete re-fetch in "
+                    "defillama_daily_revenue_restated (none covers all %d watchlist protocols). "
+                    "Run scripts/refetch_daily_revenue.py first.", len(watchlist_defillama),
+                )
+                sys.exit(1)
+            restated_fetched_at, n_protocols = complete
+            revenue_data_line = (
+                f"revenue data: restated (re-fetch of {restated_fetched_at}, "
+                f"{n_protocols}/{len(watchlist_defillama)} protocols)"
+            )
+            logger.info(
+                "Revenue source is not 'stored': oi_divergence and volume_breakout do not "
+                "read daily revenue, so their numbers below are unaffected by it."
+            )
+        else:
+            revenue_data_line = "revenue data: stored (first values we received)"
+
         logger.info("")
         logger.info("--- revenue_price_gap (TZ 4.5) ---")
+        logger.info("  %s", revenue_data_line)
         rev_result = replay_revenue_price_gap(
-            conn, watchlist_defillama, cfg["signals"]["revenue_price_gap"]
+            conn, watchlist_defillama, cfg["signals"]["revenue_price_gap"], restated_fetched_at
         )
         _report_revenue_price_gap(rev_result)
         rev_episodes = build_revenue_price_gap_episodes(rev_result)
