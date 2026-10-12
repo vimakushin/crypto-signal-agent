@@ -90,6 +90,16 @@ A normal run only accumulates history from the moment it first ran. To give the 
 
 Slow (CoinGecko's rate limits), meant to be run once by hand, not part of the daily cycle. Safe to re-run — days already saved aren't duplicated. Progress and any gaps go to `logs\backfill.log`.
 
+### Re-fetching revenue history (restatements)
+
+DeFiLlama revises daily revenue after the fact (sometimes by a factor of two or three, sometimes by a day's shift), while the daily collection keeps the first value it received and ignores later corrections. To see what the source says now without losing what we had, run:
+
+```powershell
+.venv\Scripts\python.exe scripts\refetch_daily_revenue.py
+```
+
+It adds the full current history of all watchlist protocols to the table `defillama_daily_revenue_restated`, stamped with the time of this run, and prints a per-protocol comparison. It never changes `defillama_daily_revenue` (what the signal reads, "what we received then"), so it can be run again at any time; every run adds its own set (all rows of one run share one `fetched_at`; a run is complete only if it covers all 25 protocols — check with `GROUP BY fetched_at` and `COUNT(DISTINCT protocol_slug)`). Not part of the schedule. First run 12 October 2026 — details in `BACKLOG.md`.
+
 ### Scheduled runs
 
 Four separate Windows Task Scheduler tasks:

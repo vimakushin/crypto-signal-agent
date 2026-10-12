@@ -144,6 +144,25 @@ CREATE TABLE IF NOT EXISTS defillama_daily_revenue (
 CREATE INDEX IF NOT EXISTS idx_defillama_daily_revenue_slug_date
     ON defillama_daily_revenue (protocol_slug, date);
 
+-- Что DeFiLlama отдаёт СЕЙЧАС по дневной выручке (см. BACKLOG.md, пункт
+-- "DeFiLlama пересматривает дневную выручку задним числом"). Таблица выше
+-- хранит первое полученное значение навсегда ("что получили тогда", его и
+-- читает сигнал); эта - полный набор значений каждого перезабора
+-- (scripts/refetch_daily_revenue.py) со своим fetched_at, чтобы перезаборы
+-- можно было сравнивать между собой и со старыми значениями. Сигнал эту
+-- таблицу НЕ читает.
+CREATE TABLE IF NOT EXISTS defillama_daily_revenue_restated (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_slug TEXT NOT NULL,
+    date TEXT NOT NULL,
+    revenue_usd REAL,
+    fetched_at TEXT NOT NULL,
+    UNIQUE(protocol_slug, date, fetched_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_defillama_daily_revenue_restated_slug_date
+    ON defillama_daily_revenue_restated (protocol_slug, date);
+
 -- One row per calendar date for which the Telegram digest was actually sent:
 -- the digest task is retried every 2 hours (see config.yaml schedule), and
 -- this mark is what makes the later runs exit without sending a second one.
@@ -325,6 +344,29 @@ def save_defillama_daily_revenue(conn: sqlite3.Connection, records: list[dict]) 
     conn.executemany(
         """
         INSERT OR IGNORE INTO defillama_daily_revenue (
+            protocol_slug, date, revenue_usd, fetched_at
+        ) VALUES (
+            :protocol_slug, :date, :revenue_usd, :fetched_at
+        )
+        """,
+        records,
+    )
+    conn.commit()
+
+
+def save_defillama_daily_revenue_restated(conn: sqlite3.Connection, records: list[dict]) -> None:
+    """Append one re-fetch's daily revenue values to
+    defillama_daily_revenue_restated (scripts/refetch_daily_revenue.py).
+
+    Args:
+        records: dicts with protocol_slug, date, revenue_usd and fetched_at
+            (the same fetched_at for the whole run). INSERT OR IGNORE on
+            UNIQUE(protocol_slug, date, fetched_at), so writing the same run
+            twice adds nothing; a different fetched_at adds a new full set.
+    """
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO defillama_daily_revenue_restated (
             protocol_slug, date, revenue_usd, fetched_at
         ) VALUES (
             :protocol_slug, :date, :revenue_usd, :fetched_at
