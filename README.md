@@ -33,7 +33,7 @@ All thresholds, signal weights, the watchlist and the schedule live in `config.y
 
 MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six items hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
 
-Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. A first backtest was run on 15 September 2026; its result and its limits are in [`BACKLOG.md`](BACKLOG.md).
+Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. A first backtest was run on 15 September 2026, but it was computed with a replay tool that looked one day ahead (found on 12 October), so its negative result counts neither for nor against the signal; a rerun with the corrected tool is planned after 15 October — see [`BACKLOG.md`](BACKLOG.md).
 
 ## How the project was built
 
