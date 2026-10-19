@@ -107,7 +107,47 @@ signals:
     # the median comparison below says. 50% - literally "more than half of
     # the week came from one day" - is a plain, self-evidently unusual
     # threshold, not backfit to any specific protocol's history.
+    # 19 Oct 2026: moved from a REJECTION to a MARK. The week is now evaluated
+    # as usual and the signal carries single_day_marked (share above this
+    # threshold) plus max_day_share_pct. Why: the filter only caught one
+    # dominating day, not a multi-day source failure (BACKLOG.md, "Фильтр
+    # выбросов ловит один доминирующий день..."), and a rejection hides the
+    # candidate from the owner entirely, while a mark lets them see it and
+    # judge. The key and the 50 are unchanged; only its meaning changed.
     outlier_max_share_pct: 50
+    # Second mark, "this week is more uneven than usual for this coin"
+    # (signals/revenue_price_gap.py, _shape_check). Unevenness of a 7-day
+    # window = median of the 3 largest days / median of the 3 smallest. The
+    # mark is set when this week's unevenness is more than this many times
+    # the coin's usual one (median over its complete past 7-day windows inside
+    # the baseline window). With fewer than 40 such windows the check is not
+    # applied and the signal says so. The threshold of 2 was chosen from three
+    # known thorchain-dex cases: the genuine growth of 6-13 Oct 2026 gave a
+    # ratio of 0.6-1.1; the source accounting failure of 24 Sep - 4 Oct 2026
+    # gave 3.3 up to ~2000; the x2.33 recalculation in September is not
+    # visible in the shape of the series at all. There is NO independent
+    # check of this number; the real test will be the next failure. After we
+    # see the results the threshold must not be touched - that would be
+    # fitting it to the answers.
+    # 19 Oct 2026, window correction: the three ratios above were first
+    # computed with look-ahead (the 15 Oct draft included today, which a live
+    # run does not have yet). The window is now the LAST 7 DAYS WITH DATA as
+    # of the evaluation (for ~10 protocols DeFiLlama gives a day only the next
+    # morning, so it ends a day before the revenue window), and the numbers
+    # below were re-run strictly "as it was in the database on that day"
+    # (replay as-of rule; stored first values, the re-fetched ones differ by
+    # a few percent). thorchain-dex, days that live code would really have
+    # evaluated (the database has no snapshot for 2-3 Oct, so those days were
+    # never evaluated at all): failure 24-30 Sep 106-1991 (window ending
+    # 29 Sep: 1937), 1 Oct 3.71, 4 Oct 5.28, 5 Oct 4.93; genuine growth
+    # 6-13 Oct 0.57-0.94 (0.54 on 14 Oct). So the tail of the failure is
+    # >= 3.7, not the 3.1 of the table-of-today draft. The earlier figures
+    # above (0.6-1.1, 3.3 to ~2000) are the ones obtained with look-ahead.
+    # Threshold 2 survived the recheck unchanged.
+    # It only decides whether a mark is shown, so
+    # a wrong guess is cheap. See BACKLOG.md, entry "Фильтр выбросов ловит
+    # один доминирующий день...".
+    shape_mark_ratio: 2
     # Business-scale floor, NOT exchange/market liquidity (unlike
     # oi_divergence's min_oi_value_usdt or volume_breakout's
     # min_volume_avg_usd, which do measure real trading liquidity) - this is
@@ -122,8 +162,8 @@ signals:
     # whose daily revenue is so small that the numbers are source-data
     # rounding and noise rather than a real business fact - guarding against
     # a single-day spike and against "tiny base, huge percent swing" is now
-    # handled separately, by outlier_max_share_pct above and by the median
-    # itself. This was raised to $50,000 on 2026-09-15 and then reverted:
+    # handled separately, by the median itself (the outlier-day share and
+    # the series shape are only marks now, see above). This was raised to $50,000 on 2026-09-15 and then reverted:
     # at $50,000 it cut 61 of 127 episodes (nearly half) and switched off
     # seven protocols (including aave-v2, ens, axie-infinity, olympus-dao,
     # ssv-network, thorchain-dex, ston.fi) that together account for 39% of

@@ -109,7 +109,8 @@ def rank_candidates(
         contributes its own weight on top. A signal_events row whose
         triggered_at predates its signal's cursor - i.e. a later collector
         run happened but did NOT reconfirm this trigger, for example because
-        an outlier guard rejected it on the later run - is excluded and
+        the later run found a gap between snapshots or zero/missing revenue
+        or market cap - is excluded and
         logged, not silently carried forward with stale numbers.
     """
     # protocol_slug -> {signal_name: SignalContribution}

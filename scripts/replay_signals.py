@@ -338,6 +338,7 @@ def replay_revenue_price_gap(
     revenue_threshold = signal_cfg["revenue_growth_threshold_pct"]
     mcap_threshold = signal_cfg["mcap_reaction_threshold_pct"]
     outlier_max_share_pct = signal_cfg.get("outlier_max_share_pct", 100)
+    shape_mark_ratio = signal_cfg["shape_mark_ratio"]
     max_gap_days = lookback_days * MAX_GAP_MULTIPLIER
     min_revenue_total_usd = signal_cfg.get("min_revenue_total_usd", 0)
     # math.floor, not math.ceil - mirrors signals/revenue_price_gap.py's own
@@ -365,6 +366,9 @@ def replay_revenue_price_gap(
     excluded_liquidity = 0
     excluded_insufficient_daily_history = 0
     revenue_values: list[float] = []
+    marked_single_day = 0
+    marked_shape = 0
+    shape_not_applied = 0
 
     for slug in watchlist:
         rows = conn.execute(
@@ -476,12 +480,13 @@ def replay_revenue_price_gap(
             try:
                 signal = revenue_price_gap._evaluate_snapshots(
                     latest, earlier, recent_rows, baseline_rows,
-                    revenue_threshold, mcap_threshold, outlier_max_share_pct, lookback_days,
+                    revenue_threshold, mcap_threshold, outlier_max_share_pct,
+                    shape_mark_ratio, lookback_days,
                 )
             except revenue_price_gap._DataQualityRejected:
-                # _evaluate_snapshots now raises instead of returning None
-                # for its own internal guards (outlier share, base/current
-                # median revenue non-positive - the gap and mcap guards are
+                # _evaluate_snapshots raises instead of returning None for
+                # its own internal guards (base/current median revenue
+                # non-positive - the gap and mcap guards are
                 # already covered by this function's own prefilters above,
                 # so this branch is effectively unreachable for those two).
                 # Treat exactly like the old `signal = None` / not-fired
@@ -511,6 +516,9 @@ def replay_revenue_price_gap(
                 # is still useful for judging how far above threshold actual
                 # fires land.
                 revenue_values.append(signal.revenue_growth_pct)
+                marked_single_day += signal.single_day_marked
+                marked_shape += signal.shape_marked
+                shape_not_applied += signal.shape_check_skipped
 
         episodes = _collapse_daily_episodes(entries)
         stats["episodes"] = episodes
@@ -525,6 +533,10 @@ def replay_revenue_price_gap(
         "revenue_threshold": revenue_threshold,
         "mcap_threshold": mcap_threshold,
         "outlier_max_share_pct": outlier_max_share_pct,
+        "shape_mark_ratio": shape_mark_ratio,
+        "marked_single_day": marked_single_day,
+        "marked_shape": marked_shape,
+        "shape_not_applied": shape_not_applied,
         "evaluated_total": evaluated_total,
         "fired_raw_total": fired_raw_total,
         "episodes_total": episodes_total,
@@ -547,9 +559,10 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "revenue_price_gap: lookback_days=%d, baseline_window_days=%d, "
         "revenue_growth_threshold_pct=%s, mcap_reaction_threshold_pct=%s, "
-        "outlier_max_share_pct=%s, min_revenue_total_usd=%s (config.yaml)",
+        "outlier_max_share_pct=%s, shape_mark_ratio=%s, min_revenue_total_usd=%s (config.yaml)",
         result["lookback_days"], result["baseline_window_days"], result["revenue_threshold"],
-        result["mcap_threshold"], result["outlier_max_share_pct"], result["min_revenue_total_usd"],
+        result["mcap_threshold"], result["outlier_max_share_pct"], result["shape_mark_ratio"],
+        result["min_revenue_total_usd"],
     )
     logger.info(
         "  Evaluated %d protocol-day point(s) total. Excluded from that count: %d with no "
@@ -579,6 +592,14 @@ def _report_revenue_price_gap(result: dict) -> None:
         "'fired' for up to ~6-7 consecutive days in a row and must not be counted as 6-7 "
         "separate triggers.",
         result["fired_raw_total"], result["evaluated_total"], rate, result["episodes_total"],
+    )
+    logger.info(
+        "  Of those %d fired protocol-days: %d marked 'one outlier day' (largest day above "
+        "outlier_max_share_pct of the week), %d marked 'week shape more uneven than usual', "
+        "%d where the shape check was not applied (nothing to compare with). Marks do not "
+        "remove a day from the counts above.",
+        result["fired_raw_total"], result["marked_single_day"], result["marked_shape"],
+        result["shape_not_applied"],
     )
     logger.info(
         "  Per protocol (evaluated / raw fired days / episodes / raw rows in DB / deduped "
@@ -666,6 +687,16 @@ def _revenue_price_gap_details_json(signal, result: dict) -> str:
         "baseline_median_daily_revenue": signal.baseline_median_daily_revenue,
         "recent_week_sum": signal.recent_week_sum,
         "max_day_share_pct": signal.max_day_share_pct,
+        "single_day_marked": signal.single_day_marked,
+        "week_unevenness": signal.week_unevenness,
+        "habitual_unevenness": signal.habitual_unevenness,
+        "shape_ratio": signal.shape_ratio,
+        "shape_marked": signal.shape_marked,
+        "shape_check_skipped": signal.shape_check_skipped,
+        "shape_note": signal.shape_note,
+        "shape_window_first": signal.shape_window_first,
+        "shape_window_last": signal.shape_window_last,
+        "revenue_window_end": signal.revenue_window_end,
         "mcap_now": signal.mcap_now,
         "mcap_before": signal.mcap_before,
         "symbol": signal.symbol,

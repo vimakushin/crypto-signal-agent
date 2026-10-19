@@ -3,6 +3,18 @@
   <td>{{ ep.label }}</td>
   <td>{{ ep.signal_name }}</td>
   <td class="wrap">{{ ep.signal_description }}
+    {% if ep.marks or ep.last_day_marks %}
+      <div class="marks">
+        <div><b>Отметка — это не вывод, а повод посмотреть на дневные цифры:</b></div>
+        {% if ep.marks %}<ul>{% for m in ep.marks %}<li>{{ m }}</li>{% endfor %}</ul>{% endif %}
+        {% if ep.last_day_marks %}
+          <div>На последнем дне эпизода:</div>
+          <ul>{% for m in ep.last_day_marks %}<li>{{ m }}</li>{% endfor %}</ul>
+        {% endif %}
+      </div>
+    {% endif %}
+    {% if ep.check_failed %}<div class="data-note">{{ ep.check_failed[:1]|upper }}{{ ep.check_failed[1:] }}</div>{% endif %}
+    {% if ep.last_day_check_failed %}<div class="data-note">На последнем дне эпизода: {{ ep.last_day_check_failed }}</div>{% endif %}
     {% if ep.note %}
       <div class="note"><div class="note-label">Заметка</div>{{ ep.note }}</div>
     {% endif %}

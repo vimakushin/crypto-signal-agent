@@ -42,7 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from main import load_config  # noqa: E402
-from notifications.telegram_bot import _SIGNAL_FORMATTERS  # noqa: E402
+from notifications.telegram_bot import _SIGNAL_FORMATTERS, _revenue_marks_lines  # noqa: E402
 from storage.db import (  # noqa: E402
     VALID_EPISODE_OUTCOMES,
     get_connection,
@@ -173,6 +173,10 @@ class EpisodeView(BaseModel):
     protocol_slug: str
     label: str
     signal_description: str
+    marks: list[str] = []
+    check_failed: str | None = None
+    last_day_marks: list[str] = []
+    last_day_check_failed: str | None = None
     episode_start_date: str
     episode_end_date: str
     duration_days: int
@@ -273,12 +277,32 @@ def _build_view(
             vs_market_pp=market.coin_change_pct - market.market_change_pct,
         )
 
+    # Marks come from the same function the Telegram digest uses. The
+    # description is built from details without the mark flags, because the
+    # formatter appends the marks in [brackets] and they are shown as their
+    # own block instead.
+    marks, check_failed = _revenue_marks_lines(first_details)
+    mark_flags = ("single_day_marked", "shape_marked", "shape_check_skipped")
+    plain_details = {k: v for k, v in first_details.items() if k not in mark_flags}
+    # Marks that appeared after the first day: compare the set of flags, not
+    # the text (the text carries the window date, which shifts every day).
+    last_marks, last_check_failed = [], None
+    if episode.signal_name == "revenue_price_gap":
+        first_set = {k for k in mark_flags if first_details.get(k)}
+        last_set = {k for k in mark_flags if last_details.get(k)}
+        if last_set and last_set != first_set:
+            last_marks, last_check_failed = _revenue_marks_lines(last_details)
+
     return EpisodeView(
         **market_kwargs,
+        marks=marks,
+        check_failed=check_failed,
+        last_day_marks=last_marks,
+        last_day_check_failed=last_check_failed,
         signal_name=episode.signal_name,
         protocol_slug=episode.protocol_slug,
         label=_label_for(episode, first_details),
-        signal_description=_format_signal_details(episode.signal_name, episode.first_details_json),
+        signal_description=_format_signal_details(episode.signal_name, json.dumps(plain_details)),
         episode_start_date=episode.episode_start_date,
         episode_end_date=episode.episode_end_date,
         duration_days=episode.duration_days,

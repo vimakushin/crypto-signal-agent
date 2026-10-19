@@ -27,7 +27,7 @@ import math
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -256,13 +256,71 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
 # if/elif chain, so adding a new signal's formatter later doesn't require
 # touching the others (CLAUDE.md: adding a signal shouldn't require editing
 # unrelated code).
+def _date_range_ru(first: date, last: date) -> str:
+    """'12–18 октября' (same month) or '28 сентября – 4 октября'."""
+    if (first.year, first.month) == (last.year, last.month):
+        return f"{first.day}–{_date_ru(last)}"
+    return f"{_date_ru(first)} – {_date_ru(last)}"
+
+
+def _revenue_marks_lines(details: dict) -> tuple[list[str], str | None]:
+    """Plain-Russian lines for revenue_price_gap's marks, without final
+    punctuation (callers join them: the digest line by line, the one-line
+    variant with '; ').
+
+    Returns:
+        (marks, check_failed): marks are 'one day dominates' and 'daily
+        spread unusual' lines (empty list when nothing is marked);
+        check_failed is the separate line 'форму выручки проверить не
+        удалось: <reason>' (lower case - the digest capitalizes it; about
+        our data, not about the coin) or None.
+        Old events saved before the marks existed lack the keys and give
+        ([], None). Reason texts come from details["shape_note"] (written in
+        signals/revenue_price_gap.py), not guessed here.
+    """
+    marks: list[str] = []
+    if details.get("single_day_marked"):
+        revenue_end = date.fromisoformat(details["revenue_window_end"])
+        marks.append(
+            f"один день дал {details['max_day_share_pct']:.0f}% выручки за "
+            f"{details['lookback_days']} дней по {_date_ru(revenue_end)}"
+        )
+    if details.get("shape_marked"):
+        first = date.fromisoformat(details["shape_window_first"])
+        last = date.fromisoformat(details["shape_window_last"])
+        window = _date_range_ru(first, last)
+        revenue_end = date.fromisoformat(details["revenue_window_end"])
+        shifted = ""
+        if last != revenue_end:
+            revenue_first = revenue_end - timedelta(days=details["lookback_days"] - 1)
+            shifted = f"; рост выручки выше посчитан по {_date_range_ru(revenue_first, revenue_end)}"
+        if details.get("shape_ratio") is not None:
+            ratio = f"{details['shape_ratio']:.1f}".replace(".", ",")
+            marks.append(
+                f"разброс выручки по дням в {ratio} раза больше обычного для этой монеты "
+                f"(последние семь дней, за которые есть данные: {window}{shifted})"
+            )
+        else:
+            marks.append(
+                f"в последние семь дней, за которые есть данные ({window}{shifted}), "
+                f"два и более дня с нулевой или отрицательной выручкой"
+            )
+    check_failed = None
+    if details.get("shape_check_skipped"):
+        check_failed = f"форму выручки проверить не удалось: {details['shape_note']}"
+    return marks, check_failed
+
+
 def _format_revenue_price_gap(details: dict) -> str:
-    return (
+    text = (
         f"revenue_price_gap: выручка {details.get('revenue_growth_pct'):+.1f}% "
         f"за {details.get('lookback_days')}д (порог {details.get('revenue_growth_threshold_pct')}%), "
         f"капитализация {details.get('mcap_growth_pct'):+.1f}% "
         f"(порог {details.get('mcap_reaction_threshold_pct')}%)"
     )
+    marks, check_failed = _revenue_marks_lines(details)
+    notes = marks + ([check_failed] if check_failed else [])
+    return f"{text} [{'; '.join(notes)}]" if notes else text
 
 
 def _format_oi_divergence(details: dict) -> str:
@@ -355,12 +413,20 @@ def _price_level(value: float) -> str:
 def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
     baseline_days = config["signals"]["revenue_price_gap"]["baseline_window_days"]
     lookback_days = details["lookback_days"]
-    return (
+    text = (
         f"Медианная дневная выручка за {lookback_days} дней на "
         f"{details['revenue_growth_pct']:.0f}% выше, чем за последние {baseline_days} дней, "
         f"а капитализация токена за эти {lookback_days} дней изменилась на "
         f"{_signed(details['mcap_growth_pct'])}%."
     )
+    marks, check_failed = _revenue_marks_lines(details)
+    if marks:
+        lines = [f"— {m};" for m in marks]
+        lines[-1] = lines[-1][:-1] + "."
+        text += "\nОтметка — это не вывод, а повод посмотреть на дневные цифры:\n" + "\n".join(lines)
+    if check_failed:
+        text += f"\n{check_failed[0].upper()}{check_failed[1:]}."
+    return text
 
 
 def _digest_text_volume_breakout(details: dict, config: dict) -> str:
