@@ -27,9 +27,10 @@ import math
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import NamedTuple
 
 import requests
 import yaml
@@ -263,52 +264,98 @@ def _date_range_ru(first: date, last: date) -> str:
     return f"{_date_ru(first)} – {_date_ru(last)}"
 
 
-def _revenue_marks_lines(details: dict) -> tuple[list[str], str | None]:
-    """Plain-Russian lines for revenue_price_gap's marks, without final
-    punctuation (callers join them: the digest line by line, the one-line
-    variant with '; ').
+class RevenueMarkTexts(NamedTuple):
+    """Human-readable pieces for one revenue_price_gap candidate (no final
+    punctuation, so the callers join them as they need).
+
+    marks: lower-case fragments, empty when nothing is marked.
+    daily_line: the seven daily revenue numbers with their date range, or
+        None for events saved before these fields existed.
+    check_failed: 'Сравнить с обычным для этой монеты нельзя: <reason>'
+        (the reason text says itself whose limit it is), or None.
+    """
+    marks: list[str]
+    daily_line: str | None
+    check_failed: str | None
+
+
+# All Russian wording of the revenue_price_gap marks lives in the next few
+# lines (reason texts for a skipped check live in signals/revenue_price_gap.py
+# next to the data they are stored with) - so an editor changes them here.
+_MARK_PREFIX = "Что видно в дневных цифрах ниже: "
+_MARK_SPREAD = (
+    "второй по величине день в {week} раза больше второго по малости "
+    "(обычно у этой монеты — в {habitual} раза)"
+)
+_MARK_ZERO_DAYS = "в двух или больше из этих дней выручка нулевая или отрицательная"
+_MARK_ONE_DAY = (
+    "самый крупный день дал {share:.0f}% выручки этих {days} "
+    "(при ровных днях было бы около {even:.0f}%)"
+)
+_DAILY_LINE = "Выручка по дням, {dates}, тыс. $: {numbers}"
+_CHECK_FAILED = "Сравнить с обычным для этой монеты нельзя: {reason}"
+
+
+def _daily_numbers(values: list) -> str:
+    """Daily revenue numbers as one compact string, always in thousands of
+    dollars with one decimal (comma, so units never jump between digests);
+    zero is '0', negatives carry the real minus sign, a day without data is
+    '—'.
+    """
+    parts = []
+    for v in values:
+        if v is None:
+            parts.append("—")
+        elif v == 0:
+            parts.append("0")
+        else:
+            parts.append(f"{v / 1000:.1f}".replace("-", "−").replace(".", ","))
+    return " · ".join(parts)
+
+
+def _revenue_mark_texts(details: dict) -> RevenueMarkTexts:
+    """Texts for revenue_price_gap's marks and the daily-numbers line.
+
+    Args:
+        details: the saved details_json dict of a revenue_price_gap event.
 
     Returns:
-        (marks, check_failed): marks are 'one day dominates' and 'daily
-        spread unusual' lines (empty list when nothing is marked);
-        check_failed is the separate line 'форму выручки проверить не
-        удалось: <reason>' (lower case - the digest capitalizes it; about
-        our data, not about the coin) or None.
-        Old events saved before the marks existed lack the keys and give
-        ([], None). Reason texts come from details["shape_note"] (written in
-        signals/revenue_price_gap.py), not guessed here.
+        RevenueMarkTexts. Old events saved before the marks existed lack the
+        keys and give ([], None, None). A missing key that a present mark
+        needs raises KeyError, which the callers (_format_contribution,
+        _digest_signal_text) catch.
     """
     marks: list[str] = []
-    if details.get("single_day_marked"):
-        revenue_end = date.fromisoformat(details["revenue_window_end"])
-        marks.append(
-            f"один день дал {details['max_day_share_pct']:.0f}% выручки за "
-            f"{details['lookback_days']} дней по {_date_ru(revenue_end)}"
-        )
     if details.get("shape_marked"):
-        first = date.fromisoformat(details["shape_window_first"])
-        last = date.fromisoformat(details["shape_window_last"])
-        window = _date_range_ru(first, last)
-        revenue_end = date.fromisoformat(details["revenue_window_end"])
-        shifted = ""
-        if last != revenue_end:
-            revenue_first = revenue_end - timedelta(days=details["lookback_days"] - 1)
-            shifted = f"; рост выручки выше посчитан по {_date_range_ru(revenue_first, revenue_end)}"
-        if details.get("shape_ratio") is not None:
-            ratio = f"{details['shape_ratio']:.1f}".replace(".", ",")
-            marks.append(
-                f"разброс выручки по дням в {ratio} раза больше обычного для этой монеты "
-                f"(последние семь дней, за которые есть данные: {window}{shifted})"
-            )
+        if details.get("week_unevenness") is not None:
+            marks.append(_MARK_SPREAD.format(
+                week=f"{details['week_unevenness']:.1f}".replace(".", ","),
+                habitual=f"{details['habitual_unevenness']:.1f}".replace(".", ","),
+            ))
         else:
-            marks.append(
-                f"в последние семь дней, за которые есть данные ({window}{shifted}), "
-                f"два и более дня с нулевой или отрицательной выручкой"
-            )
+            marks.append(_MARK_ZERO_DAYS)
+    if details.get("single_day_marked"):
+        # "семи" only when all 7 shown days have data; otherwise just "дней".
+        shown = sum(v is not None for v in details["shape_window_values"])
+        marks.append(_MARK_ONE_DAY.format(
+            share=details["window_max_day_share_pct"], days="семи дней" if shown == 7 else "дней",
+            even=100 / shown,
+        ))
+
+    daily_line = None
+    if "shape_window_values" in details:
+        dates = _date_range_ru(
+            date.fromisoformat(details["shape_window_first"]),
+            date.fromisoformat(details["shape_window_last"]),
+        )
+        daily_line = _DAILY_LINE.format(
+            dates=dates, numbers=_daily_numbers(details["shape_window_values"])
+        )
+
     check_failed = None
     if details.get("shape_check_skipped"):
-        check_failed = f"форму выручки проверить не удалось: {details['shape_note']}"
-    return marks, check_failed
+        check_failed = _CHECK_FAILED.format(reason=details["shape_note"])
+    return RevenueMarkTexts(marks, daily_line, check_failed)
 
 
 def _format_revenue_price_gap(details: dict) -> str:
@@ -318,8 +365,10 @@ def _format_revenue_price_gap(details: dict) -> str:
         f"капитализация {details.get('mcap_growth_pct'):+.1f}% "
         f"(порог {details.get('mcap_reaction_threshold_pct')}%)"
     )
-    marks, check_failed = _revenue_marks_lines(details)
-    notes = marks + ([check_failed] if check_failed else [])
+    texts = _revenue_mark_texts(details)
+    notes = texts.marks + [
+        part[0].lower() + part[1:] for part in (texts.daily_line, texts.check_failed) if part
+    ]
     return f"{text} [{'; '.join(notes)}]" if notes else text
 
 
@@ -417,16 +466,18 @@ def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
         f"Медианная дневная выручка за {lookback_days} дней на "
         f"{details['revenue_growth_pct']:.0f}% выше, чем за последние {baseline_days} дней, "
         f"а капитализация токена за эти {lookback_days} дней изменилась на "
-        f"{_signed(details['mcap_growth_pct'])}%."
+        f"{_signed(details['mcap_growth_pct']).replace('.', ',')}%."
     )
-    marks, check_failed = _revenue_marks_lines(details)
-    if marks:
-        lines = [f"— {m};" for m in marks]
-        lines[-1] = lines[-1][:-1] + "."
-        text += "\nОтметка — это не вывод, а повод посмотреть на дневные цифры:\n" + "\n".join(lines)
-    if check_failed:
-        text += f"\n{check_failed[0].upper()}{check_failed[1:]}."
-    return text
+    texts = _revenue_mark_texts(details)
+    lines = []
+    if texts.marks:
+        lines.append(_MARK_PREFIX + "; ".join(texts.marks) + ".")
+    if texts.daily_line:
+        lines.append(texts.daily_line)
+    if texts.check_failed:
+        lines.append(texts.check_failed + ".")
+    lines.append(text)
+    return "\n".join(lines)
 
 
 def _digest_text_volume_breakout(details: dict, config: dict) -> str:

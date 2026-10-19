@@ -26,29 +26,9 @@
 
 <h2>Новые для разметки ({{ new_episodes|length }})</h2>
 {% if new_episodes %}
-<table>
-  <thead>
-    <tr>
-      <th>Монета / тикер</th>
-      <th>Сигнал</th>
-      <th class="wrap">Расшифровка</th>
-      <th>Начало &rarr; конец эпизода</th>
-      <th>Дней</th>
-      <th>Статус</th>
-      <th>Цена на старт</th>
-      <th>Цена сейчас</th>
-      <th>Капитализация на старт</th>
-      <th>Капитализация сейчас</th>
-      <th title="{{ market_hint }}">К рынку</th>
-      <th>Разметка</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for ep in new_episodes %}
-      {{ row_macros.render_row(ep) }}
-    {% endfor %}
-  </tbody>
-</table>
+{% for ep in new_episodes %}
+  {{ row_macros.render_row(ep, market_hint) }}
+{% endfor %}
 {% else %}
 <p class="empty">Пока нет эпизодов, готовых к разметке (эпизод должен быть не моложе настроенного в config.yaml числа дней).</p>
 {% endif %}
@@ -60,30 +40,9 @@
   пока он шёл, и он всё ещё идёт спустя 14 и более дней. Причина указана в каждой строке.
 </p>
 {% if reviewable_episodes %}
-<table>
-  <thead>
-    <tr>
-      <th>Монета / тикер</th>
-      <th>Сигнал</th>
-      <th class="wrap">Расшифровка</th>
-      <th>Начало &rarr; конец эпизода</th>
-      <th>Дней</th>
-      <th>Статус</th>
-      <th>Цена на старт</th>
-      <th>Цена сейчас</th>
-      <th>Капитализация на старт</th>
-      <th>Капитализация сейчас</th>
-      <th title="{{ market_hint }}">К рынку</th>
-      <th>Прежняя оценка</th>
-      <th>Разметка</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for ep in reviewable_episodes %}
-      {{ row_macros.render_row(ep) }}
-    {% endfor %}
-  </tbody>
-</table>
+{% for ep in reviewable_episodes %}
+  {{ row_macros.render_row(ep, market_hint) }}
+{% endfor %}
 {% else %}
 <p class="empty">Нет эпизодов, которые стоило бы пересмотреть прямо сейчас.</p>
 {% endif %}

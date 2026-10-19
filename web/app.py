@@ -42,7 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from main import load_config  # noqa: E402
-from notifications.telegram_bot import _SIGNAL_FORMATTERS, _revenue_marks_lines  # noqa: E402
+from notifications.telegram_bot import _MARK_PREFIX, _SIGNAL_FORMATTERS, _revenue_mark_texts  # noqa: E402
 from storage.db import (  # noqa: E402
     VALID_EPISODE_OUTCOMES,
     get_connection,
@@ -163,7 +163,7 @@ def _load_notes() -> tuple[dict[tuple[str, str, str], str], str | None]:
 
 
 class EpisodeView(BaseModel):
-    """Everything one row of the episode-labeling table needs to render -
+    """Everything one card of the episode-labeling page needs to render -
     the same shape this route would hand to a future React frontend as JSON
     (see web-dev.md: "роут отдаёт то же самое, что позже отдавал бы в JSON
     API для React"), Jinja just renders it as HTML for now.
@@ -173,10 +173,8 @@ class EpisodeView(BaseModel):
     protocol_slug: str
     label: str
     signal_description: str
-    marks: list[str] = []
-    check_failed: str | None = None
-    last_day_marks: list[str] = []
-    last_day_check_failed: str | None = None
+    mark_lines: list[str] = []
+    last_day_lines: list[str] = []
     episode_start_date: str
     episode_end_date: str
     duration_days: int
@@ -252,6 +250,23 @@ def _price_mcap_for(conn, episode: Episode, first_details: dict, last_details: d
     )
 
 
+def _mark_lines(details: dict) -> list[str]:
+    """Revenue marks as display lines, in the digest's order: marks, daily
+    numbers, "could not compare". Empty for old events and other signals."""
+    try:
+        texts = _revenue_mark_texts(details)
+    except (KeyError, TypeError, ValueError):
+        return ["Отметки не удалось разобрать из сохранённых деталей"]
+    lines = []
+    if texts.marks:
+        lines.append(_MARK_PREFIX + "; ".join(texts.marks) + ".")
+    if texts.daily_line:
+        lines.append(texts.daily_line)
+    if texts.check_failed:
+        lines.append(texts.check_failed + ".")
+    return lines
+
+
 def _build_view(
     conn, config: dict, episode: Episode, notes: dict, prior: ReviewableEpisode | None = None
 ) -> EpisodeView:
@@ -277,28 +292,27 @@ def _build_view(
             vs_market_pp=market.coin_change_pct - market.market_change_pct,
         )
 
-    # Marks come from the same function the Telegram digest uses. The
-    # description is built from details without the mark flags, because the
-    # formatter appends the marks in [brackets] and they are shown as their
-    # own block instead.
-    marks, check_failed = _revenue_marks_lines(first_details)
-    mark_flags = ("single_day_marked", "shape_marked", "shape_check_skipped")
-    plain_details = {k: v for k, v in first_details.items() if k not in mark_flags}
+    # Marks, daily numbers and the "could not compare" line come from the same
+    # function as the Telegram digest, in the digest's order. The description
+    # is built from details without those keys, because the formatter appends
+    # them in [brackets] and they are shown as their own block instead.
+    mark_keys = ("single_day_marked", "shape_marked", "shape_check_skipped", "shape_window_values")
+    plain_details = {k: v for k, v in first_details.items() if k not in mark_keys}
+    mark_lines = _mark_lines(first_details)
     # Marks that appeared after the first day: compare the set of flags, not
     # the text (the text carries the window date, which shifts every day).
-    last_marks, last_check_failed = [], None
+    last_day_lines: list[str] = []
     if episode.signal_name == "revenue_price_gap":
-        first_set = {k for k in mark_flags if first_details.get(k)}
-        last_set = {k for k in mark_flags if last_details.get(k)}
+        flags = mark_keys[:3]
+        first_set = {k for k in flags if first_details.get(k)}
+        last_set = {k for k in flags if last_details.get(k)}
         if last_set and last_set != first_set:
-            last_marks, last_check_failed = _revenue_marks_lines(last_details)
+            last_day_lines = _mark_lines(last_details)
 
     return EpisodeView(
         **market_kwargs,
-        marks=marks,
-        check_failed=check_failed,
-        last_day_marks=last_marks,
-        last_day_check_failed=last_check_failed,
+        mark_lines=mark_lines,
+        last_day_lines=last_day_lines,
         signal_name=episode.signal_name,
         protocol_slug=episode.protocol_slug,
         label=_label_for(episode, first_details),
@@ -367,11 +381,11 @@ def post_episode_outcome(
     outcome_comment: str = Form(""),
 ) -> HTMLResponse:
     """Saves/overwrites one episode's manual label. On success returns an
-    empty body - the row's hx-target="closest tr" / hx-swap="outerHTML" (see
-    templates/_episode_row.html) then removes the row from the page without
+    empty body - the card's hx-target="closest .card" / hx-swap="outerHTML" (see
+    templates/_episode_row.html) then removes the card from the page without
     a full reload. On a bad `outcome` (shouldn't happen from the UI's own
     fixed three buttons, but guarded anyway per save_episode_outcome's
-    contract), re-renders the same row with an inline error instead of
+    contract), re-renders the same card with an inline error instead of
     silently failing or 500ing - see base.html's htmx:beforeSwap handler,
     which allows a 400 response body to still swap in.
     """

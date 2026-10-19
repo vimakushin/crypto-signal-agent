@@ -114,6 +114,9 @@ signals:
     # выбросов ловит один доминирующий день..."), and a rejection hides the
     # candidate from the owner entirely, while a mark lets them see it and
     # judge. The key and the 50 are unchanged; only its meaning changed.
+    # Also 19 Oct 2026: the share is counted over the last 7 days WITH DATA
+    # (the 7 days the summary shows), not over the revenue window D-6..D, so
+    # the reader can add the shown numbers up and get the same share.
     outlier_max_share_pct: 50
     # Second mark, "this week is more uneven than usual for this coin"
     # (signals/revenue_price_gap.py, _shape_check). Unevenness of a 7-day

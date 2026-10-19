@@ -8,8 +8,9 @@
 <style>
   body {
     font-family: -apple-system, Segoe UI, Arial, sans-serif;
-    margin: 0;
     padding: 0 1.5rem 3rem;
+    max-width: 1400px;
+    margin: 0 auto;
     background: #0f1115;
     color: #d8dbe2;
     font-size: 14px;
@@ -17,27 +18,15 @@
   h1 { font-size: 1.3rem; margin: 1.5rem 0 0.25rem; }
   h2 { font-size: 1.05rem; margin: 2rem 0 0.5rem; color: #9aa4b8; }
   p.hint { color: #7c8397; margin: 0 0 1rem; }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    background: #171a21;
-  }
-  th, td {
-    border-bottom: 1px solid #262b36;
-    padding: 6px 10px;
-    text-align: left;
-    vertical-align: top;
-    white-space: nowrap;
-  }
-  td.wrap, th.wrap { white-space: normal; }
-  th {
-    background: #1d212b;
-    color: #9aa4b8;
-    font-weight: 600;
-    position: sticky;
-    top: 0;
-  }
-  tr:hover td { background: #1b1f29; }
+  .card { background: #171a21; border: 1px solid #262b36; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; }
+  .card-head { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+  .coin { font-size: 1.05rem; }
+  .sig { color: #9aa4b8; }
+  .desc { margin-top: 0.5rem; overflow-wrap: anywhere; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; margin-top: 0.6rem; }
+  .metrics .market { grid-column: 1 / -1; }
+  .metrics .k { display: block; color: #7c8397; font-size: 0.75rem; }
+  .actions { margin-top: 0.7rem; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .badge {
     display: inline-block;
     padding: 1px 6px;
@@ -49,8 +38,7 @@
   .badge-closed { background: #3a3f4c; color: #b6bcc9; }
   .badge-old-formula { background: #5a3a1a; color: #ffcf8a; }
   .actions button {
-    margin-right: 4px;
-    padding: 4px 8px;
+    padding: 6px 10px;
     border: 1px solid #3a3f4c;
     background: #232733;
     color: #d8dbe2;
@@ -59,25 +47,27 @@
   }
   .actions button:hover { background: #2b3040; }
   .actions input[type=text] {
-    width: 140px;
+    width: 220px;
+    max-width: 100%;
     background: #12141a;
     border: 1px solid #3a3f4c;
     color: #d8dbe2;
     border-radius: 4px;
     padding: 3px 6px;
-    margin-right: 4px;
   }
   .error-msg { color: #ff8a8a; font-weight: 600; }
-  .prior { color: #9aa4b8; font-size: 0.85rem; }
-  .marks { margin-top: 0.5rem; padding: 4px 8px; border-left: 3px solid #e0b050; background: #2a2418; color: #f0e2bd; }
-  .marks ul { margin: 2px 0 2px 1.2rem; padding: 0; }
-  .data-note { margin-top: 0.4rem; font-size: 0.85rem; }
+  .prior { margin-top: 0.6rem; color: #9aa4b8; font-size: 0.85rem; }
+  .marks { margin-top: 0.5rem; overflow-wrap: anywhere; padding: 4px 8px; border-left: 3px solid #e0b050; background: #2a2418; color: #f0e2bd; }
   .note { margin-top: 0.5rem; padding: 4px 8px; border-left: 3px solid #5a6a8a; background: #1a1d26; white-space: pre-line; font-size: 0.85rem; }
   .note-label { color: #7c8397; font-size: 0.7rem; text-transform: uppercase; }
   .notes-error { color: #ff8a8a; font-weight: 600; border: 1px solid #ff8a8a; padding: 6px 10px; }
   .empty { color: #7c8397; padding: 1rem 0; }
   form.filter-form { margin: 0.5rem 0 1rem; }
   form.filter-form label { color: #9aa4b8; }
+  @media (max-width: 600px) {
+    body { padding: 0 16px 2rem; }
+    .actions input[type=text] { width: 100%; }
+  }
 </style>
 </head>
 <body>

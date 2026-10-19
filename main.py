@@ -300,13 +300,13 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
                     "(configured) - recent $%.0f/day vs baseline $%.0f/day, week sum $%.0f "
                     "(largest day %.1f%% of it), actual gap between compared snapshots "
                     "%.1fd, mcap only +%.1f%%; marks: single_day=%s, shape=%s (week unevenness "
-                    "%s vs usual %s, ratio %s, check skipped=%s, note: %s, shape window %s..%s, revenue window ends %s)",
+                    "%s vs usual %s, ratio %s, check skipped=%s, note: %s, shape window %s..%s, window max day share %.1f%%)",
                     s.protocol_slug, s.symbol, s.revenue_growth_pct, s.lookback_days,
                     s.recent_median_daily_revenue, s.baseline_median_daily_revenue,
                     s.recent_week_sum, s.max_day_share_pct, s.actual_lookback_days,
                     s.mcap_growth_pct, s.single_day_marked, s.shape_marked, s.week_unevenness,
                     s.habitual_unevenness, s.shape_ratio, s.shape_check_skipped, s.shape_note,
-                    s.shape_window_first, s.shape_window_last, s.revenue_window_end,
+                    s.shape_window_first, s.shape_window_last, s.window_max_day_share_pct,
                 )
                 save_signal_event(
                     conn,
@@ -335,7 +335,8 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
                         "shape_note": s.shape_note,
                         "shape_window_first": s.shape_window_first,
                         "shape_window_last": s.shape_window_last,
-                        "revenue_window_end": s.revenue_window_end,
+                        "shape_window_values": s.shape_window_values,
+                        "window_max_day_share_pct": s.window_max_day_share_pct,
                         "mcap_now": s.mcap_now,
                         "mcap_before": s.mcap_before,
                         "symbol": s.symbol,

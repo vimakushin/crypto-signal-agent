@@ -64,6 +64,22 @@ MIN_HISTORY_COVERAGE_FRACTION = 0.9
 # week: a round, plain floor, not tuned to any protocol's history.
 MIN_PAST_WINDOWS_FOR_SHAPE = 40
 
+# Reasons the shape check was not applied, in Russian: they are stored in
+# details_json (shape_note) and shown to the reader after the digest's
+# "_CHECK_FAILED" phrase (notifications/telegram_bot.py, "Сравнить с обычным
+# для этой монеты нельзя: …").
+# Each text says by itself whether the cause is our data or the coin's behaviour.
+NOTE_GAPS = "не за все эти дни есть данные (—)"
+NOTE_FEW_WINDOWS = (
+    "у нас пока меньше полутора месяцев её истории без пропусков "
+    "(это ограничение наших данных, а не признак монеты)"
+)
+NOTE_ZERO_DAYS = (
+    "у неё часто бывают недели с двумя и больше нулевыми днями "
+    "(так было минимум в половине прошлых недель), поэтому обычного уровня нет"
+)
+
+
 # Unevenness is defined for a 7-day window: median of the 3 largest days
 # divided by median of the 3 smallest (= 2nd largest / 2nd smallest).
 SHAPE_WINDOW_DAYS = 7
@@ -100,13 +116,17 @@ class RevenueGapSignal:
     # min_revenue_total_usd's liquidity floor is actually checked against),
     # not itself part of the growth-% formula.
     recent_week_sum: float
-    # Share (%) of recent_week_sum contributed by its single largest day -
-    # logged on every signal so the user can see at a glance how "spiky" vs.
-    # "broad" the week behind a candidate was.
+    # Share (%) of recent_week_sum (the revenue window D-6..D) contributed by
+    # its single largest day. Kept for history only: since 19 Oct 2026 mark 1
+    # is based on window_max_day_share_pct below, the days the reader sees.
     max_day_share_pct: float
-    # Mark 1 ("one outlier day"): max_day_share_pct is above config.yaml's
-    # outlier_max_share_pct. Since 19 Oct 2026 this only marks the signal, it
-    # no longer rejects the week (see config.yaml for the history).
+    # Same share, but over the 7 days shown to the reader (shape_window_values,
+    # i.e. the last 7 days with data); the reader can add the shown numbers up
+    # and get this share. 0.0 when those days sum to <= 0.
+    window_max_day_share_pct: float
+    # Mark 1 ("one outlier day"): window_max_day_share_pct is above
+    # config.yaml's outlier_max_share_pct. Since 19 Oct 2026 this only marks
+    # the signal, it no longer rejects the week (see config.yaml).
     single_day_marked: bool
     # Mark 2 ("this week is more uneven than usual for this coin"), see
     # _shape_check. week_unevenness/habitual_unevenness are None when they
@@ -124,14 +144,14 @@ class RevenueGapSignal:
     # digest words that case itself.
     shape_check_skipped: bool
     shape_note: str | None
-    # The 7 days mark 2 describes (first/last day, ISO dates; None if no
-    # window could be formed) and the last day of the window the revenue
-    # medians used - they differ by a day for protocols whose latest day
-    # DeFiLlama publishes only the next morning. The reader must see which
-    # days the mark is about.
-    shape_window_first: str | None
-    shape_window_last: str | None
-    revenue_window_end: str
+    # The 7 days both marks describe and the digest shows: first/last day (ISO
+    # dates) and the 7 daily values oldest first, None for a day without
+    # data. For ~10 protocols DeFiLlama publishes a day only the next
+    # morning, so this window ends a day before the revenue window D-6..D the
+    # medians use.
+    shape_window_first: str
+    shape_window_last: str
+    shape_window_values: list[float | None]
     mcap_now: float
     mcap_before: float
 
@@ -199,7 +219,6 @@ def _unevenness(values: list[float]) -> float:
 
 def _shape_check(
     baseline_daily_revenue: list[sqlite3.Row],
-    revenue_window_end: date,
     shape_mark_ratio: float,
 ) -> dict:
     """Mark 2: is the shape of the latest 7 days more uneven than usual for
@@ -209,7 +228,7 @@ def _shape_check(
     evaluation (the last day with data and the 6 before it), not necessarily
     the window the signal's medians use: for ~10 protocols DeFiLlama gives a
     day's revenue only the next morning, so their window ends one day earlier
-    than `revenue_window_end`. Its unevenness is compared with the median
+    than the revenue window. Its unevenness is compared with the median
     unevenness of all complete 7-day windows (7 consecutive dates, no missing
     values) lying fully inside the baseline window and ending BEFORE this
     window's first day. Uses only rows the caller already has (nothing from
@@ -219,21 +238,17 @@ def _shape_check(
 
     Args:
         baseline_daily_revenue: the baseline window's rows (date, revenue_usd).
-        revenue_window_end: last day of the window the signal's revenue
-            medians were computed on (the latest snapshot's date).
         shape_mark_ratio: config.yaml signals.revenue_price_gap.shape_mark_ratio.
 
     Returns:
         Dict with the RevenueGapSignal fields week_unevenness,
         habitual_unevenness, shape_ratio, shape_marked, shape_check_skipped,
-        shape_note, shape_window_first, shape_window_last, revenue_window_end.
+        shape_note, shape_window_first, shape_window_last, shape_window_values.
         Never contains inf/NaN (the result goes into JSON).
     """
     result: dict = {
         "week_unevenness": None, "habitual_unevenness": None, "shape_ratio": None,
         "shape_marked": False, "shape_check_skipped": True, "shape_note": None,
-        "shape_window_first": None, "shape_window_last": None,
-        "revenue_window_end": revenue_window_end.isoformat(),
     }
     by_date = {
         date.fromisoformat(r["date"]): r["revenue_usd"]
@@ -244,8 +259,9 @@ def _shape_check(
     first_day = window_days[-1]
     result["shape_window_first"] = first_day.isoformat()
     result["shape_window_last"] = last_day.isoformat()
+    result["shape_window_values"] = [by_date.get(d) for d in reversed(window_days)]
     if not all(d in by_date for d in window_days):
-        result["shape_note"] = "в последних семи днях есть пропуски в данных"
+        result["shape_note"] = NOTE_GAPS
         return result
     week = [by_date[d] for d in window_days]
 
@@ -257,16 +273,11 @@ def _shape_check(
         if all(d in by_date for d in days):
             past.append(_unevenness([by_date[d] for d in days]))
     if len(past) < MIN_PAST_WINDOWS_FOR_SHAPE:
-        result["shape_note"] = (
-            f"у монеты пока мало прошлых недель для сравнения (есть {len(past)}, нужно {MIN_PAST_WINDOWS_FOR_SHAPE})"
-        )
+        result["shape_note"] = NOTE_FEW_WINDOWS
         return result
     habitual = statistics.median(past)
     if not math.isfinite(habitual):
-        result["shape_note"] = (
-            "у этой монеты слишком часто бывают дни с нулевой выручкой, "
-            "обычный разброс не посчитать"
-        )
+        result["shape_note"] = NOTE_ZERO_DAYS
         return result
 
     result["habitual_unevenness"] = habitual
@@ -411,6 +422,10 @@ def _evaluate_snapshots(
     if mcap_growth_pct >= revenue_growth_pct or mcap_growth_pct >= mcap_reaction_threshold_pct:
         return None
 
+    shape = _shape_check(baseline_daily_revenue, shape_mark_ratio)
+    shown = [v for v in shape["shape_window_values"] if v is not None]
+    window_max_day_share_pct = (max(shown) / sum(shown) * 100) if sum(shown) > 0 else 0.0
+
     return RevenueGapSignal(
         protocol_slug=latest["protocol_slug"],
         symbol=latest["symbol"],
@@ -424,11 +439,9 @@ def _evaluate_snapshots(
         baseline_median_daily_revenue=baseline_median,
         recent_week_sum=recent_sum,
         max_day_share_pct=max_day_share_pct,
-        single_day_marked=max_day_share_pct > outlier_max_share_pct,
-        **_shape_check(
-            baseline_daily_revenue, datetime.fromisoformat(latest["fetched_at"]).date(),
-            shape_mark_ratio,
-        ),
+        window_max_day_share_pct=window_max_day_share_pct,
+        single_day_marked=window_max_day_share_pct > outlier_max_share_pct,
+        **shape,
         mcap_now=mcap_now,
         mcap_before=mcap_before,
     )
