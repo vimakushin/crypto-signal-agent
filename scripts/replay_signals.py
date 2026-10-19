@@ -337,7 +337,7 @@ def replay_revenue_price_gap(
         )
     revenue_threshold = signal_cfg["revenue_growth_threshold_pct"]
     mcap_threshold = signal_cfg["mcap_reaction_threshold_pct"]
-    outlier_max_share_pct = signal_cfg.get("outlier_max_share_pct", 100)
+    single_day_mark_ratio = signal_cfg["single_day_mark_ratio"]
     shape_mark_ratio = signal_cfg["shape_mark_ratio"]
     max_gap_days = lookback_days * MAX_GAP_MULTIPLIER
     min_revenue_total_usd = signal_cfg.get("min_revenue_total_usd", 0)
@@ -480,7 +480,7 @@ def replay_revenue_price_gap(
             try:
                 signal = revenue_price_gap._evaluate_snapshots(
                     latest, earlier, recent_rows, baseline_rows,
-                    revenue_threshold, mcap_threshold, outlier_max_share_pct,
+                    revenue_threshold, mcap_threshold, single_day_mark_ratio,
                     shape_mark_ratio, lookback_days,
                 )
             except revenue_price_gap._DataQualityRejected:
@@ -532,7 +532,7 @@ def replay_revenue_price_gap(
         "baseline_window_days": baseline_window_days,
         "revenue_threshold": revenue_threshold,
         "mcap_threshold": mcap_threshold,
-        "outlier_max_share_pct": outlier_max_share_pct,
+        "single_day_mark_ratio": single_day_mark_ratio,
         "shape_mark_ratio": shape_mark_ratio,
         "marked_single_day": marked_single_day,
         "marked_shape": marked_shape,
@@ -559,9 +559,9 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "revenue_price_gap: lookback_days=%d, baseline_window_days=%d, "
         "revenue_growth_threshold_pct=%s, mcap_reaction_threshold_pct=%s, "
-        "outlier_max_share_pct=%s, shape_mark_ratio=%s, min_revenue_total_usd=%s (config.yaml)",
+        "single_day_mark_ratio=%s, shape_mark_ratio=%s, min_revenue_total_usd=%s (config.yaml)",
         result["lookback_days"], result["baseline_window_days"], result["revenue_threshold"],
-        result["mcap_threshold"], result["outlier_max_share_pct"], result["shape_mark_ratio"],
+        result["mcap_threshold"], result["single_day_mark_ratio"], result["shape_mark_ratio"],
         result["min_revenue_total_usd"],
     )
     logger.info(
@@ -594,8 +594,8 @@ def _report_revenue_price_gap(result: dict) -> None:
         result["fired_raw_total"], result["evaluated_total"], rate, result["episodes_total"],
     )
     logger.info(
-        "  Of those %d fired protocol-days: %d marked 'one outlier day' (largest day above "
-        "outlier_max_share_pct of the week), %d marked 'week shape more uneven than usual', "
+        "  Of those %d fired protocol-days: %d marked 'one day dominates' (its share of the "
+        "shown 7 days is more than single_day_mark_ratio times the coin's usual one), %d marked 'week shape more uneven than usual', "
         "%d where the shape check was not applied (nothing to compare with). Marks do not "
         "remove a day from the counts above.",
         result["fired_raw_total"], result["marked_single_day"], result["marked_shape"],
@@ -698,6 +698,16 @@ def _revenue_price_gap_details_json(signal, result: dict) -> str:
         "shape_window_last": signal.shape_window_last,
         "shape_window_values": signal.shape_window_values,
         "window_max_day_share_pct": signal.window_max_day_share_pct,
+        "habitual_max_day_share_pct": signal.habitual_max_day_share_pct,
+        "single_day_ratio": signal.single_day_ratio,
+        "revenue_window_first": signal.revenue_window_first,
+        "revenue_window_last": signal.revenue_window_last,
+        "revenue_window_count": signal.revenue_window_count,
+        "baseline_window_first": signal.baseline_window_first,
+        "baseline_window_last": signal.baseline_window_last,
+        "baseline_window_count": signal.baseline_window_count,
+        "mcap_date_earlier": signal.mcap_date_earlier,
+        "mcap_date_latest": signal.mcap_date_latest,
         "mcap_now": signal.mcap_now,
         "mcap_before": signal.mcap_before,
         "symbol": signal.symbol,

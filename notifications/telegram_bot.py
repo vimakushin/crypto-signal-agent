@@ -284,16 +284,24 @@ class RevenueMarkTexts(NamedTuple):
 # next to the data they are stored with) - so an editor changes them here.
 _MARK_PREFIX = "Что видно в дневных цифрах ниже: "
 _MARK_SPREAD = (
-    "второй по величине день в {week} раза больше второго по малости "
+    "второй самый крупный день в {week} раза больше второго самого мелкого "
     "(обычно у этой монеты — в {habitual} раза)"
 )
 _MARK_ZERO_DAYS = "в двух или больше из этих дней выручка нулевая или отрицательная"
 _MARK_ONE_DAY = (
-    "самый крупный день дал {share:.0f}% выручки этих {days} "
-    "(при ровных днях было бы около {even:.0f}%)"
+    "самый крупный день дал {share:.0f}% выручки этих дней "
+    "(обычно у этой монеты — {habitual:.0f}%)"
 )
 _DAILY_LINE = "Выручка по дням, {dates}, тыс. $: {numbers}"
-_CHECK_FAILED = "Сравнить с обычным для этой монеты нельзя: {reason}"
+# Headline sentence of the digest. Every date and number in it is the one the
+# signal was really computed from (details_json: revenue_window_*,
+# baseline_window_*, mcap_date_*).
+_HEADLINE = (
+    "Медиана дневной выручки за {revenue_dates}{revenue_note} на {growth:.0f}% выше, чем за "
+    "{baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни). "
+    "Капитализация токена {mcap_dates} изменилась на {mcap}%."
+)
+_CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
 def _daily_numbers(values: list) -> str:
@@ -335,11 +343,9 @@ def _revenue_mark_texts(details: dict) -> RevenueMarkTexts:
         else:
             marks.append(_MARK_ZERO_DAYS)
     if details.get("single_day_marked"):
-        # "семи" only when all 7 shown days have data; otherwise just "дней".
-        shown = sum(v is not None for v in details["shape_window_values"])
         marks.append(_MARK_ONE_DAY.format(
-            share=details["window_max_day_share_pct"], days="семи дней" if shown == 7 else "дней",
-            even=100 / shown,
+            share=details["window_max_day_share_pct"],
+            habitual=details["habitual_max_day_share_pct"],
         ))
 
     daily_line = None
@@ -459,24 +465,63 @@ def _price_level(value: float) -> str:
     return f"${value:.{decimals}f}"
 
 
-def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
-    baseline_days = config["signals"]["revenue_price_gap"]["baseline_window_days"]
-    lookback_days = details["lookback_days"]
-    text = (
-        f"Медианная дневная выручка за {lookback_days} дней на "
-        f"{details['revenue_growth_pct']:.0f}% выше, чем за последние {baseline_days} дней, "
-        f"а капитализация токена за эти {lookback_days} дней изменилась на "
-        f"{_signed(details['mcap_growth_pct']).replace('.', ',')}%."
+def _days_word(n: int) -> str:
+    """'день' / 'дня' / 'дней' for n (81 день, 82 дня, 85 дней, 11 дней)."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "дня"
+    return "дней"
+
+
+def _revenue_headline(details: dict) -> str:
+    """The digest's headline sentence, naming the real windows. An event
+    saved before the window dates were stored raises KeyError, which
+    _digest_signal_text catches.
+    """
+    mcap = _signed(details["mcap_growth_pct"]).replace(".", ",")
+    latest_day = date.fromisoformat(details["mcap_date_latest"])
+    earlier_day = date.fromisoformat(details["mcap_date_earlier"])
+    revenue_last = date.fromisoformat(details["revenue_window_last"])
+    revenue_note = ""
+    if details["revenue_window_count"] < details["lookback_days"]:
+        revenue_note = f" ({details['revenue_window_count']} {_days_word(details['revenue_window_count'])}"
+        if revenue_last < latest_day:
+            revenue_note += f"; за {_date_ru(latest_day)} данных ещё нет"
+        revenue_note += ")"
+    if (earlier_day.year, earlier_day.month) == (latest_day.year, latest_day.month):
+        mcap_dates = f"с {earlier_day.day} по {_date_ru(latest_day)}"
+    else:
+        mcap_dates = f"с {_date_ru(earlier_day)} по {_date_ru(latest_day)}"
+    baseline_first = date.fromisoformat(details["baseline_window_first"])
+    baseline_last = date.fromisoformat(details["baseline_window_last"])
+    baseline_count = details["baseline_window_count"]
+    baseline_days_word = _days_word(baseline_count)
+    if baseline_count < (baseline_last - baseline_first).days + 1:
+        baseline_days_word += " с данными"
+    return _HEADLINE.format(
+        revenue_dates=_date_range_ru(date.fromisoformat(details["revenue_window_first"]), revenue_last),
+        revenue_note=revenue_note,
+        growth=details["revenue_growth_pct"],
+        baseline_count=baseline_count,
+        baseline_days_word=baseline_days_word,
+        baseline_dates=_date_range_ru(baseline_first, baseline_last),
+        mcap_dates=mcap_dates,
+        mcap=mcap,
     )
+
+
+def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
+    """Headline first, then what is visible in the daily numbers (marks), the
+    'cannot compare' line if any, and the daily numbers last."""
     texts = _revenue_mark_texts(details)
-    lines = []
+    lines = [_revenue_headline(details)]
     if texts.marks:
         lines.append(_MARK_PREFIX + "; ".join(texts.marks) + ".")
-    if texts.daily_line:
-        lines.append(texts.daily_line)
     if texts.check_failed:
         lines.append(texts.check_failed + ".")
-    lines.append(text)
+    if texts.daily_line:
+        lines.append(texts.daily_line)
     return "\n".join(lines)
 
 
@@ -614,7 +659,7 @@ def format_digest(
         results: rank_candidates()'s return value (order kept as is).
         today: date for the header.
         conn: open storage/db.py connection (coin names, episodes).
-        config: parsed config.yaml (baseline window for the wording).
+        config: parsed config.yaml (passed to every signal's wording function).
         since_by_signal: default_since_by_signal()'s cursor, for episodes.
         stale_sources: storage.db.sources_without_fetch_today()'s result at
             the moment of building. Non-empty -> the text starts with a

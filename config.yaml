@@ -99,6 +99,8 @@ signals:
     baseline_window_days: 90
     revenue_growth_threshold_pct: 30
     mcap_reaction_threshold_pct: 10
+    # (Formerly outlier_max_share_pct: 50 - the key was removed on 19 Oct 2026,
+    # its history is kept here, next to the key that replaced it.)
     # Outlier guard (see BACKLOG.md's "revenue_price_gap ловит одиночные
     # выбросы" entry - thorchain-dex's 12 Sep 2026 false positive, where one
     # day supplied 60% of the week's total revenue): if a single day
@@ -113,11 +115,34 @@ signals:
     # dominating day, not a multi-day source failure (BACKLOG.md, "Фильтр
     # выбросов ловит один доминирующий день..."), and a rejection hides the
     # candidate from the owner entirely, while a mark lets them see it and
-    # judge. The key and the 50 are unchanged; only its meaning changed.
+    # judge. (At that step the key and the 50 were unchanged.)
     # Also 19 Oct 2026: the share is counted over the last 7 days WITH DATA
     # (the 7 days the summary shows), not over the revenue window D-6..D, so
     # the reader can add the shown numbers up and get the same share.
-    outlier_max_share_pct: 50
+    # Later on 19 Oct 2026: the constant 50% was replaced by a comparison with
+    # the coin's own habit. single_day_mark_ratio is the number of times the
+    # largest day's share of the shown 7 days must exceed the coin's usual
+    # share (median of the same share over its complete past 7-day windows,
+    # the windows the shape check uses) for the mark "one day dominates" to
+    # be set. If the shape check cannot be applied (fewer than 40 past
+    # windows, gaps, usual level undefined) this mark is not set either and
+    # the digest says that the comparison is impossible. Why: for a coin whose
+    # largest day is usually 50%+ (convex-finance), a fixed 50% marked 10 of
+    # its 15 fired days and said nothing. The value 2 was chosen from known
+    # cases, replayed on stored data as the live run saw it: thorchain-dex's
+    # one-day spike of 10-16 Sep 2026 had a share of 53-67% against a usual
+    # 26%, ratio 2.05-2.58 (marked); the genuine growth of 7-13 Oct 2026 gave
+    # 0.73-0.95 (not marked); convex-finance, all 15 fired days, gave 0.30-1.85
+    # (not marked; the fixed 50% had marked 10 of them); for an ordinary coin
+    # with a usual share of ~25% a ratio of 2 almost coincides with the old
+    # 50%. The margin is thin (1.85 against 2.05), there is NO independent
+    # check, and after the results are seen the value must not be touched -
+    # that would be fitting it to the answers. Over the whole history the new
+    # rule marks 38 of 742 fired days (the old 50% rule on the same shown
+    # window: 43). On the re-fetched ("restated") data convex-finance reaches
+    # 2.01-2.10 on 9 of its 36 fired days - a reminder of how thin the margin
+    # is; the live run sees the first-received values, not these.
+    single_day_mark_ratio: 2
     # Second mark, "this week is more uneven than usual for this coin"
     # (signals/revenue_price_gap.py, _shape_check). Unevenness of a 7-day
     # window = median of the 3 largest days / median of the 3 smallest. The
@@ -165,7 +190,7 @@ signals:
     # whose daily revenue is so small that the numbers are source-data
     # rounding and noise rather than a real business fact - guarding against
     # a single-day spike and against "tiny base, huge percent swing" is now
-    # handled separately, by the median itself (the outlier-day share and
+    # handled separately, by the median itself (the one-day share and
     # the series shape are only marks now, see above). This was raised to $50,000 on 2026-09-15 and then reverted:
     # at $50,000 it cut 61 of 127 episodes (nearly half) and switched off
     # seven protocols (including aave-v2, ens, axie-infinity, olympus-dao,
