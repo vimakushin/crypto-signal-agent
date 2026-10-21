@@ -12,7 +12,7 @@ This isn't a trading bot. It never says "buy" or "sell," never names a price tar
 
 ## Where the project started
 
-It started as a search for coins in the early stage of a move, before that move shows on the price chart. That question is still open. The measurement of 15 October 2026 is why the project no longer claims it: with a base rate of about 30% (the share of "beat the market" outcomes for a random coin on a random day), telling even a strong signal from it (30% against 45%) takes 163 episodes (an episode is a run of days in which a detector stays fired on one coin), and the system produces about eight a month — roughly 20 months. On the 8 to 17 episodes so far (depending on which version of the data is used) the signal has neither been shown to beat the market nor ruled out. So finding early coins remains the owner's personal hypothesis, which they keep watching, and not something the product says about itself. Dropping a claim that can't be shown on the available data is a result of the work; the numbers are in [`BACKLOG.md`](BACKLOG.md), the plan is in [`SURVEILLANCE.md`](SURVEILLANCE.md).
+It started as a search for coins in the early stage of a move, before that move shows on the price chart. That question is still open. The measurement of 15 October 2026 is why the project no longer claims it: with a base rate of about 30% (the share of "beat the market" outcomes for a random coin on a random day), telling even a strong signal from it (30% against 45%) takes 163 episodes (an episode is a run of days in which a detector stays fired on one coin), and the system produces about eight a month — roughly 20 months. On the 8 to 17 episodes so far (depending on which version of the data is used) the revenue-gap signal has neither been shown to beat the market nor ruled out. So finding early coins remains the owner's personal hypothesis, which they keep watching, and not something the product says about itself. Dropping a claim that can't be shown on the available data is a result of the work; the numbers are in [`BACKLOG.md`](BACKLOG.md), the plan is in [`SURVEILLANCE.md`](SURVEILLANCE.md).
 
 ## How it's built
 
@@ -21,7 +21,7 @@ collectors/  →  signals/  →  scoring/  →  notifications/
 (data collection) (detectors)  (ranking)   (digest)
 ```
 
-- **Collectors** (`collectors/`) pull history from three free public APIs — DeFiLlama (protocol revenue/fees), Binance Futures (Open Interest, no API key required) and CoinGecko (price/volume/market cap) — and accumulate it in a local SQLite database (`storage/`), so signals can compare "now" against "before" without re-hitting the source every time.
+- **Collectors** (`collectors/`) pull history from three free public APIs — DeFiLlama (protocol revenue/fees and market cap), Binance Futures (Open Interest, no API key required) and CoinGecko (price/volume) — and accumulate it in a local SQLite database (`storage/`), so signals can compare "now" against "before" without re-hitting the source every time.
 - **Signal detectors** (`signals/`) — three independent modules:
   - **revenue-gap** — protocol revenue grew X% over 7-30 days while the token's market cap didn't react;
   - **OI divergence** — futures Open Interest grew X% while price barely moved;
