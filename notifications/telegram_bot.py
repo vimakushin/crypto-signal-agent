@@ -49,6 +49,8 @@ from scoring.ranker import (  # noqa: E402
     signal_weights_from_config,
 )
 from storage.db import (  # noqa: E402
+    BackupProblem,
+    backup_problem,
     get_connection,
     get_digest_send_stale,
     init_db,
@@ -640,6 +642,28 @@ def _stale_warning(stale_sources: dict[str, str | None]) -> str:
     )
 
 
+def _backup_warning(problem: BackupProblem) -> str:
+    """Warning line for a backup that is not OK (incident 2026-10-06..22: the
+    backup failed silently for two weeks, the owner sees only this digest).
+
+    Args:
+        problem: storage.db.backup_problem()'s non-None result.
+
+    Returns:
+        One paragraph: what is wrong with the backup copy and why it matters.
+    """
+    if problem.last_backup is not None:
+        what = f"резервная копия данных не делалась с {_date_ru(problem.last_backup.date())} (обычно её делают каждый день)"
+    else:
+        what = "резервная копия данных не делается"
+    # The reason stays in the log (first-user, 22 Oct 2026: a folder name in the
+    # digest left the owner with nothing to do); here: what is at risk and what to do.
+    return (
+        f"Внимание: {what}. Если сломается компьютер, накопленная история пропадёт безвозвратно. "
+        "Откройте Claude Code в папке проекта и попросите проверить резервную копию."
+    )
+
+
 def format_digest(
     results: list[CandidateScore],
     today: date,
@@ -665,19 +689,36 @@ def format_digest(
             the moment of building. Non-empty -> the text starts with a
             warning paragraph, and an empty digest no longer claims the
             system works. Empty/None -> the text is exactly as without it.
+            Independently, storage.db.backup_problem(config) is checked here:
+            a bad backup puts its own warning first (before the stale one).
 
     Returns:
         The full text, not yet truncated (send_telegram_message() does that).
     """
     header = f"Сводка за {_date_ru(today)}"
     warning = f"{_stale_warning(stale_sources)}\n\n" if stale_sources else ""
+    # The check must never cost the owner the digest itself (reviewer, 22 Oct
+    # 2026): a broken config or a file vanishing mid-scan becomes a line saying
+    # the check failed - not silence, which is how the backup failure of
+    # 6-22 Oct went unnoticed.
+    try:
+        backup = backup_problem(config)
+        backup_text = _backup_warning(backup) if backup else None
+    except Exception:
+        logger.exception("Backup check failed")
+        backup_text = (
+            "Внимание: не удалось проверить, делается ли резервная копия данных. Если так будет и завтра, "
+            "откройте Claude Code в папке проекта и попросите проверить резервную копию."
+        )
+    if backup_text:
+        warning = f"{backup_text}\n\n{warning}"
     if not results:
         if stale_sources:
             return (
                 f"{warning}{header}: сигналов не видно, но по устаревшим данным "
                 "судить об этом нельзя."
             )
-        return f"{header}: сегодня сигналов нет. Система работает, данные собираются."
+        return f"{warning}{header}: сегодня сигналов нет. Система работает, данные собираются."
 
     episodes = _build_all_episodes(conn, since_by_signal)
     multi: list[str] = []

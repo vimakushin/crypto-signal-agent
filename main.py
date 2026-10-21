@@ -54,6 +54,7 @@ import yaml
 from collectors import binance_futures, coingecko, defillama
 from signals import oi_divergence, revenue_price_gap, volume_breakout
 from storage.db import (
+    backup_problem,
     get_connection,
     get_latest_binance_oi_fetch_time,
     get_latest_coingecko_fetch_time,
@@ -79,21 +80,6 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 # "stale" only once it's overdue by more than 1.5x its expected polling
 # interval, not the moment it's a few minutes late.
 STALENESS_MULTIPLIER = 1.5
-
-# scripts/backup_db.py runs once a day (config.yaml schedule.backup_run_time
-# sets WHEN, not how often) - there's no separate "backup interval" setting
-# in config.yaml to read, so this is a plain constant, same category as
-# STALENESS_MULTIPLIER above: an operational-diagnostics tolerance, not a
-# calibrated signal threshold, so it does not belong in config.yaml either.
-BACKUP_EXPECTED_INTERVAL_HOURS = 24
-
-# Matches scripts/backup_db.py's BACKUP_FILENAME_GLOB exactly - duplicated
-# rather than imported, since importing scripts.backup_db would run that
-# module's unconditional _setup_logging() call at import time (it runs at
-# module scope, not inside main()) and stomp on this script's own
-# _setup_logging(log_filename) setup for the current --cycle. See
-# scripts/backup_db.py's own module docstring for the full backup design.
-_BACKUP_FILENAME_GLOB = "db_????????_??????.sqlite"
 
 
 def _setup_logging(log_filename: str = "scheduler.log") -> None:
@@ -680,35 +666,11 @@ def check_data_freshness(conn, config: dict) -> None:
         if elapsed_hours > expected_interval_hours * STALENESS_MULTIPLIER:
             _warn_stale(source, elapsed_hours, expected_interval_hours)
 
-    # Backup check: no storage/db.py table for this - resolve backup_dir the
-    # same way scripts/backup_db.py's main() does (explicit config value, or
-    # the project-local default), duplicated rather than imported (see
-    # _BACKUP_FILENAME_GLOB's comment above for why scripts.backup_db can't
-    # be imported here).
-    try:
-        backup_dir_str = config.get("backup", {}).get("backup_dir")
-    except Exception:
-        logger.warning(
-            "Could not read backup.backup_dir from config.yaml - falling back to default backup dir"
-        )
-        backup_dir_str = None
-
-    backup_dir = Path(backup_dir_str) if backup_dir_str else PROJECT_ROOT / "backups"
-    if not backup_dir.is_absolute():
-        backup_dir = PROJECT_ROOT / backup_dir
-
-    if not backup_dir.is_dir():
-        logger.info("No backups for %s yet, skipping freshness check", backup_dir)
-    else:
-        backups = sorted(backup_dir.glob(_BACKUP_FILENAME_GLOB))
-        if not backups:
-            logger.info("No backups in %s yet, skipping freshness check", backup_dir)
-        else:
-            latest_backup = backups[-1]
-            mtime = latest_backup.stat().st_mtime
-            elapsed_hours = (datetime.now() - datetime.fromtimestamp(mtime)).total_seconds() / 3600
-            if elapsed_hours > BACKUP_EXPECTED_INTERVAL_HOURS * STALENESS_MULTIPLIER:
-                _warn_stale(f"DB backup ({backup_dir})", elapsed_hours, BACKUP_EXPECTED_INTERVAL_HOURS)
+    # Backup check: the rule lives in storage/db.py (shared with the Telegram
+    # digest). Incident 2026-10-06..22: a missing folder / no backups used to
+    # be an INFO skip here and the backup failed silently for two weeks; now
+    # backup_problem() logs a WARNING for those cases itself.
+    backup_problem(config)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

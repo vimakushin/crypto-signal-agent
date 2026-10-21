@@ -20,6 +20,7 @@ import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "db.sqlite"
 
@@ -810,6 +811,73 @@ def sources_without_fetch_today(
         for source, iso in latest.items()
         if iso is None or datetime.fromisoformat(iso).astimezone().date() != today
     }
+
+
+# Incident 2026-10-06..22: backup.backup_dir pointed at a missing drive, the
+# daily backup failed for two weeks and nobody noticed - the old check in
+# main.py logged only INFO for "no folder / no files", and warnings went to
+# the log only. One rule for "backup is not OK" now lives here, used by
+# main.py's freshness check (log) and the Telegram digest (owner sees it).
+#
+# scripts/backup_db.py runs once a day (config.yaml schedule.backup_run_time
+# sets WHEN, not how often), so 36 h = 24 h * 1.5, the same allowance for
+# run-to-run jitter as main.py's STALENESS_MULTIPLIER. Operational tolerance,
+# not a signal threshold, hence a constant and not config.yaml.
+BACKUP_MAX_AGE_HOURS = 36
+
+# Matches scripts/backup_db.py's BACKUP_FILENAME_GLOB exactly - duplicated
+# rather than imported, since importing scripts.backup_db would run that
+# module's unconditional _setup_logging() call at import time.
+_BACKUP_FILENAME_GLOB = "db_????????_??????.sqlite"
+
+
+class BackupProblem(NamedTuple):
+    """Why the backup is not OK. `reason` is a short plain-Russian phrase;
+    `last_backup` is the newest backup's time (local, naive) or None when
+    there is no folder / no backup at all."""
+
+    reason: str
+    last_backup: datetime | None
+
+
+def backup_problem(config: dict) -> BackupProblem | None:
+    """The project's single rule for "the DB backup is not OK".
+
+    Resolves backup.backup_dir the same way scripts/backup_db.py's main()
+    does (config value, else <project>/backups; relative -> from the project
+    root). Logs a WARNING with the folder path when there is a problem.
+
+    Args:
+        config: parsed config.yaml.
+
+    Returns:
+        None if the newest db_YYYYMMDD_HHMMSS.sqlite is at most
+        BACKUP_MAX_AGE_HOURS old; otherwise a BackupProblem (folder missing /
+        no backup files in it / newest one too old, with its age).
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    backup_dir_str = (config.get("backup") or {}).get("backup_dir")
+    backup_dir = Path(backup_dir_str) if backup_dir_str else project_root / "backups"
+    if not backup_dir.is_absolute():
+        backup_dir = project_root / backup_dir
+
+    problem: BackupProblem | None = None
+    if not backup_dir.is_dir():
+        problem = BackupProblem("не найдена папка для копий", None)
+    else:
+        backups = sorted(backup_dir.glob(_BACKUP_FILENAME_GLOB))
+        if not backups:
+            problem = BackupProblem("в папке для копий нет ни одной копии", None)
+        else:
+            latest = datetime.fromtimestamp(backups[-1].stat().st_mtime)
+            age_hours = (datetime.now() - latest).total_seconds() / 3600
+            if age_hours > BACKUP_MAX_AGE_HOURS:
+                problem = BackupProblem(
+                    f"последней копии {age_hours:.0f} ч ({age_hours / 24:.1f} сут.)", latest
+                )
+    if problem:
+        logging.getLogger(__name__).warning("DB backup is not OK (%s): %s", backup_dir, problem.reason)
+    return problem
 
 
 def get_digest_send_stale(conn: sqlite3.Connection, digest_date: date) -> bool | None:

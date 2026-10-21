@@ -186,7 +186,9 @@ A row can carry a short human-written note (what lies behind the number in the d
 .venv\Scripts\python.exe scripts\backup_db.py
 ```
 
-Where backups go is set in `config.yaml` (`backup.backup_dir`), not a flag — otherwise the scheduled task, which runs the script with no arguments, would keep writing to the old location forever. If it isn't set, backups land in a local `backups\` folder inside the project (not tracked in git) — the downside being that losing the disk or the machine takes out both the original and the backups at once; pointing it at a cloud-synced folder (OneDrive, Google Drive, etc.) is safer.
+Where backups go is set in `config.yaml` (`backup.backup_dir`), not a flag — otherwise the scheduled task, which runs the script with no arguments, would keep writing to the old location forever. If it isn't set, backups land in a local `backups\` folder inside the project (not tracked in git) — the downside being that losing the disk or the machine takes out both the original and the backups at once; pointing it at a cloud-synced folder (OneDrive, Google Drive, etc.) is safer. A cloud folder only protects if its sync client is installed and signed in on this machine; the script cannot check that.
+
+If the newest backup is missing or older than 36 hours, the daily Telegram digest opens with a warning line (and the run log gets a warning). The backup failed unnoticed from 6 to 22 October 2026 because the folder sat on a drive that had disappeared; this is what makes that visible now.
 
 To change where backups are stored, edit `backup.backup_dir` in `config.yaml`. The `--backup-dir` flag still works for a manual, one-off run and overrides `config.yaml` just for that run:
 
