@@ -220,3 +220,7 @@ copy "<backup_dir>\db_YYYYMMDD_HHMMSS.sqlite" "storage\db.sqlite"
 
 - **Secrets** — `.env` isn't tracked in git; recreate it from `.env.example` (see "Setup").
 - The scheduled tasks need to be registered again (`scripts\register_scheduled_task.ps1`) — they don't travel with the code.
+
+## License
+
+[MIT](LICENSE)

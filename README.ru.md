@@ -220,3 +220,7 @@ copy "<backup_dir>\db_YYYYMMDD_HHMMSS.sqlite" "storage\db.sqlite"
 
 - **Секреты** — `.env` не хранится в git, создать заново из `.env.example` (см. «Установка»).
 - Задания Планировщика — зарегистрировать заново (`scripts\register_scheduled_task.ps1`), не переносятся вместе с кодом.
+
+## Лицензия
+
+[MIT](LICENSE)
