@@ -2,13 +2,17 @@
 
 *English | [Русский](README.ru.md)*
 
-A service that watches the crypto market for coins in the early stage of a move — before that move shows up on the price chart.
+A daily market-surveillance service. Every day it collects revenue, market cap and volume for 25 DeFi protocols, plus futures open interest for 26 major coins, from three free public sources, and flags what looks unusual — so that a person can investigate it. It does not predict prices and passes no verdict on them.
 
 ## What problem it solves
 
-By the time a coin's rally is visible on the price chart, the early opportunity is usually already gone. Instead of watching price, this service tracks three independent market signals that tend to lead it: protocol revenue growing while the token's market cap doesn't react, futures positioning building up while price stays flat, and a price breakout on abnormal volume. Every day, a Telegram bot sends a list of candidates — with a breakdown of exactly which signal fired and on what numbers.
+Unusual behaviour in market data is easy to miss, and hard to tell apart from a glitch in the data itself. The service watches for three kinds of oddity: protocol revenue growing while the token's market cap doesn't react, futures positioning building up while price stays flat, and a price breakout on abnormal volume. Every day, a Telegram bot sends a list of the coins that stood out — with a breakdown of exactly which detector fired and on what numbers. The system only marks; whether there is an explanation behind the oddity is for a human to find out.
 
-This isn't a trading bot. It never says "buy" or "sell," never names a price target, and never places an order — it only collects and ranks candidates for a human to review manually. The call is always the user's.
+This isn't a trading bot. It never says "buy" or "sell," never names a price target, and never places an order.
+
+## Where the project started
+
+It started as a search for coins in the early stage of a move, before that move shows on the price chart. That question is still open. The measurement of 15 October 2026 is why the project no longer claims it: with a base rate of about 30% (the share of "beat the market" outcomes for a random coin on a random day), telling even a strong signal from it (30% against 45%) takes 163 episodes (an episode is a run of days in which a detector stays fired on one coin), and the system produces about eight a month — roughly 20 months. On the 8 to 17 episodes so far (depending on which version of the data is used) the signal has neither been shown to beat the market nor ruled out. So finding early coins remains the owner's personal hypothesis, which they keep watching, and not something the product says about itself. Dropping a claim that can't be shown on the available data is a result of the work; the numbers are in [`BACKLOG.md`](BACKLOG.md), the plan is in [`SURVEILLANCE.md`](SURVEILLANCE.md).
 
 ## How it's built
 
@@ -33,7 +37,7 @@ All thresholds, signal weights, the watchlist and the schedule live in `config.y
 
 MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six items hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
 
-Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. A first backtest was run on 15 September 2026, but it was computed with a replay tool that looked one day ahead (found on 12 October), so its negative result counts neither for nor against the signal; a rerun with the corrected tool is planned after 15 October — see [`BACKLOG.md`](BACKLOG.md).
+Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. The backtest of 15 September 2026 was computed with a replay tool that looked one day ahead (found on 12 October) and was redone on 15 October with the corrected tool: the share of "it worked" among episodes is not above a random coin's, and the sample is far too small to settle it either way — see "Where the project started" above and [`BACKLOG.md`](BACKLOG.md).
 
 ## How the project was built
 
