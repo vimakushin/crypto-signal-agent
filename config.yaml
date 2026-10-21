@@ -360,12 +360,17 @@ backup:
   # backup_db.py with no arguments at all - if this path only existed as a
   # CLI flag, the scheduled task would silently keep writing to the old
   # location until someone remembered to edit the .ps1 and re-register it.
-  # Points inside the user's OneDrive folder (a subfolder of its own), not at
-  # a drive letter: until 22 Oct 2026 this was "G:\My Drive\..." (Google
-  # Drive), the G: drive disappeared, and from 6 Oct the daily backup failed
-  # every day with "[WinError 3] The system cannot find the path specified:
-  # 'G:\'" - two weeks with no backup, noticed only by the audit. A folder
-  # under the user profile doesn't vanish when a drive is unplugged. See
-  # backup_db.py's module docstring for why a cloud-synced folder is worth
-  # pointing this at instead of the project-local default.
-  backup_dir: "C:\\Users\\vital\\OneDrive\\crypto-signal-agent-backups"
+  # Points inside the local Google Drive sync folder (G:\My Drive), NOT the
+  # drive's root, so backups land in their own subfolder rather than mixed in
+  # among everything else already synced there - see backup_db.py's module
+  # docstring for why a cloud-synced folder is worth pointing this at instead
+  # of the project-local default.
+  # History: from 6 to 22 Oct 2026 the daily backup failed every day with
+  # "[WinError 3] The system cannot find the path specified: 'G:\'" because
+  # Google Drive was not running and the G: drive was absent - two weeks with
+  # no backup, noticed only by the audit. On 22 Oct the path was briefly moved
+  # to a OneDrive folder, but OneDrive turned out not to be installed on this
+  # machine (the folder was just a local directory), so on 23 Oct the path
+  # went back here once Google Drive was running again. If G: is missing the
+  # digest now opens with a warning (storage/db.py's backup_problem).
+  backup_dir: "G:\\My Drive\\crypto-signal-agent-backups"
