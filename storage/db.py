@@ -616,14 +616,17 @@ MARKET_POINT_TOLERANCE_HOURS = 1
 
 
 def get_market_change(
-    conn: sqlite3.Connection, symbols: list[str], start_iso: str, end_iso: str
+    conn: sqlite3.Connection, symbols: list[str], start_iso: str, end_iso: str,
+    exclude: str | None = None,
 ) -> MarketChange:
     """Median price change (%) of `symbols` between two moments, from
     binance_oi_snapshots - the "market background" shown next to a coin's own
     move in the digest.
 
     Median, not mean: one coin that flew (or crashed) by 80% must not shift
-    the background. The window must be the coin's own window, otherwise the
+    the background. A coin whose own move is shown next to the background is
+    passed as `exclude`: otherwise it takes part in its own comparison. The
+    window must be the coin's own window, otherwise the
     two numbers are not comparable.
 
     For every symbol the stored point nearest to each moment is taken, if it
@@ -636,10 +639,14 @@ def get_market_change(
         symbols: Binance Futures tickers (config.yaml watchlist).
         start_iso: ISO 8601 start of the window.
         end_iso: ISO 8601 end of the window.
+        exclude: ticker to leave out of the median (the card's own coin);
+            ignored if it is not in `symbols`. `total` and the "half" threshold
+            are then counted without it.
 
     Returns:
         MarketChange; median_pct is None (with `reason`) if not computed.
     """
+    symbols = [s for s in symbols if s != exclude]
     total = len(symbols)
     changes: list[float] = []
     for symbol in symbols:

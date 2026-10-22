@@ -598,20 +598,34 @@ _MARKET_WINDOWS = {
 
 
 def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
-    """One line with the median move of the 26 watchlist coins over the same
-    window as the coin's own number. Facts only, no comparison or verdict.
+    """One line with the median move of the 26 watchlist coins (without the
+    card's own coin, if it is one of them) over the same window as the coin's
+    own number. Facts only, no comparison or verdict.
     Any exception is logged and replaced by a plain line: the background must
     never cost the owner the digest.
     """
     try:
         symbols = config["watchlist"]["binance_futures_symbols"]
         start, end, when = _MARKET_WINDOWS[contribution.signal_name](contribution.details, conn, slug)
-        change = get_market_change(conn, symbols, start, end)
+        # The card's own coin must not sit in its own background. oi_divergence:
+        # the slug is the Binance ticker. revenue_price_gap: the protocol's token
+        # symbol + USDT, exact match only (of 25 protocols only AAVE matches).
+        if contribution.signal_name == "oi_divergence":
+            own = slug
+        else:
+            row = conn.execute(
+                "SELECT symbol FROM defillama_snapshots WHERE protocol_slug = ? "
+                "ORDER BY fetched_at DESC LIMIT 1", (slug,),
+            ).fetchone()
+            own = f"{row['symbol']}USDT" if row and row["symbol"] else None
+        excluded = own in symbols
+        change = get_market_change(conn, symbols, start, end, exclude=own)
         if change.median_pct is None:
             return f"Рыночный фон {when[1]} посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
         coins = f"{change.total}" if change.n == change.total else f"по {change.n} из {change.total}"
+        others = ", кроме этой" if excluded else ""
         value = _signed(change.median_pct).replace(".", ",")
-        return f"Рынок {when[0]} (медиана изменения цены {coins} крупных монет Binance): {value}%."
+        return f"Рынок {when[0]} (медиана изменения цены {coins} крупных монет Binance{others}): {value}%."
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
         return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
