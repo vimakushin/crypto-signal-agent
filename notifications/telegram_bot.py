@@ -27,7 +27,7 @@ import math
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
@@ -53,6 +53,7 @@ from storage.db import (  # noqa: E402
     backup_problem,
     get_connection,
     get_digest_send_stale,
+    get_market_change,
     init_db,
     record_digest_sent,
     sources_without_fetch_today,
@@ -540,7 +541,7 @@ def _digest_text_oi_divergence(details: dict, config: dict) -> str:
     return (
         f"Открытый интерес по фьючерсам Binance вырос на {details['oi_growth_pct']:.0f}% "
         f"за {details['lookback_hours']:.0f} ч, а цена за это время изменилась на "
-        f"{_signed(details['price_change_pct'])}%."
+        f"{_signed(details['price_change_pct']).replace('.', ',')}%."
     )
 
 
@@ -551,8 +552,74 @@ _DIGEST_TEXTS = {
 }
 
 
-def _digest_signal_text(contribution, config: dict) -> str:
-    """Plain-language sentence for one SignalContribution. Unknown
+def _revenue_market_window(details: dict, conn, slug: str) -> tuple[str, str, tuple[str, str]]:
+    """Window of the coin's cap change: the moments the two market-cap
+    snapshots were really taken (they drift between 08:00 and 11:00 UTC, so a
+    fixed hour would shift the window). details holds only the dates, hence
+    the lookup of the last snapshot of each date. LookupError if one is gone.
+    """
+    moments = []
+    for key in ("mcap_date_earlier", "mcap_date_latest"):
+        row = conn.execute(
+            "SELECT fetched_at FROM defillama_snapshots "
+            "WHERE protocol_slug = ? AND date(fetched_at) = ? ORDER BY fetched_at DESC LIMIT 1",
+            (slug, details[key]),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"no defillama snapshot for {slug} on {details[key]}")
+        moments.append(row["fetched_at"])
+    return moments[0], moments[1], ("за те же даты", "за эти даты")
+
+
+def _oi_market_window(details: dict, conn, slug: str) -> tuple[str, str, tuple[str, str]]:
+    """Window of the coin's price change. details has no timestamps, only
+    oi_now/price_now, which identify the exact stored point the signal ended
+    on; the start is that moment minus the real elapsed lookback_hours.
+    LookupError if the point is gone.
+    """
+    row = conn.execute(
+        "SELECT oi_timestamp FROM binance_oi_snapshots WHERE symbol = ? AND oi = ? AND price = ? "
+        "ORDER BY oi_timestamp DESC LIMIT 1",
+        (slug, details["oi_now"], details["price_now"]),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"no stored point for {slug} with oi_now/price_now from the signal")
+    end = datetime.fromisoformat(row["oi_timestamp"])
+    start = end - timedelta(hours=details["lookback_hours"])
+    return start.isoformat(), row["oi_timestamp"], ("за то же время", "за это время")
+
+
+# Only signals that show the coin's own % move get a background; volume_breakout
+# shows no move, so there is nothing to compare the market with.
+_MARKET_WINDOWS = {
+    "revenue_price_gap": _revenue_market_window,
+    "oi_divergence": _oi_market_window,
+}
+
+
+def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
+    """One line with the median move of the 26 watchlist coins over the same
+    window as the coin's own number. Facts only, no comparison or verdict.
+    Any exception is logged and replaced by a plain line: the background must
+    never cost the owner the digest.
+    """
+    try:
+        symbols = config["watchlist"]["binance_futures_symbols"]
+        start, end, when = _MARKET_WINDOWS[contribution.signal_name](contribution.details, conn, slug)
+        change = get_market_change(conn, symbols, start, end)
+        if change.median_pct is None:
+            return f"Рыночный фон {when[1]} посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
+        coins = f"{change.total}" if change.n == change.total else f"по {change.n} из {change.total}"
+        value = _signed(change.median_pct).replace(".", ",")
+        return f"Рынок {when[0]} (медиана изменения цены {coins} крупных монет Binance): {value}%."
+    except Exception:
+        logger.exception("Market background failed for %s", contribution.signal_name)
+        return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
+
+
+def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
+    """Plain-language sentence for one SignalContribution, plus a market
+    background line for signals that show the coin's own % move. Unknown
     signal_name or a broken details dict falls back to the generic line
     (and a warning) so one bad row can't sink the whole digest.
     """
@@ -562,10 +629,13 @@ def _digest_signal_text(contribution, config: dict) -> str:
         logger.warning("Digest: no plain-language text for signal %s", contribution.signal_name)
         return generic
     try:
-        return text_fn(contribution.details, config)
+        text = text_fn(contribution.details, config)
     except (TypeError, ValueError, KeyError) as exc:
         logger.warning("Digest: could not format details for %s: %s", contribution.signal_name, exc)
         return generic
+    if contribution.signal_name in _MARKET_WINDOWS:
+        text += "\n" + _market_background_line(contribution, slug, conn, config)
+    return text
 
 
 def _coin_label(conn, candidate: CandidateScore) -> str:
@@ -725,7 +795,7 @@ def format_digest(
     single: list[str] = []
     for candidate in results:
         title = f"{_coin_label(conn, candidate)} · {_freshness_label(candidate, episodes)}"
-        texts = [_digest_signal_text(c, config) for c in candidate.contributions]
+        texts = [_digest_signal_text(c, config, conn, candidate.protocol_slug) for c in candidate.contributions]
         if len({c.signal_name for c in candidate.contributions}) >= 2:
             body = "\n".join(f"• {t}" for t in texts)
             multi.append(f"{title} · скор {candidate.total_score:.2f}\n{body}")

@@ -599,6 +599,77 @@ def get_binance_oi_snapshot_hours_before(
     ).fetchone()
 
 
+class MarketChange(NamedTuple):
+    """Result of get_market_change(). median_pct is None when the background
+    could not be computed; `reason` then says why, in plain Russian."""
+    median_pct: float | None
+    n: int
+    total: int
+    reason: str | None
+
+
+# Stored points are hourly since 8 Sep 2026, every 4 hours before that. A
+# point within an hour of the requested moment is "the price at that moment"
+# (at most half an hour off on the hourly grid); a wider tolerance would let
+# a data gap quietly turn into a different time window than the coin's own.
+MARKET_POINT_TOLERANCE_HOURS = 1
+
+
+def get_market_change(
+    conn: sqlite3.Connection, symbols: list[str], start_iso: str, end_iso: str
+) -> MarketChange:
+    """Median price change (%) of `symbols` between two moments, from
+    binance_oi_snapshots - the "market background" shown next to a coin's own
+    move in the digest.
+
+    Median, not mean: one coin that flew (or crashed) by 80% must not shift
+    the background. The window must be the coin's own window, otherwise the
+    two numbers are not comparable.
+
+    For every symbol the stored point nearest to each moment is taken, if it
+    lies within MARKET_POINT_TOLERANCE_HOURS. A symbol missing either point
+    is left out. If fewer than half of `symbols` remain, no number is given:
+    a median of a handful of coins is not a market background.
+
+    Args:
+        conn: open connection.
+        symbols: Binance Futures tickers (config.yaml watchlist).
+        start_iso: ISO 8601 start of the window.
+        end_iso: ISO 8601 end of the window.
+
+    Returns:
+        MarketChange; median_pct is None (with `reason`) if not computed.
+    """
+    total = len(symbols)
+    changes: list[float] = []
+    for symbol in symbols:
+        prices = []
+        for moment in (start_iso, end_iso):
+            row = conn.execute(
+                """
+                SELECT price FROM binance_oi_snapshots
+                WHERE symbol = ? AND price > 0
+                  AND round(abs(julianday(oi_timestamp) - julianday(?)) * 24, 3) <= ?
+                ORDER BY abs(julianday(oi_timestamp) - julianday(?))
+                LIMIT 1
+                """,
+                (symbol, moment, MARKET_POINT_TOLERANCE_HOURS, moment),
+            ).fetchone()
+            prices.append(row["price"] if row else None)
+        if prices[0] is not None and prices[1] is not None:
+            changes.append((prices[1] - prices[0]) / prices[0] * 100)
+    if len(changes) * 2 < total:
+        return MarketChange(
+            None, len(changes), total,
+            f"в базе есть цены Binance на оба момента только по {len(changes)} из {total} монет, "
+            "а для медианы нужна хотя бы половина",
+        )
+    changes.sort()
+    mid = len(changes) // 2
+    median = changes[mid] if len(changes) % 2 else (changes[mid - 1] + changes[mid]) / 2
+    return MarketChange(median, len(changes), total, None)
+
+
 def save_coingecko_price_history(conn: sqlite3.Connection, records: list[dict]) -> None:
     """Persist daily price/volume points from
     collectors/coingecko.py's collect_price_volume_history(), or historical
