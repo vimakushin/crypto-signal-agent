@@ -669,7 +669,7 @@ def get_market_change(
         return MarketChange(
             None, len(changes), total,
             f"в базе есть цены Binance на оба момента только по {len(changes)} из {total} монет, "
-            "а для медианы нужна хотя бы половина",
+            "а для серединного значения нужна хотя бы половина",
         )
     changes.sort()
     mid = len(changes) // 2

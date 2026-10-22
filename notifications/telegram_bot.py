@@ -27,7 +27,7 @@ import math
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
@@ -295,15 +295,22 @@ _MARK_ONE_DAY = (
     "самый крупный день дал {share:.0f}% выручки этих дней "
     "(обычно у этой монеты — {habitual:.0f}%)"
 )
-_DAILY_LINE = "Выручка по дням, {dates}, тыс. $: {numbers}"
+_DAILY_LINE = "Выручка по дням, {dates}{note}, тыс. $: {numbers}"
 # Headline sentence of the digest. Every date and number in it is the one the
 # signal was really computed from (details_json: revenue_window_*,
 # baseline_window_*, mcap_date_*).
 _HEADLINE = (
     "Медиана дневной выручки за {revenue_dates}{revenue_note} на {growth:.0f}% выше, чем за "
-    "{baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни). "
-    "Капитализация токена {mcap_dates} изменилась на {mcap}%."
+    "{baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)."
 )
+# The market cap is a different quantity from the price the market is compared
+# with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), so it stands on its own
+# line and says so - the price/market pair is a separate block below.
+_MCAP_LINE = "Капитализация токена {mcap_dates} изменилась на {mcap}%"
+_MCAP_NOT_COMPARED = " (в сравнении с рынком выше она не участвует)"
+# Start of the price/market block; the market-cap line points at the block
+# only when this block is really shown.
+_BACKGROUND_TITLE = "Цена монеты и рынка, "
 _CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
@@ -324,11 +331,13 @@ def _daily_numbers(values: list) -> str:
     return " · ".join(parts)
 
 
-def _revenue_mark_texts(details: dict) -> RevenueMarkTexts:
+def _revenue_mark_texts(details: dict, daily_note: str = "") -> RevenueMarkTexts:
     """Texts for revenue_price_gap's marks and the daily-numbers line.
 
     Args:
         details: the saved details_json dict of a revenue_price_gap event.
+        daily_note: text put right after the dates of the daily-numbers line
+            (the digest uses it to say which of these days the median covers).
 
     Returns:
         RevenueMarkTexts. Old events saved before the marks existed lack the
@@ -358,7 +367,7 @@ def _revenue_mark_texts(details: dict) -> RevenueMarkTexts:
             date.fromisoformat(details["shape_window_last"]),
         )
         daily_line = _DAILY_LINE.format(
-            dates=dates, numbers=_daily_numbers(details["shape_window_values"])
+            dates=dates, note=daily_note, numbers=_daily_numbers(details["shape_window_values"])
         )
 
     check_failed = None
@@ -482,9 +491,7 @@ def _revenue_headline(details: dict) -> str:
     saved before the window dates were stored raises KeyError, which
     _digest_signal_text catches.
     """
-    mcap = _signed(details["mcap_growth_pct"]).replace(".", ",")
     latest_day = date.fromisoformat(details["mcap_date_latest"])
-    earlier_day = date.fromisoformat(details["mcap_date_earlier"])
     revenue_last = date.fromisoformat(details["revenue_window_last"])
     revenue_note = ""
     if details["revenue_window_count"] < details["lookback_days"]:
@@ -492,10 +499,6 @@ def _revenue_headline(details: dict) -> str:
         if revenue_last < latest_day:
             revenue_note += f"; за {_date_ru(latest_day)} данных ещё нет"
         revenue_note += ")"
-    if (earlier_day.year, earlier_day.month) == (latest_day.year, latest_day.month):
-        mcap_dates = f"с {earlier_day.day} по {_date_ru(latest_day)}"
-    else:
-        mcap_dates = f"с {_date_ru(earlier_day)} по {_date_ru(latest_day)}"
     baseline_first = date.fromisoformat(details["baseline_window_first"])
     baseline_last = date.fromisoformat(details["baseline_window_last"])
     baseline_count = details["baseline_window_count"]
@@ -509,16 +512,48 @@ def _revenue_headline(details: dict) -> str:
         baseline_count=baseline_count,
         baseline_days_word=baseline_days_word,
         baseline_dates=_date_range_ru(baseline_first, baseline_last),
-        mcap_dates=mcap_dates,
-        mcap=mcap,
     )
 
 
-def _digest_text_revenue_price_gap(details: dict, config: dict) -> str:
-    """Headline first, then what is visible in the daily numbers (marks), the
-    'cannot compare' line if any, and the daily numbers last."""
-    texts = _revenue_mark_texts(details)
+def _revenue_mcap_line(details: dict, compared: bool) -> str:
+    """The market-cap sentence with its own dates (the dates of the two
+    DeFiLlama snapshots the signal compared). The remark about the market
+    comparison is added only when `compared` - the comparison is shown.
+    """
+    latest_day = date.fromisoformat(details["mcap_date_latest"])
+    earlier_day = date.fromisoformat(details["mcap_date_earlier"])
+    if (earlier_day.year, earlier_day.month) == (latest_day.year, latest_day.month):
+        mcap_dates = f"с {earlier_day.day} по {_date_ru(latest_day)}"
+    else:
+        mcap_dates = f"с {_date_ru(earlier_day)} по {_date_ru(latest_day)}"
+    return _MCAP_LINE.format(
+        mcap_dates=mcap_dates, mcap=_signed(details["mcap_growth_pct"]).replace(".", ",")
+    ) + (_MCAP_NOT_COMPARED if compared else "") + "."
+
+
+def _digest_text_revenue_price_gap(details: dict, config: dict, background: str = "") -> str:
+    """Headline, the price/market block (`background`, if any), market cap, then what is visible in the daily numbers
+    (marks), the 'cannot compare' line if any, and the daily numbers last.
+
+    The median covers the last `lookback_days` calendar days ending on the day
+    of the latest snapshot (today's revenue is usually not published yet, so
+    6 of 7), while the seven daily numbers always end on the last day that has
+    data - they are the days the marks above them were computed on, so they
+    cannot be cut to the median's days without contradicting the marks. When
+    the two ranges differ, the daily line says which of its days the median
+    covers.
+    """
+    first = date.fromisoformat(details["revenue_window_first"])
+    last = date.fromisoformat(details["revenue_window_last"])
+    shape_first = date.fromisoformat(details["shape_window_first"]) if "shape_window_first" in details else None
+    note = ""
+    if shape_first is not None and (shape_first, date.fromisoformat(details["shape_window_last"])) != (first, last):
+        note = f" (в медиану выше вошли {_date_range_ru(first, last)})"
+    texts = _revenue_mark_texts(details, note)
     lines = [_revenue_headline(details)]
+    if background:
+        lines += ["", background, ""]
+    lines.append(_revenue_mcap_line(details, background.startswith(_BACKGROUND_TITLE)))
     if texts.marks:
         lines.append(_MARK_PREFIX + "; ".join(texts.marks) + ".")
     if texts.check_failed:
@@ -541,7 +576,8 @@ def _digest_text_oi_divergence(details: dict, config: dict) -> str:
     return (
         f"Открытый интерес по фьючерсам Binance вырос на {details['oi_growth_pct']:.0f}% "
         f"за {details['lookback_hours']:.0f} ч, а цена за это время изменилась на "
-        f"{_signed(details['price_change_pct']).replace('.', ',')}%."
+        f"{_signed(details['price_change_pct']).replace('.', ',')}%. "
+        f"С рынком ниже сравнивается цена, а не рост интереса."
     )
 
 
@@ -552,61 +588,91 @@ _DIGEST_TEXTS = {
 }
 
 
-def _revenue_market_window(details: dict, conn, slug: str) -> tuple[str, str, tuple[str, str]]:
-    """Window of the coin's cap change: the moments the two market-cap
-    snapshots were really taken (they drift between 08:00 and 11:00 UTC, so a
-    fixed hour would shift the window). details holds only the dates, hence
-    the lookup of the last snapshot of each date. LookupError if one is gone.
+class _PriceWindow(NamedTuple):
+    """The two moments of a card's price comparison. coin_pct is the coin's
+    own PRICE change between them (None if the coin's price is not in the
+    database); start/end are ISO moments of the coin's own prices, so the
+    market points are looked up next to exactly these. text is the window as
+    shown to the reader, in UTC.
     """
-    moments = []
+    start: str
+    end: str
+    coin_pct: float | None
+    text: str
+
+
+def _moment_ru(iso: str) -> str:
+    """'2026-10-15T00:00:00+00:00' -> '15 октября 00:00' (UTC)."""
+    moment = datetime.fromisoformat(iso).astimezone(timezone.utc)
+    return f"{_date_ru(moment.date())} {moment:%H:%M}"
+
+
+def _window_text(start: str, end: str) -> str:
+    return f"с {_moment_ru(start)} по {_moment_ru(end)} (время UTC)"
+
+
+def _revenue_price_window(details: dict, conn, slug: str) -> _PriceWindow:
+    """Price window of a revenue_price_gap card: CoinGecko's daily price of
+    the coin on the two dates of the market-cap comparison. A daily CoinGecko
+    price is the point of 00:00 UTC of its date (checked 22 Oct 2026 against
+    the live market_chart answer: every stored value equals the 00:00 point,
+    also the last day's, although it is collected at ~09:00 UTC), so the
+    moments are those dates at 00:00 UTC. A date with no price row (one of
+    the 25 protocols is missing on many days) gives coin_pct None - never
+    zero and never a neighbouring day.
+    """
+    prices = []
     for key in ("mcap_date_earlier", "mcap_date_latest"):
         row = conn.execute(
-            "SELECT fetched_at FROM defillama_snapshots "
-            "WHERE protocol_slug = ? AND date(fetched_at) = ? ORDER BY fetched_at DESC LIMIT 1",
+            "SELECT price FROM coingecko_price_history WHERE protocol_slug = ? AND date = ? AND price > 0",
             (slug, details[key]),
         ).fetchone()
-        if row is None:
-            raise LookupError(f"no defillama snapshot for {slug} on {details[key]}")
-        moments.append(row["fetched_at"])
-    return moments[0], moments[1], ("за те же даты", "за эти даты")
+        prices.append(row["price"] if row else None)
+    start = f"{details['mcap_date_earlier']}T00:00:00+00:00"
+    end = f"{details['mcap_date_latest']}T00:00:00+00:00"
+    coin_pct = None if None in prices else (prices[1] - prices[0]) / prices[0] * 100
+    return _PriceWindow(start, end, coin_pct, _window_text(start, end))
 
 
-def _oi_market_window(details: dict, conn, slug: str) -> tuple[str, str, tuple[str, str]]:
-    """Window of the coin's price change. details has no timestamps, only
-    oi_now/price_now, which identify the exact stored point the signal ended
-    on; the start is that moment minus the real elapsed lookback_hours.
-    LookupError if the point is gone.
+def _oi_price_window(details: dict, conn, slug: str) -> _PriceWindow:
+    """Price window of an oi_divergence card: the exact stored hourly points
+    the signal's price_before / price_now come from (details has only the
+    values, so they are found by value, as the digest always did). The coin's
+    number is the signal's own price_change_pct. LookupError if a point is gone.
     """
-    row = conn.execute(
-        "SELECT oi_timestamp FROM binance_oi_snapshots WHERE symbol = ? AND oi = ? AND price = ? "
-        "ORDER BY oi_timestamp DESC LIMIT 1",
-        (slug, details["oi_now"], details["price_now"]),
-    ).fetchone()
-    if row is None:
-        raise LookupError(f"no stored point for {slug} with oi_now/price_now from the signal")
-    end = datetime.fromisoformat(row["oi_timestamp"])
-    start = end - timedelta(hours=details["lookback_hours"])
-    return start.isoformat(), row["oi_timestamp"], ("за то же время", "за это время")
+    moments = []
+    for oi_key, price_key in (("oi_before", "price_before"), ("oi_now", "price_now")):
+        row = conn.execute(
+            "SELECT oi_timestamp FROM binance_oi_snapshots WHERE symbol = ? AND oi = ? AND price = ? "
+            "ORDER BY oi_timestamp DESC LIMIT 1",
+            (slug, details[oi_key], details[price_key]),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"no stored point for {slug} with {oi_key}/{price_key} from the signal")
+        moments.append(row["oi_timestamp"])
+    return _PriceWindow(moments[0], moments[1], details["price_change_pct"], _window_text(*moments))
 
 
 # Only signals that show the coin's own % move get a background; volume_breakout
 # shows no move, so there is nothing to compare the market with.
-_MARKET_WINDOWS = {
-    "revenue_price_gap": _revenue_market_window,
-    "oi_divergence": _oi_market_window,
+_PRICE_WINDOWS = {
+    "revenue_price_gap": _revenue_price_window,
+    "oi_divergence": _oi_price_window,
 }
 
 
 def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
-    """One line with the median move of the 26 watchlist coins (without the
-    card's own coin, if it is one of them) over the same window as the coin's
-    own number. Facts only, no comparison or verdict.
-    Any exception is logged and replaced by a plain line: the background must
-    never cost the owner the digest.
+    """The block comparing the coin's PRICE change with the median price change
+    of the watchlist coins over the same two moments. Both numbers are prices
+    (the coin's market cap or open-interest growth is never compared). Facts
+    only, no verdict. Any exception is logged and replaced by a plain line: the
+    background must never cost the owner the digest.
     """
     try:
         symbols = config["watchlist"]["binance_futures_symbols"]
-        start, end, when = _MARKET_WINDOWS[contribution.signal_name](contribution.details, conn, slug)
+        window = _PRICE_WINDOWS[contribution.signal_name](contribution.details, conn, slug)
+        if window.coin_pct is None:
+            return "Цену монеты за эти даты взять не удалось, сравнить с рынком нельзя."
         # The card's own coin must not sit in its own background. oi_divergence:
         # the slug is the Binance ticker. revenue_price_gap: the protocol's token
         # symbol + USDT, exact match only (of 25 protocols only AAVE matches).
@@ -618,14 +684,28 @@ def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
                 "ORDER BY fetched_at DESC LIMIT 1", (slug,),
             ).fetchone()
             own = f"{row['symbol']}USDT" if row and row["symbol"] else None
+        ticker = own.removesuffix("USDT") if own else "эта монета"
         excluded = own in symbols
-        change = get_market_change(conn, symbols, start, end, exclude=own)
+        change = get_market_change(conn, symbols, window.start, window.end, exclude=own)
         if change.median_pct is None:
-            return f"Рыночный фон {when[1]} посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
-        coins = f"{change.total}" if change.n == change.total else f"по {change.n} из {change.total}"
-        others = ", кроме этой" if excluded else ""
+            return f"Рынок посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
+        examples = ", ".join(s.removesuffix("USDT") for s in symbols[:3])
         value = _signed(change.median_pct).replace(".", ",")
-        return f"Рынок {when[0]} (медиана изменения цены {coins} крупных монет Binance{others}): {value}%."
+        coin = _signed(window.coin_pct).replace(".", ",")
+        who = f"монета {ticker}" if own else "монета"
+        lines = [
+            f"{_BACKGROUND_TITLE}{window.text}:",
+            f"{who} {coin}%, рынок {value}%.",
+            f"Рынок — серединное значение (половина монет изменилась сильнее, половина слабее) "
+            f"по {len(symbols)} монетам Binance, за которыми следит сервис ({examples} и др.).",
+        ]
+        if excluded:
+            lines[-1] += f" Эта монета в их числе, поэтому взяты остальные {change.total}."
+        else:
+            lines[-1] += " Этой монеты среди них нет."
+        if change.n < change.total:
+            lines[-1] += f" Цены на эти моменты нашлись у {change.n} из {change.total}, у остальных их нет в базе."
+        return "\n".join(lines)
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
         return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
@@ -642,13 +722,18 @@ def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
     if text_fn is None:
         logger.warning("Digest: no plain-language text for signal %s", contribution.signal_name)
         return generic
+    background = ""
+    if contribution.signal_name in _PRICE_WINDOWS:
+        background = _market_background_line(contribution, slug, conn, config)
     try:
+        if contribution.signal_name == "revenue_price_gap":
+            return text_fn(contribution.details, config, background)
         text = text_fn(contribution.details, config)
     except (TypeError, ValueError, KeyError) as exc:
         logger.warning("Digest: could not format details for %s: %s", contribution.signal_name, exc)
         return generic
-    if contribution.signal_name in _MARKET_WINDOWS:
-        text += "\n" + _market_background_line(contribution, slug, conn, config)
+    if background:
+        text += "\n\n" + background
     return text
 
 
