@@ -2,7 +2,7 @@
 
 *English | [Русский](README.ru.md)*
 
-A daily market-surveillance service. Every day it collects revenue, market cap and volume for 25 DeFi protocols, plus futures open interest for 26 major coins, from three free public sources, and flags what looks unusual — so that a person can investigate it. It does not predict prices and passes no verdict on them.
+A daily market-surveillance service. Every day it collects revenue, market cap and volume for 25 DeFi protocols, plus futures open interest and daily trading volume for 26 coins, from three free public sources, and flags what looks unusual — so that a person can investigate it. It does not predict prices and passes no verdict on them.
 
 ## What problem it solves
 
@@ -21,7 +21,7 @@ collectors/  →  signals/  →  scoring/  →  notifications/
 (data collection) (detectors)  (ranking)   (digest)
 ```
 
-- **Collectors** (`collectors/`) pull history from three free public APIs — DeFiLlama (protocol revenue/fees and market cap), Binance Futures (Open Interest, no API key required) and CoinGecko (price/volume) — and accumulate it in a local SQLite database (`storage/`), so signals can compare "now" against "before" without re-hitting the source every time.
+- **Collectors** (`collectors/`) pull history from three free public APIs — DeFiLlama (protocol revenue/fees and market cap), Binance Futures (Open Interest and daily volume of the 26 watchlist coins, no API key required) and CoinGecko (price/volume) — and accumulate it in a local SQLite database (`storage/`), so signals can compare "now" against "before" without re-hitting the source every time.
 - **Signal detectors** (`signals/`) — three independent modules:
   - **revenue-gap** — protocol revenue grew X% over 7-30 days while the token's market cap didn't react;
   - **OI divergence** — futures Open Interest grew X% while price barely moved;

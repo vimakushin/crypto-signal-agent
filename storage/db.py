@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -174,6 +174,17 @@ CREATE TABLE IF NOT EXISTS digest_sends (
     digest_date TEXT PRIMARY KEY,
     sent_at TEXT NOT NULL,
     stale INTEGER NOT NULL DEFAULT 0
+);
+
+-- Closed daily candles of the watchlist Binance Futures coins (volume in USDT),
+-- for the volume part of the digest's market background. Only closed UTC days
+-- are stored, so a row never changes after it is written.
+CREATE TABLE IF NOT EXISTS binance_daily_volume (
+    symbol TEXT NOT NULL,
+    date TEXT NOT NULL,
+    quote_volume_usdt REAL NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, date)
 );
 
 CREATE TABLE IF NOT EXISTS signal_events (
@@ -665,6 +676,11 @@ def get_market_change(
             prices.append(row["price"] if row else None)
         if prices[0] is not None and prices[1] is not None:
             changes.append((prices[1] - prices[0]) / prices[0] * 100)
+    if not changes and total:
+        return MarketChange(
+            None, 0, total,
+            f"в базе нет цен Binance на оба момента ни по одной из {total} монет",
+        )
     if len(changes) * 2 < total:
         return MarketChange(
             None, len(changes), total,
@@ -675,6 +691,124 @@ def get_market_change(
     mid = len(changes) // 2
     median = changes[mid] if len(changes) % 2 else (changes[mid - 1] + changes[mid]) / 2
     return MarketChange(median, len(changes), total, None)
+
+
+def save_binance_daily_volume(conn: sqlite3.Connection, records: list[dict]) -> None:
+    """Persist closed daily candles from collectors/binance_futures.py's
+    collect_daily_volume(). INSERT OR IGNORE on (symbol, date): a closed day's
+    volume does not change, so re-fetching the last days every run is a no-op
+    for days already stored and never rewrites an existing row.
+    """
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO binance_daily_volume (symbol, date, quote_volume_usdt, fetched_at)
+        VALUES (:symbol, :date, :quote_volume_usdt, :fetched_at)
+        """,
+        records,
+    )
+    conn.commit()
+
+
+DAILY_VOLUME_FIRST_RUN_DAYS = 60  # 30-day average window plus a month of events to look back at
+
+
+def daily_volume_fetch_limit(conn: sqlite3.Connection, symbols: list[str]) -> int:
+    """How many latest daily candles to ask Binance for: the full
+    DAILY_VOLUME_FIRST_RUN_DAYS if any of `symbols` (the current watchlist)
+    has no stored day yet, otherwise just enough to cover the days since the
+    stalest of them last stored a day (plus a margin of two for the
+    still-open day and a day's overlap), at most the full history. Counted
+    over the watchlist itself, not over the table: a coin added to the
+    watchlist later must get the full history, and a coin removed from it
+    must not hold the "stalest" day back.
+    """
+    last_days = []
+    for symbol in symbols:
+        last = conn.execute(
+            "SELECT MAX(date) FROM binance_daily_volume WHERE symbol = ?", (symbol,)
+        ).fetchone()[0]
+        if last is None:
+            return DAILY_VOLUME_FIRST_RUN_DAYS
+        last_days.append(last)
+    stalest = date.fromisoformat(min(last_days))
+    return min(DAILY_VOLUME_FIRST_RUN_DAYS, (datetime.now(timezone.utc).date() - stalest).days + 2)
+
+
+class MarketVolume(NamedTuple):
+    """Result of get_market_volume_ratio(). median_ratio is None when the
+    background could not be computed; `reason` then says why, in Russian."""
+    median_ratio: float | None
+    n: int
+    total: int
+    reason: str | None
+
+
+# Why ratios and not volumes: each coin is compared with its OWN average, so
+# Binance Futures volume of the market coins can be set next to a coin whose
+# volume comes from CoinGecko (all venues, spot and derivatives) - the levels
+# differ (AAVE: CoinGecko ~2.7x Binance Futures), the "times its usual" does
+# not. Limitation: futures volume swings harder than spot volume, so the
+# median of futures ratios may run slightly higher than a spot one would.
+# Days: a CoinGecko daily point dated D is the 24 h that ENDED at 00:00 UTC of
+# D, i.e. Binance day D-1 (checked 22 Oct 2026 on AAVE, 198 days: correlation
+# of day-to-day changes 0.92 at that shift vs -0.15 at shift 0). The caller
+# passes the Binance day, not the CoinGecko date.
+
+
+def get_market_volume_ratio(
+    conn: sqlite3.Connection, symbols: list[str], day: str, avg_days: int, exclude: str | None = None,
+) -> MarketVolume:
+    """Median over `symbols` of (volume of Binance day `day`) / (mean volume of
+    the `avg_days` days before it; `day` itself is not in the mean, as in
+    signals/volume_breakout.py). A coin with no volume for `day`, or with fewer
+    than avg_days stored days before it, is left out. If fewer than half
+    of the coins remain, no number is given. `exclude` (the card's own coin) is
+    left out of the median, `total` and the half threshold, as in
+    get_market_change.
+
+    Args:
+        conn: open connection.
+        symbols: Binance Futures tickers (config.yaml watchlist).
+        day: YYYY-MM-DD, the closed Binance (UTC) day to measure.
+        avg_days: length of the average window (the signal's volume_avg_lookback_days).
+        exclude: ticker to leave out; ignored if it is not in `symbols`.
+
+    Returns:
+        MarketVolume; median_ratio is None (with `reason`) if not computed.
+    """
+    symbols = [s for s in symbols if s != exclude]
+    total = len(symbols)
+    ratios: list[float] = []
+    for symbol in symbols:
+        row = conn.execute(
+            "SELECT quote_volume_usdt FROM binance_daily_volume WHERE symbol = ? AND date = ?",
+            (symbol, day),
+        ).fetchone()
+        previous = conn.execute(
+            "SELECT quote_volume_usdt FROM binance_daily_volume "
+            "WHERE symbol = ? AND date < ? AND date >= date(?, ?)",
+            (symbol, day, day, f"-{avg_days} days"),
+        ).fetchall()
+        if row is None or len(previous) < avg_days:
+            continue
+        average = sum(r[0] for r in previous) / len(previous)
+        if average > 0:
+            ratios.append(row[0] / average)
+    if not ratios and total:
+        return MarketVolume(
+            None, 0, total,
+            f"в базе нет объёма Binance за этот день и {avg_days} дней до него ни по одной из {total} монет",
+        )
+    if len(ratios) * 2 < total:
+        return MarketVolume(
+            None, len(ratios), total,
+            f"в базе есть объём Binance за этот день и {avg_days} дней до него только по "
+            f"{len(ratios)} из {total} монет, а для серединного значения нужна хотя бы половина",
+        )
+    ratios.sort()
+    mid = len(ratios) // 2
+    median = ratios[mid] if len(ratios) % 2 else (ratios[mid - 1] + ratios[mid]) / 2
+    return MarketVolume(median, len(ratios), total, None)
 
 
 def save_coingecko_price_history(conn: sqlite3.Connection, records: list[dict]) -> None:

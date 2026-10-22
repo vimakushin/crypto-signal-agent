@@ -55,11 +55,13 @@ from collectors import binance_futures, coingecko, defillama
 from signals import oi_divergence, revenue_price_gap, volume_breakout
 from storage.db import (
     backup_problem,
+    daily_volume_fetch_limit,
     get_connection,
     get_latest_binance_oi_fetch_time,
     get_latest_coingecko_fetch_time,
     get_latest_defillama_fetch_time,
     init_db,
+    save_binance_daily_volume,
     save_binance_oi_snapshots,
     save_coingecko_price_history,
     save_defillama_daily_revenue,
@@ -508,6 +510,25 @@ def run_binance_futures_cycle(config: dict) -> None:
     try:
         save_binance_oi_snapshots(conn, records)
         logger.info("Saved OI snapshots to %s", db_path)
+
+        # Daily volume for the digest's market background. Before the early
+        # returns below on purpose: it does not depend on the oi_divergence
+        # signal. collect_daily_volume() logs a failing symbol and goes on, but
+        # a failure of the whole step (Binance answering null instead of a
+        # list of candles, a failed database write) would raise out of here;
+        # the volume background is a side feature, so it is logged and the
+        # oi_divergence scan below still runs.
+        try:
+            volume_records = binance_futures.collect_daily_volume(
+                watchlist, limit=daily_volume_fetch_limit(conn, watchlist)
+            )
+            save_binance_daily_volume(conn, volume_records)
+            logger.info(
+                "Saved %d daily volume rows for %d/%d watchlist symbols",
+                len(volume_records), len({r["symbol"] for r in volume_records}), len(watchlist),
+            )
+        except Exception:
+            logger.exception("Daily volume collection failed; continuing with the oi_divergence scan")
 
         if not signal_cfg.get("enabled", True):
             return

@@ -27,7 +27,7 @@ import math
 import re
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
@@ -54,6 +54,7 @@ from storage.db import (  # noqa: E402
     get_connection,
     get_digest_send_stale,
     get_market_change,
+    get_market_volume_ratio,
     init_db,
     record_digest_sent,
     sources_without_fetch_today,
@@ -564,10 +565,11 @@ def _digest_text_revenue_price_gap(details: dict, config: dict, background: str 
 
 
 def _digest_text_volume_breakout(details: dict, config: dict) -> str:
+    ratio = f"{details['volume_ratio']:.1f}".replace(".", ",")
     return (
-        f"Цена пробила уровень, державшийся {details['resistance_lookback_days']} дней "
+        f"Цена поднялась выше уровня, державшегося {details['resistance_lookback_days']} дней "
         f"({_price_level(details['resistance_level'])}), на объёме в "
-        f"{details['volume_ratio']:.1f} раза выше среднего за "
+        f"{ratio} раза выше среднего за "
         f"{details['volume_avg_lookback_days']} дней."
     )
 
@@ -653,12 +655,46 @@ def _oi_price_window(details: dict, conn, slug: str) -> _PriceWindow:
     return _PriceWindow(moments[0], moments[1], details["price_change_pct"], _window_text(*moments))
 
 
-# Only signals that show the coin's own % move get a background; volume_breakout
-# shows no move, so there is nothing to compare the market with.
+# Signals that get a price background: the ones that show the coin's own % move.
+# volume_breakout has its own background, of volume (_volume_background_line).
 _PRICE_WINDOWS = {
     "revenue_price_gap": _revenue_price_window,
     "oi_divergence": _oi_price_window,
 }
+
+
+def _own_symbol(signal_name: str, slug: str, conn) -> str | None:
+    """The card coin's Binance ticker, to leave it out of its own market
+    background. oi_divergence: the slug is the ticker. Other signals: the
+    protocol's token symbol + USDT, exact match only (of 25 protocols only
+    AAVE matches the 26 tickers); None if the symbol is unknown.
+    """
+    if signal_name == "oi_divergence":
+        return slug
+    row = conn.execute(
+        "SELECT symbol FROM defillama_snapshots WHERE protocol_slug = ? "
+        "ORDER BY fetched_at DESC LIMIT 1", (slug,),
+    ).fetchone()
+    return f"{row['symbol']}USDT" if row and row["symbol"] else None
+
+
+def _market_note(symbols: list[str], excluded: bool, n: int, total: int, meaning: str, found: str) -> str:
+    """The sentence explaining 'рынок' under a background block, the same for
+    price and volume: what the middle value means, which coins, whether the
+    card's coin is among them, and how many had data.
+    """
+    examples = ", ".join(s.removesuffix("USDT") for s in symbols[:3])
+    note = (
+        f"Рынок — серединное значение ({meaning}) "
+        f"по {len(symbols)} монетам Binance, за которыми следит сервис ({examples} и др.)."
+    )
+    if excluded:
+        note += f" Эта монета в их числе, поэтому взяты остальные {total}."
+    else:
+        note += " Этой монеты среди них нет."
+    if n < total:
+        note += f" {found} нашлись у {n} из {total}, у остальных их нет в базе."
+    return note
 
 
 def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
@@ -673,42 +709,65 @@ def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
         window = _PRICE_WINDOWS[contribution.signal_name](contribution.details, conn, slug)
         if window.coin_pct is None:
             return "Цену монеты за эти даты взять не удалось, сравнить с рынком нельзя."
-        # The card's own coin must not sit in its own background. oi_divergence:
-        # the slug is the Binance ticker. revenue_price_gap: the protocol's token
-        # symbol + USDT, exact match only (of 25 protocols only AAVE matches).
-        if contribution.signal_name == "oi_divergence":
-            own = slug
-        else:
-            row = conn.execute(
-                "SELECT symbol FROM defillama_snapshots WHERE protocol_slug = ? "
-                "ORDER BY fetched_at DESC LIMIT 1", (slug,),
-            ).fetchone()
-            own = f"{row['symbol']}USDT" if row and row["symbol"] else None
+        # The card's own coin must not sit in its own background.
+        own = _own_symbol(contribution.signal_name, slug, conn)
         ticker = own.removesuffix("USDT") if own else "эта монета"
         excluded = own in symbols
         change = get_market_change(conn, symbols, window.start, window.end, exclude=own)
         if change.median_pct is None:
             return f"Рынок посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
-        examples = ", ".join(s.removesuffix("USDT") for s in symbols[:3])
         value = _signed(change.median_pct).replace(".", ",")
         coin = _signed(window.coin_pct).replace(".", ",")
         who = f"монета {ticker}" if own else "монета"
-        lines = [
+        return "\n".join([
             f"{_BACKGROUND_TITLE}{window.text}:",
             f"{who} {coin}%, рынок {value}%.",
-            f"Рынок — серединное значение (половина монет изменилась сильнее, половина слабее) "
-            f"по {len(symbols)} монетам Binance, за которыми следит сервис ({examples} и др.).",
-        ]
-        if excluded:
-            lines[-1] += f" Эта монета в их числе, поэтому взяты остальные {change.total}."
-        else:
-            lines[-1] += " Этой монеты среди них нет."
-        if change.n < change.total:
-            lines[-1] += f" Цены на эти моменты нашлись у {change.n} из {change.total}, у остальных их нет в базе."
-        return "\n".join(lines)
+            _market_note(
+                symbols, excluded, change.n, change.total,
+                "половина монет изменилась сильнее, половина слабее", "Цены на эти моменты",
+            ),
+        ])
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
         return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
+
+
+def _volume_background_line(contribution, slug: str, conn, config: dict) -> str:
+    """The volume block of a volume_breakout card: the coin's volume ratio (the
+    signal's own volume_ratio) next to the median of the same ratio over the
+    watchlist coins, for the same day. A CoinGecko daily point dated D is the
+    24 h that ended at 00:00 UTC of D (see storage/db.py, get_market_volume_ratio), so
+    the market ratio is that of Binance day D-1, and the window is shown as
+    such. Facts only, no verdict; any exception is logged and replaced by a
+    plain line, as in _market_background_line.
+    """
+    try:
+        symbols = config["watchlist"]["binance_futures_symbols"]
+        details = contribution.details
+        days = int(details["volume_avg_lookback_days"])
+        ratio = details.get("volume_ratio")
+        if ratio is None:
+            return "Объём монеты за эти сутки взять не удалось, сравнить с рынком нельзя."
+        signal_day = date.fromisoformat(details["date"])
+        binance_day = (signal_day - timedelta(days=1)).isoformat()
+        text = _window_text(f"{binance_day}T00:00:00+00:00", f"{signal_day.isoformat()}T00:00:00+00:00")
+        own = _own_symbol(contribution.signal_name, slug, conn)
+        ticker = own.removesuffix("USDT") if own else "эта монета"
+        market = get_market_volume_ratio(conn, symbols, binance_day, days, exclude=own)
+        if market.median_ratio is None:
+            return f"Рынок посчитать не удалось: {market.reason}. Сравнить с рынком нельзя."
+        who = f"монета {ticker}" if own else "монета"
+        return "\n".join([
+            f"Объём за сутки {text}, раз к среднему за {days} предыдущих суток (1,0 — как обычно):",
+            "{} {}, рынок {}.".format(who, f"{ratio:.1f}".replace(".", ","), f"{market.median_ratio:.1f}".replace(".", ",")),
+            _market_note(
+                symbols, own in symbols, market.n, market.total,
+                "у половины монет отношение больше, у половины меньше", "Объёмы за эти дни",
+            ),
+        ])
+    except Exception:
+        logger.exception("Volume background failed for %s", contribution.signal_name)
+        return "Рыночный фон по объёму посчитать не удалось, сравнить с рынком нельзя."
 
 
 def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
@@ -725,6 +784,8 @@ def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
     background = ""
     if contribution.signal_name in _PRICE_WINDOWS:
         background = _market_background_line(contribution, slug, conn, config)
+    elif contribution.signal_name == "volume_breakout":
+        background = _volume_background_line(contribution, slug, conn, config)
     try:
         if contribution.signal_name == "revenue_price_gap":
             return text_fn(contribution.details, config, background)

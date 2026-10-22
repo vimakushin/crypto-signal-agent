@@ -320,3 +320,46 @@ def collect(
             })
 
     return records
+
+
+def collect_daily_volume(symbols: list[str], limit: int) -> list[dict]:
+    """Fetch closed daily candles (1d, UTC) with their volume in USDT.
+
+    Used for the volume part of the digest's market background: the median,
+    over the watchlist coins, of "day's volume / average volume of the 30 days
+    before it". Only CLOSED days are returned - today's candle is still
+    filling up, and a half-day volume would look like a quiet market. Like
+    collect(), never raises for one bad symbol: it is logged and skipped.
+
+    Args:
+        symbols: Binance Futures tickers.
+        limit: how many latest daily candles to ask for (Binance max 1500);
+            the still-open one among them is dropped.
+
+    Returns:
+        One dict per (symbol, closed day): symbol, date (YYYY-MM-DD, UTC day
+        the candle opened), quote_volume_usdt (kline field 7, traded value in
+        USDT, not coins), fetched_at.
+    """
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    now_ms = time.time() * 1000
+    records: list[dict] = []
+    for symbol in symbols:
+        try:
+            klines = fetch_klines(symbol, interval="1d", limit=limit)
+        except RuntimeError:
+            logger.error("Binance Futures: skipping '%s' - daily volume unavailable", symbol)
+            continue
+        for k in klines:
+            try:
+                if k[6] >= now_ms:
+                    continue
+                records.append({
+                    "symbol": symbol,
+                    "date": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc).date().isoformat(),
+                    "quote_volume_usdt": float(k[7]),
+                    "fetched_at": fetched_at,
+                })
+            except (IndexError, TypeError, ValueError) as exc:
+                logger.warning("Binance Futures: malformed daily candle for %s (%r), dropping: %s", symbol, k, exc)
+    return records
