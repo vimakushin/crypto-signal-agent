@@ -106,6 +106,8 @@ It adds the full current history of all watchlist protocols to the table `defill
 
 ### Scheduled runs
 
+Since 25 October 2026 the collectors store only finished UTC days: DeFiLlama daily revenue is not stored for a day that has not ended, and CoinGecko points are kept only when stamped exactly 00:00 UTC (the "current" point is dropped). Earlier first-received values of the 15 protocols whose day is visible on the day of collection are often unfinished and noisy in both directions (see `BACKLOG.md`, "first values are noisy in both directions"); the revenue signal's window ends on the day before the snapshot from 26 October 2026 on (`WINDOW_RULE_CHANGE_DATE` in `signals/revenue_price_gap.py`). A protocol that DeFiLlama publishes late (cowswap, on about 15% of days) may still have no value for the last day at collection time, and its 7-day window then holds 6 days.
+
 Four separate Windows Task Scheduler tasks:
 
 - **`CryptoSignalAgent-DeFiLlama`** — once a day, `main.py --cycle defillama --skip-if-fresh`, then retried every 2 hours for 10 hours.
@@ -113,11 +115,11 @@ Four separate Windows Task Scheduler tasks:
 - **`CryptoSignalAgent-Backup`** — once a day, `scripts\backup_db.py`.
 - **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`), then retried every 2 hours for 10 hours.
 
-The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date (a row in the `digest_sends` table marks it as sent). A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. The one case with a second message: if the digest had to go out with the stale-data warning and the data arrives later that day, one more digest follows, saying it is a repeat on fresh data.
+The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date of its data (a row in the `digest_sends` table marks it as sent). The digest is named after the date of its data — the earliest of the last-collection dates of the three sources — not after the clock at the moment of sending. A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. If the collection did not run and the digest for the last data already went out, instead of a digest there is one short notice a day (table `collection_notices`) saying for how many days the collection has not run, with the last run of the scheduler tasks when it can be read.
 
 What a retry does not fix: "today's data is in" means at least one row was collected today. A collection that got only some of the coins (CoinGecko's rate limit, for instance) counts as done and is not repeated.
 
-Because of this, starting these two tasks by hand may do nothing: `Start-ScheduledTask` on the DeFiLlama task exits within a second if today's data is already collected, and on the digest task if today's digest has already gone out. To collect regardless, run `main.py --cycle defillama` yourself (without `--skip-if-fresh`). To send today's digest again, delete today's row from `digest_sends` first.
+Because of this, starting these two tasks by hand may do nothing: `Start-ScheduledTask` on the DeFiLlama task exits within a second if today's data is already collected, and on the digest task if the digest for the current data has already gone out. To collect regardless, run `main.py --cycle defillama` yourself (without `--skip-if-fresh`). To send that digest again, delete its row from `digest_sends` first.
 
 Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.yaml`, re-run this once to apply it:
 
