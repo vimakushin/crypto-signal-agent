@@ -249,7 +249,7 @@ def append_new_observations(
 
 
 def backfill_seven_day_outcomes(
-    conn, observations_path: Path = DEFAULT_OBSERVATIONS_PATH
+    conn, observations_path: Path = DEFAULT_OBSERVATIONS_PATH, today: date | None = None
 ) -> int:
     """Fill in the "через 7 дней" column for any row that is >=7 days old
     and still has that cell empty. Never touches "через 14 дней", "через 30
@@ -271,6 +271,9 @@ def backfill_seven_day_outcomes(
     Args:
         conn: open sqlite3 connection.
         observations_path: path to observations.md.
+        today: the date to count the 7 days up to. The digest passes its DATA
+            date, so the journal and the digest never disagree on "today";
+            defaults to date.today().
 
     Returns:
         Number of rows whose "через 7 дней" cell was filled in. 0 if the
@@ -279,7 +282,7 @@ def backfill_seven_day_outcomes(
     if not observations_path.exists():
         return 0
 
-    today = date.today()
+    today = today or date.today()
     lines = _read_lines(observations_path)
     updated_count = 0
     out_lines: list[str] = []

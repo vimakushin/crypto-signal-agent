@@ -104,10 +104,10 @@ class RevenueGapSignal:
     actual_lookback_days: float
     revenue_growth_pct: float
     mcap_growth_pct: float
-    # Median daily revenue over `lookback_days` ending on the latest
-    # snapshot's date, and over `baseline_window_days` ending on the same
-    # date - the two numbers revenue_growth_pct is computed from. Replaces
-    # the old `revenue_total` (a weekly SUM) field - see this module's
+    # Median daily revenue over `lookback_days` ending on the last finished
+    # UTC day (the day before the latest snapshot's date), and over
+    # `baseline_window_days` ending on the same day - the two numbers
+    # revenue_growth_pct is computed from. Replaces the old `revenue_total` (a weekly SUM) field - see this module's
     # docstring for why a sum was misleading.
     recent_median_daily_revenue: float
     baseline_median_daily_revenue: float
@@ -116,7 +116,7 @@ class RevenueGapSignal:
     # min_revenue_total_usd's liquidity floor is actually checked against),
     # not itself part of the growth-% formula.
     recent_week_sum: float
-    # Share (%) of recent_week_sum (the revenue window D-6..D) contributed by
+    # Share (%) of recent_week_sum (the revenue window D-7..D-1) contributed by
     # its single largest day. Kept for history only: since 19 Oct 2026 mark 1
     # is based on window_max_day_share_pct below, the days the reader sees.
     max_day_share_pct: float
@@ -151,9 +151,8 @@ class RevenueGapSignal:
     shape_note: str | None
     # The 7 days both marks describe and the digest shows: first/last day (ISO
     # dates) and the 7 daily values oldest first, None for a day without
-    # data. For ~10 protocols DeFiLlama publishes a day only the next
-    # morning, so this window ends a day before the revenue window D-6..D the
-    # medians use.
+    # data. All windows end on D-1 (the last finished day); this one ends
+    # earlier only when D-1 itself has no data (a skipped day).
     shape_window_first: str
     shape_window_last: str
     shape_window_values: list[float | None]
@@ -201,6 +200,60 @@ class RevenueGapScanResult:
     insufficient_data_quality: list[str] = field(default_factory=list)
 
 
+# The ONE place that says when the window rule changed: 26 Oct 2026 is the date
+# of the first collection under the new rules (08:00 UTC; collectors/defillama.py
+# no longer stores the current, unfinished day). The 25 Oct collection (~09:48
+# UTC) still ran the OLD code (collectors/defillama.py and this file were
+# changed later that day, ~14:08 and ~14:29), so the live signal of 25 Oct still
+# computed the window by the old rule (ending on the snapshot's own day); the
+# rows stored on 25 Oct were a partial day and were deleted that evening. The
+# 25 Oct snapshot in the replay is therefore also an old-rule one. Snapshots
+# dated BEFORE 26 Oct use the old rule (window ends on the snapshot's own day
+# D); snapshots from 26 Oct on (inclusive) use the new rule (window ends on
+# D-1). The replay must reproduce what the live signal really did on each
+# date, so it takes the rule from revenue_window_end_date too - never a second
+# copy of this date or of the arithmetic.
+WINDOW_RULE_CHANGE_DATE = date(2026, 10, 26)
+
+
+def revenue_window_end_date(snapshot_fetched_at: str) -> str:
+    """The ONE rule for where the revenue windows end. Used by scan_watchlist,
+    by scripts/replay_signals.py and by scripts/measure_hit_rate.py, so live
+    signal and replay cannot drift apart.
+
+    For snapshots dated before WINDOW_RULE_CHANGE_DATE (26 Oct 2026) the window
+    ends on the snapshot's own day D (what the live signal did then); from that
+    date on it ends on the last FINISHED UTC day, D-1.
+
+    Rows up to and including 24 Oct 2026 are the first values of the old
+    collector and may be incomplete; finished days are guaranteed only from
+    25 Oct 2026 (the protection against the unfinished day entered the
+    collector on 25 Oct; the first collection under the new rules was 26 Oct).
+
+    Since 25 Oct 2026 the collector no longer stores the current, unfinished
+    day (collectors/defillama.py), so ending the window "today" would always
+    miss its last day (6 days of 7, "no data for today" in the digest).
+    Thresholds and formula are unchanged; only the window's end moved one day
+    back.
+
+    History note: rows stored before 25 Oct by the old collector hold the
+    FIRST, often partial, value of their day. So for replay on older history in
+    `stored` mode the "yesterday" row can be an incomplete first value (saved
+    partly by run D-1, for some protocols by run D); in `restated` mode it is
+    the finished value. Live rows from 25 Oct on are finished days.
+
+    Args:
+        snapshot_fetched_at: ISO timestamp of the market-cap snapshot.
+
+    Returns:
+        "YYYY-MM-DD", the last day included in the window.
+    """
+    snapshot_day = datetime.fromisoformat(snapshot_fetched_at).date()
+    if snapshot_day < WINDOW_RULE_CHANGE_DATE:
+        return snapshot_day.isoformat()
+    return (snapshot_day - timedelta(days=1)).isoformat()
+
+
 def _days_between(later_iso: str, earlier_iso: str) -> float:
     """Actual elapsed time between two stored snapshot timestamps, in days.
 
@@ -244,16 +297,15 @@ def _shape_check(
     spread between big and small days, unusual for this protocol?
 
     The window is the LAST 7 consecutive days that have data as of this
-    evaluation (the last day with data and the 6 before it), not necessarily
-    the window the signal's medians use: for ~10 protocols DeFiLlama gives a
-    day's revenue only the next morning, so their window ends one day earlier
-    than the revenue window. Its unevenness is compared with the median
+    evaluation (the last day with data and the 6 before it). All windows end
+    on the day given by revenue_window_end_date (D-1 since 25 Oct 2026), so it differs
+    from the window the signal's medians use only when a day is skipped. Its unevenness is compared with the median
     unevenness of all complete 7-day windows (7 consecutive dates, no missing
     values) lying fully inside the baseline window and ending BEFORE this
     window's first day. Uses only rows the caller already has (nothing from
     after the evaluation moment). The window never reaches back further than
-    D-7 only because scan_watchlist's coverage check (>= 6 valid days in
-    D-6..D, >= 81 in the baseline) runs before this function is called.
+    D-8 only because scan_watchlist's coverage check (>= 6 valid days in
+    D-7..D-1, >= 81 in the baseline) runs before this function is called.
 
     The same past windows give the coin's habitual share of the largest day
     (median of max/sum, windows with sum <= 0 skipped); mark 1 is set when the
@@ -359,10 +411,11 @@ def _evaluate_snapshots(
             (latest - lookback_days) for the same protocol - only used here
             for its `mcap`.
         recent_daily_revenue: defillama_daily_revenue rows for the
-            `lookback_days`-day window ending on latest's date (see
+            `lookback_days`-day window ending on the last finished day (the
+            day before latest's date; see
             storage.db.get_defillama_daily_revenue_window).
         baseline_daily_revenue: defillama_daily_revenue rows for the
-            `baseline_window_days`-day window ending on the SAME date.
+            `baseline_window_days`-day window ending on the SAME day.
         revenue_growth_threshold_pct: see config.yaml
             signals.revenue_price_gap.revenue_growth_threshold_pct.
         mcap_reaction_threshold_pct: see config.yaml
@@ -577,7 +630,7 @@ def scan_watchlist(
             insufficient_history.append(slug)
             continue
 
-        end_date = datetime.fromisoformat(latest["fetched_at"]).date().isoformat()
+        end_date = revenue_window_end_date(latest["fetched_at"])
         recent_rows = get_defillama_daily_revenue_window(conn, slug, end_date, lookback_days)
         baseline_rows = get_defillama_daily_revenue_window(conn, slug, end_date, baseline_window_days)
 

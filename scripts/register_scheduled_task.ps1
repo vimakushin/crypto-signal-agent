@@ -146,11 +146,13 @@ if ($TelegramRunHour -lt 0 -or $TelegramRunHour -gt 23 -or $TelegramRunMinute -l
     throw "schedule.telegram_run_time in config.yaml is out of range: '$TelegramRunTimeRaw'"
 }
 
-# The repeats must stay within one calendar day: a repeat after midnight sees
-# the NEW date, sends a digest built on yesterday's data and marks the new day
-# as done, so the real 12:30 digest of that day would be skipped. Hence the
-# last repeat (run time + window) has to be before 24:00 for both repeating
-# tasks, and the interval can't exceed the window.
+# The repeats must stay within one calendar day: a repeat after midnight already
+# belongs to the NEW date. It would either stay silent (yesterday's digest has
+# gone out and the first regular time of the new day has not come) or send a
+# late digest under its real data date - no harm done, but it is not what the
+# chain of repeats is for, and "today" for the freshness checks changes under
+# it. Hence the last repeat (run time + window) has to be before 24:00 for both
+# repeating tasks, and the interval can't exceed the window.
 if ($RetryIntervalHours -gt $RetryWindowHours) {
     throw "schedule.retry_interval_hours ($RetryIntervalHours) must not be greater than schedule.retry_window_hours ($RetryWindowHours) in config.yaml"
 }
@@ -158,7 +160,7 @@ foreach ($check in @(
         @{ Name = "schedule.defillama_run_time"; Minutes = $RunHour * 60 + $RunMinute },
         @{ Name = "schedule.telegram_run_time"; Minutes = $TelegramRunHour * 60 + $TelegramRunMinute })) {
     if ($check.Minutes + $RetryWindowHours * 60 -ge 24 * 60) {
-        throw "$($check.Name) + schedule.retry_window_hours ($RetryWindowHours h) in config.yaml reaches midnight or later - the last repeat must be before 24:00 (a repeat after midnight would send a digest for the new day on yesterday's data)"
+        throw "$($check.Name) + schedule.retry_window_hours ($RetryWindowHours h) in config.yaml reaches midnight or later - the last repeat must be before 24:00 (the repeats must stay within one calendar day)"
     }
 }
 

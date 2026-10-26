@@ -128,6 +128,33 @@ GRID_STEP_HOURS = 4
 # change).
 MAX_GAP_MULTIPLIER = 1.5
 
+# Classification of replay-vs-live-journal differences (used by
+# scripts/measure_hit_rate.py). Until the owner's decision of 19 Oct 2026
+# (commit 155beea) the outlier filter REJECTED a week in which one day gave more
+# than 50% of the week's revenue; now it only flags it. So the replay (current
+# code) fires on such days where the live journal, written by the old code,
+# stayed silent. Such "extra in replay" pairs are explained; everything else is not.
+OUTLIER_RULE_CHANGE_DATE = date_cls(2026, 10, 19)
+OUTLIER_DAY_SHARE_PCT = 50.0
+
+
+def is_discrepancy_explained(day: date_cls, max_day_share_pct: float | None, side: str) -> bool:
+    """Say whether one replay-vs-journal difference is explained by the 19 Oct rule change.
+
+    Args:
+        day: the date of the differing (protocol, day) pair.
+        max_day_share_pct: share of the week's revenue given by its biggest day, in %
+            (None if unknown).
+        side: 'extra' (fired in the replay only) or 'missing' (in the journal only).
+
+    Returns:
+        True only for 'extra' strictly before OUTLIER_RULE_CHANGE_DATE with a share
+        strictly above OUTLIER_DAY_SHARE_PCT; False for everything else.
+    """
+    if side != "extra" or max_day_share_pct is None:
+        return False
+    return day < OUTLIER_RULE_CHANGE_DATE and max_day_share_pct > OUTLIER_DAY_SHARE_PCT
+
 
 def _setup_logging() -> None:
     """Console + a rotating file in logs/replay_signals.log, separate from
@@ -429,7 +456,13 @@ def replay_revenue_price_gap(
             # was visible at the time - that SQL now exists in two copies
             # (the live function and the _as_of one in storage/db.py): if
             # the live window rule ever changes, change _as_of with it.
-            end_date = latest_date.isoformat()
+            # The window's END day comes from the one shared rule,
+            # revenue_price_gap.revenue_window_end_date: the snapshot's own day
+            # for snapshots before WINDOW_RULE_CHANGE_DATE (26 Oct 2026; the 25 Oct live run still used the old rule), the
+            # day before it from then on - exactly what the live signal did on
+            # each date (see that function for what it means for old history
+            # in stored vs restated mode).
+            end_date = revenue_price_gap.revenue_window_end_date(latest["fetched_at"])
             # As-of rule: this run sees only revenue received before the NEXT
             # snapshot of this protocol was saved (nothing at all is cut for
             # the last snapshot). Not "before this snapshot's own fetched_at":

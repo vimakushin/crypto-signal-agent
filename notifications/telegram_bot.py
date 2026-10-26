@@ -25,9 +25,10 @@ from __future__ import annotations
 import logging
 import math
 import re
+import subprocess
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as time_of_day, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
@@ -51,11 +52,14 @@ from scoring.ranker import (  # noqa: E402
 from storage.db import (  # noqa: E402
     BackupProblem,
     backup_problem,
+    get_collection_notice_dates,
     get_connection,
-    get_digest_send_stale,
+    get_data_date,
+    get_digest_send_dates,
     get_market_change,
     get_market_volume_ratio,
     init_db,
+    record_collection_notice_sent,
     record_digest_sent,
     sources_without_fetch_today,
 )
@@ -185,7 +189,7 @@ def _truncate_for_telegram(text: str) -> str:
     return text[:cutoff] + TRUNCATION_SUFFIX
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
+def send_telegram_message(token: str, chat_id: str, text: str, what: str = "digest") -> bool:
     """Send `text` to `chat_id` via the Telegram Bot API's sendMessage,
     with retry-with-backoff (same shape as
     collectors/defillama.py's _get_with_retry).
@@ -201,6 +205,8 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
         chat_id: Telegram chat id to send to (from .env's TELEGRAM_CHAT_ID).
         text: message text. Truncated to Telegram's length limit if needed
             (see _truncate_for_telegram).
+        what: what is being sent, for the log only ("сводка за 26 октября",
+            "уведомление о сборе") - so the log does not call a notice a digest.
 
     Returns:
         True if the message was sent successfully, False if all
@@ -215,7 +221,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
         try:
             response = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            logger.info("Telegram: digest sent successfully (attempt %s/%s)", attempt, MAX_RETRIES)
+            logger.info("Telegram: %s sent successfully (attempt %s/%s)", what, attempt, MAX_RETRIES)
             return True
         except requests.exceptions.HTTPError as exc:
             last_error_text = _redact_token(str(exc))
@@ -305,13 +311,26 @@ _HEADLINE = (
     "{baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)."
 )
 # The market cap is a different quantity from the price the market is compared
-# with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), so it stands on its own
-# line and says so - the price/market pair is a separate block below.
+# with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), and its window is another
+# one too (dates of the two DeFiLlama snapshots, not the revenue days) - so the
+# two cannot be compared and must not stand side by side. Since 25 Oct 2026 the
+# line is the LAST one of the card, after the daily revenue, with its own dates
+# and no remark (first-user: the old "(в сравнении с рынком выше она не
+# участвует)" made readers re-read; away from the price/market pair it is not needed).
 _MCAP_LINE = "Капитализация токена {mcap_dates} изменилась на {mcap}%"
-_MCAP_NOT_COMPARED = " (в сравнении с рынком выше она не участвует)"
-# Start of the price/market block; the market-cap line points at the block
-# only when this block is really shown.
 _BACKGROUND_TITLE = "Цена монеты и рынка, "
+# What the signal compares, in one sentence: revenue growth against market-cap
+# growth (the cap, not the price). The signal fires only when the cap grew by
+# less than revenue did (or fell). 25 Oct 2026: "…выросла слабее выручки или
+# снизилась" dropped - it repeated the cap line and stopped being exact if the
+# cap threshold ever exceeded the revenue one; the shorter text is true both when
+# the cap fell (-2.1%) and when it grew less than revenue. No verdict.
+# Same day, second change: "…а капитализация его токена за ней не пошла" argued
+# with the number below it when the cap was +9% (it did "go", just less). The
+# signal's condition is exactly "cap growth < revenue growth" (and below the cap
+# threshold; signals/revenue_price_gap.py), so the sentence says that: true for
+# +9% and for a fall alike.
+_GAP_SENTENCE = "Выручка протокола выросла сильнее, чем капитализация его токена."
 _CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
@@ -497,8 +516,11 @@ def _revenue_headline(details: dict) -> str:
     revenue_note = ""
     if details["revenue_window_count"] < details["lookback_days"]:
         revenue_note = f" ({details['revenue_window_count']} {_days_word(details['revenue_window_count'])}"
-        if revenue_last < latest_day:
-            revenue_note += f"; за {_date_ru(latest_day)} данных ещё нет"
+        # The window is meant to end on the last finished day (the day before
+        # the snapshot); today's figure is never expected.
+        expected_last = latest_day - timedelta(days=1)
+        if revenue_last < expected_last:
+            revenue_note += f"; за {_date_ru(expected_last)} данных ещё нет"
         revenue_note += ")"
     baseline_first = date.fromisoformat(details["baseline_window_first"])
     baseline_last = date.fromisoformat(details["baseline_window_last"])
@@ -516,10 +538,9 @@ def _revenue_headline(details: dict) -> str:
     )
 
 
-def _revenue_mcap_line(details: dict, compared: bool) -> str:
+def _revenue_mcap_line(details: dict) -> str:
     """The market-cap sentence with its own dates (the dates of the two
-    DeFiLlama snapshots the signal compared). The remark about the market
-    comparison is added only when `compared` - the comparison is shown.
+    DeFiLlama snapshots the signal compared).
     """
     latest_day = date.fromisoformat(details["mcap_date_latest"])
     earlier_day = date.fromisoformat(details["mcap_date_earlier"])
@@ -529,16 +550,20 @@ def _revenue_mcap_line(details: dict, compared: bool) -> str:
         mcap_dates = f"с {_date_ru(earlier_day)} по {_date_ru(latest_day)}"
     return _MCAP_LINE.format(
         mcap_dates=mcap_dates, mcap=_signed(details["mcap_growth_pct"]).replace(".", ",")
-    ) + (_MCAP_NOT_COMPARED if compared else "") + "."
+    ) + "."
 
 
 def _digest_text_revenue_price_gap(details: dict, config: dict, background: str = "") -> str:
-    """Headline, the price/market block (`background`, if any), market cap, then what is visible in the daily numbers
-    (marks), the 'cannot compare' line if any, and the daily numbers last.
+    """Headline, the sentence about the point, the price/market block
+    (`background`, if any), what is visible in the daily numbers (marks), the
+    'cannot compare' line if any, the daily numbers, and the market-cap line
+    last (its window differs from the price/market one, so it stands apart).
 
-    The median covers the last `lookback_days` calendar days ending on the day
-    of the latest snapshot (today's revenue is usually not published yet, so
-    6 of 7), while the seven daily numbers always end on the last day that has
+    The median covers the last `lookback_days` calendar days ending on the last
+    finished UTC day (the day before the latest snapshot; since 25 Oct 2026 the
+    collector does not store the unfinished current day, so normally 7 of 7;
+    6 of 7 when a protocol's last finished day is not published yet), while the
+    seven daily numbers always end on the last day that has
     data - they are the days the marks above them were computed on, so they
     cannot be cut to the median's days without contradicting the marks. When
     the two ranges differ, the daily line says which of its days the median
@@ -551,16 +576,16 @@ def _digest_text_revenue_price_gap(details: dict, config: dict, background: str 
     if shape_first is not None and (shape_first, date.fromisoformat(details["shape_window_last"])) != (first, last):
         note = f" (в медиану выше вошли {_date_range_ru(first, last)})"
     texts = _revenue_mark_texts(details, note)
-    lines = [_revenue_headline(details)]
+    lines = [_revenue_headline(details), _GAP_SENTENCE]
     if background:
         lines += ["", background, ""]
-    lines.append(_revenue_mcap_line(details, background.startswith(_BACKGROUND_TITLE)))
     if texts.marks:
         lines.append(_MARK_PREFIX + "; ".join(texts.marks) + ".")
     if texts.check_failed:
         lines.append(texts.check_failed + ".")
     if texts.daily_line:
         lines.append(texts.daily_line)
+    lines.append(_revenue_mcap_line(details))
     return "\n".join(lines)
 
 
@@ -614,24 +639,31 @@ def _window_text(start: str, end: str) -> str:
 
 
 def _revenue_price_window(details: dict, conn, slug: str) -> _PriceWindow:
-    """Price window of a revenue_price_gap card: CoinGecko's daily price of
-    the coin on the two dates of the market-cap comparison. A daily CoinGecko
-    price is the point of 00:00 UTC of its date (checked 22 Oct 2026 against
-    the live market_chart answer: every stored value equals the 00:00 point,
-    also the last day's, although it is collected at ~09:00 UTC), so the
-    moments are those dates at 00:00 UTC. A date with no price row (one of
-    the 25 protocols is missing on many days) gives coin_pct None - never
-    zero and never a neighbouring day.
+    """Price window of a revenue_price_gap card: the SAME days as the card's
+    revenue (revenue_window_first .. revenue_window_last), from 00:00 UTC of
+    the first day to 00:00 UTC of the day after the last one - so the revenue
+    and the price in one card describe the same period (before 25 Oct 2026 the
+    price used the market-cap snapshot dates, a day or two off). A daily
+    CoinGecko price is the point of 00:00 UTC of its date (checked 22 Oct 2026
+    against the live market_chart answer: every stored value equals the 00:00
+    point), so these moments are the dates `first` and `last + 1` of
+    coingecko_price_history; Binance has an hourly point at every 00:00, so
+    the market is looked up at exactly the same moments. A date with no price
+    row (one of the 25 protocols is missing on many days) gives coin_pct None
+    - never zero and never a neighbouring day. The market-cap line keeps the
+    snapshot dates; it is a different quantity (see _MCAP_LINE).
     """
+    first = date.fromisoformat(details["revenue_window_first"])
+    after_last = date.fromisoformat(details["revenue_window_last"]) + timedelta(days=1)
     prices = []
-    for key in ("mcap_date_earlier", "mcap_date_latest"):
+    for day in (first, after_last):
         row = conn.execute(
             "SELECT price FROM coingecko_price_history WHERE protocol_slug = ? AND date = ? AND price > 0",
-            (slug, details[key]),
+            (slug, day.isoformat()),
         ).fetchone()
         prices.append(row["price"] if row else None)
-    start = f"{details['mcap_date_earlier']}T00:00:00+00:00"
-    end = f"{details['mcap_date_latest']}T00:00:00+00:00"
+    start = f"{first.isoformat()}T00:00:00+00:00"
+    end = f"{after_last.isoformat()}T00:00:00+00:00"
     coin_pct = None if None in prices else (prices[1] - prices[0]) / prices[0] * 100
     return _PriceWindow(start, end, coin_pct, _window_text(start, end))
 
@@ -678,22 +710,23 @@ def _own_symbol(signal_name: str, slug: str, conn) -> str | None:
     return f"{row['symbol']}USDT" if row and row["symbol"] else None
 
 
-def _market_note(symbols: list[str], excluded: bool, n: int, total: int, meaning: str, found: str) -> str:
-    """The sentence explaining 'рынок' under a background block, the same for
-    price and volume: what the middle value means, which coins, whether the
-    card's coin is among them, and how many had data.
+def _market_note(n: int, total: int, ticker: str) -> str:
+    """One short line under a background block (price and volume alike): what
+    'рынок' is, how many coins it is taken over, and that the card's own coin
+    is not among them. `total` is already counted without the own coin; the
+    sentence says so for a coin that is in the list and for one that is not.
+
+    Args:
+        n: coins that had data for this block.
+        total: coins the market is taken over (the list without the own coin).
+        ticker: the card coin's ticker, or 'эта монета' when it is unknown.
     """
-    examples = ", ".join(s.removesuffix("USDT") for s in symbols[:3])
     note = (
-        f"Рынок — серединное значение ({meaning}) "
-        f"по {len(symbols)} монетам Binance, за которыми следит сервис ({examples} и др.)."
+        f"Рынок — серединное значение (половина монет выше, половина ниже) "
+        f"по {total} монетам Binance; {ticker[:1].upper() + ticker[1:]} в расчёт рынка не входит."
     )
-    if excluded:
-        note += f" Эта монета в их числе, поэтому взяты остальные {total}."
-    else:
-        note += " Этой монеты среди них нет."
     if n < total:
-        note += f" {found} нашлись у {n} из {total}, у остальных их нет в базе."
+        note += f" Данные нашлись у {n} из {total}."
     return note
 
 
@@ -712,7 +745,6 @@ def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
         # The card's own coin must not sit in its own background.
         own = _own_symbol(contribution.signal_name, slug, conn)
         ticker = own.removesuffix("USDT") if own else "эта монета"
-        excluded = own in symbols
         change = get_market_change(conn, symbols, window.start, window.end, exclude=own)
         if change.median_pct is None:
             return f"Рынок посчитать не удалось: {change.reason}. Сравнить с рынком нельзя."
@@ -722,10 +754,7 @@ def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
         return "\n".join([
             f"{_BACKGROUND_TITLE}{window.text}:",
             f"{who} {coin}%, рынок {value}%.",
-            _market_note(
-                symbols, excluded, change.n, change.total,
-                "половина монет изменилась сильнее, половина слабее", "Цены на эти моменты",
-            ),
+            _market_note(change.n, change.total, ticker),
         ])
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
@@ -758,12 +787,11 @@ def _volume_background_line(contribution, slug: str, conn, config: dict) -> str:
             return f"Рынок посчитать не удалось: {market.reason}. Сравнить с рынком нельзя."
         who = f"монета {ticker}" if own else "монета"
         return "\n".join([
-            f"Объём за сутки {text}, раз к среднему за {days} предыдущих суток (1,0 — как обычно):",
-            "{} {}, рынок {}.".format(who, f"{ratio:.1f}".replace(".", ","), f"{market.median_ratio:.1f}".replace(".", ",")),
-            _market_note(
-                symbols, own in symbols, market.n, market.total,
-                "у половины монет отношение больше, у половины меньше", "Объёмы за эти дни",
+            f"Объём за сутки {text}, во сколько раз к среднему за {days} предыдущих суток:",
+            "{} — в {} раза, рынок — в {} раза.".format(
+                who, f"{ratio:.1f}".replace(".", ","), f"{market.median_ratio:.1f}".replace(".", ",")
             ),
+            _market_note(market.n, market.total, ticker),
         ])
     except Exception:
         logger.exception("Volume background failed for %s", contribution.signal_name)
@@ -818,8 +846,13 @@ def _coin_label(conn, candidate: CandidateScore) -> str:
 
 
 def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
-    """'новая в сводке' or 'была и вчера, идёт с <дата>', judged by the
-    episode (run of consecutive days) each contribution belongs to.
+    """'первый день срабатывания' or 'срабатывает с <дата>, была и вчера',
+    judged by the episode (run of consecutive days of the signal firing, from
+    signal_events) each contribution belongs to. It says only what is counted:
+    when the firing run began, NOT when the coin first appeared in a sent
+    digest (digest_sends only starts on 5 Oct, signals on 10 Sep) and not how
+    long the revenue has been high (the old "идёт с 6 октября" read as a
+    revenue duration next to "6 дней").
     """
     starts = []
     for contribution in candidate.contributions:
@@ -833,42 +866,66 @@ def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
             ):
                 starts.append(episode.episode_start_date)
     if not starts:
-        return "новая в сводке"
-    return f"была и вчера, идёт с {_date_ru(date.fromisoformat(min(starts)))}"
+        return "первый день срабатывания"
+    return f"срабатывает с {_date_ru(date.fromisoformat(min(starts)))}, была и вчера"
 
 
-_STALE_SOURCE_LABELS = {
-    "defillama": "выручка и капитализация протоколов (DeFiLlama)",
-    "coingecko": "цены и объёмы (CoinGecko)",
-    "binance": "фьючерсы (Binance)",
-}
+# Source key (storage.db.sources_without_fetch_today) -> the one word the owner
+# sees for it, in the collection notice and in the stale-data warning alike.
+_STALE_SOURCE_SHORT = {"defillama": "выручка", "coingecko": "цены", "binance": "фьючерсы"}
 
 
-def _stale_warning(stale_sources: dict[str, str | None]) -> str:
-    """The warning paragraph that opens the digest when a source has no
-    collection today. "No collection today" and not "older than 24 hours" on
-    purpose: yesterday's collection ran late (12:44), today's failed, the
-    digest runs at 12:30 - the data are 23.8 hours old and a 24-hour rule
-    would stay silent about a source that has not updated today.
+def _join_names(keys: list[str]) -> str:
+    """'выручка', 'выручка и цены', 'выручка, цены и фьючерсы'."""
+    if len(keys) <= 1:
+        return "".join(keys)
+    return ", ".join(keys[:-1]) + " и " + keys[-1]
 
-    Args:
-        stale_sources: {source key: last fetched_at ISO (UTC) or None}.
+
+def _stale_groups(stale_sources: dict[str, str | None]) -> list[tuple[str, str]]:
+    """Stale sources grouped by their last collection day, so one date is not
+    repeated for sources that share it.
 
     Returns:
-        Two lines: which sources did not update today (with their last
-        collection date) and a note that the digest is built on that data.
+        [(source names, 'последний сбор 23 октября' | 'ещё ни разу не собирались')].
     """
-    parts = []
+    by_when: dict[str, list[str]] = {}
     for source, last_iso in stale_sources.items():
         if last_iso is None:
             when = "ещё ни разу не собирались"
         else:
-            last_day = datetime.fromisoformat(last_iso).astimezone().date()
-            when = f"последний сбор {_date_ru(last_day)}"
-        parts.append(f"{_STALE_SOURCE_LABELS[source]} — {when}")
+            when = f"последний сбор {_date_ru(datetime.fromisoformat(last_iso).astimezone().date())}"
+        by_when.setdefault(when, []).append(_STALE_SOURCE_SHORT[source])
+    return [(_join_names(names), when) for when, names in by_when.items()]
+
+
+def _stale_warning(stale_sources: dict[str, str | None], data_date: date, today: date) -> str:
+    """The warning paragraph that opens a late digest: one for a data date
+    that is already behind the calendar because a source has no collection
+    today. "No collection today" and not "older than 24 hours" on purpose:
+    yesterday's collection ran late (12:44), today's failed, the digest runs
+    at 12:30 - the data are 23.8 hours old and a 24-hour rule would stay
+    silent about a source that has not updated today.
+
+    Args:
+        stale_sources: {source key: last fetched_at ISO (UTC) or None}.
+        data_date: the date of the data the digest is named after.
+        today: this run's local date, taken once at its start.
+
+    Returns:
+        One sentence saying what this digest is (late, for `data_date`) and
+        which sources did not update; with no data at all - the short
+        new-install explanation instead.
+    """
+    names = _join_names([_STALE_SOURCE_SHORT[s] for s in stale_sources])
+    if len(stale_sources) == len(_STALE_SOURCE_SHORT) and all(v is None for v in stale_sources.values()):
+        return (
+            f"Внимание: {_date_ru(today)} не обновились {names}. "
+            "Похоже, это новая установка: в базе ещё нет данных."
+        )
     return (
-        f"Внимание: данные устарели. Сегодня не обновлялись: {'; '.join(parts)}.\n"
-        "Сводка ниже построена на этих данных."
+        f"Эта сводка за {_date_ru(data_date)} пришла с опозданием: "
+        f"за {_date_ru(today)} сбор не завершён — не обновились {names}."
     )
 
 
@@ -896,11 +953,12 @@ def _backup_warning(problem: BackupProblem) -> str:
 
 def format_digest(
     results: list[CandidateScore],
-    today: date,
+    data_date: date,
     conn,
     config: dict,
     since_by_signal: dict[str, str],
     stale_sources: dict[str, str | None] | None = None,
+    today: date | None = None,
 ) -> str:
     """Turn rank_candidates()'s output into the Telegram message text.
 
@@ -911,7 +969,9 @@ def format_digest(
 
     Args:
         results: rank_candidates()'s return value (order kept as is).
-        today: date for the header.
+        data_date: the date of the data the digest is built on (not the
+            clock at the moment of sending - see decide_action); it names
+            the digest in the header.
         conn: open storage/db.py connection (coin names, episodes).
         config: parsed config.yaml (passed to every signal's wording function).
         since_by_signal: default_since_by_signal()'s cursor, for episodes.
@@ -919,14 +979,16 @@ def format_digest(
             the moment of building. Non-empty -> the text starts with a
             warning paragraph, and an empty digest no longer claims the
             system works. Empty/None -> the text is exactly as without it.
+        today: this run's local date, taken once at its start (the stale
+            warning names it); required when `stale_sources` is non-empty.
             Independently, storage.db.backup_problem(config) is checked here:
             a bad backup puts its own warning first (before the stale one).
 
     Returns:
         The full text, not yet truncated (send_telegram_message() does that).
     """
-    header = f"Сводка за {_date_ru(today)}"
-    warning = f"{_stale_warning(stale_sources)}\n\n" if stale_sources else ""
+    header = f"Сводка за {_date_ru(data_date)}"
+    warning = f"{_stale_warning(stale_sources, data_date, today)}\n\n" if stale_sources else ""
     # The check must never cost the owner the digest itself (reviewer, 22 Oct
     # 2026): a broken config or a file vanishing mid-scan becomes a line saying
     # the check failed - not silence, which is how the backup failure of
@@ -948,7 +1010,7 @@ def format_digest(
                 f"{warning}{header}: сигналов не видно, но по устаревшим данным "
                 "судить об этом нельзя."
             )
-        return f"{warning}{header}: сегодня сигналов нет. Система работает, данные собираются."
+        return f"{warning}{header}: сигналов нет. Система работает, данные собираются."
 
     episodes = _build_all_episodes(conn, since_by_signal)
     multi: list[str] = []
@@ -1057,19 +1119,233 @@ def wait_for_fresh_data(
         time.sleep(min(poll_seconds, remaining))
 
 
-def main() -> int:
-    """Build today's digest and send it to Telegram: once per date, or twice
-    if the first one had to go out on stale data and fresh data arrived later.
+SEND_DIGEST = "send_digest"
+SEND_NOTICE = "send_notice"
+NOTHING = "nothing"
 
-    Steps: read .env; exit quietly if the digest for today was already sent
-    (this task is retried every few hours - see config.yaml schedule); wait
-    for fresh data; rank candidates and update observations.md; build the
-    text (with a stale-data warning if needed); send; on success remember it.
-    A failed send leaves no mark, so the next scheduled run tries again.
+
+class Action(NamedTuple):
+    """What one run must do. kind is SEND_DIGEST (day = the data date to name
+    the digest after), SEND_NOTICE (days = how many days the collection has
+    not run) or NOTHING."""
+    kind: str
+    day: date | None = None
+    days: int | None = None
+
+
+def decide_action(
+    data_date: date,
+    today: date,
+    time_now: time_of_day,
+    first_run_time: time_of_day,
+    digests_sent: set[date],
+    notices_sent: set[date],
+) -> Action:
+    """Pure decision of a digest run - no database, no clock inside.
+
+    The rules (owner's decision of 26 Oct 2026, after the 01:58 run named a
+    digest built on 25 Oct data "за 26 октября"):
+      - a digest is named after the DATA date and goes out once per data date;
+      - data from today, digest not sent yet -> send it;
+      - data from an earlier day, that day's digest not sent yet -> send it
+        under its own date (the caller adds the stale-data warning);
+      - data from an earlier day and that day's digest already sent: before
+        the first regular digest time of the day the collection has not had
+        its chance yet, so stay silent (the night catch-up run at 01:28 must
+        not raise a false alarm); from that time on send one short notice per
+        calendar day that the collection did not run;
+      - the notice is never sent for a date whose digest has not gone out, and
+        fresh data (a new data date) always gives a normal digest, not a notice.
+
+    Args:
+        data_date: get_data_date()'s result.
+        today: this run's local date, taken once at its start.
+        time_now: local time of day of the run's start.
+        first_run_time: schedule.telegram_run_time, the first regular digest
+            time of the day.
+        digests_sent: data dates whose digest already went out.
+        notices_sent: calendar days whose notice already went out.
 
     Returns:
-        Process exit code: 0 - sent, or nothing left to send today; 1 - no
-        credentials, the send failed, or the sent mark could not be written.
+        The Action to perform.
+    """
+    if data_date not in digests_sent:
+        return Action(SEND_DIGEST, day=data_date)
+    if data_date >= today or time_now < first_run_time or today in notices_sent:
+        return Action(NOTHING)
+    return Action(SEND_NOTICE, days=(today - data_date).days)
+
+
+# The task names in the Windows Task Scheduler and what each one collects. The
+# DeFiLlama task also collects CoinGecko prices (main.py runs both), hence
+# "выручка и цены".
+_TASKS_FOR_NOTICE = (
+    ("CryptoSignalAgent-DeFiLlama", "сбор выручки и цен", ("defillama", "coingecko")),
+    ("CryptoSignalAgent-BinanceOI", "сбор фьючерсов", ("binance",)),
+)
+
+# Task Scheduler's own result codes (LastTaskResult) that are not a process exit
+# code: 0x41301 "is running now", 0x41303 "has not run yet".
+_TASK_RUNNING = "267009"
+_TASK_NEVER_RAN = "267011"
+
+def scheduled_tasks_line(stale_sources: dict[str, str | None], today: date) -> str | None:
+    """One sentence about the collection tasks that answer for the stale
+    sources, from the Windows Task Scheduler (Get-ScheduledTaskInfo). It
+    states the fact and sets it against the data ("ran today, but no fresh
+    data after it"); exit code 0 is never worded as "all fine": a collection
+    with an unreachable source exits with 0 too. No guess about the reason.
+
+    Args:
+        stale_sources: sources_without_fetch_today()'s result; only the tasks
+            of these sources are mentioned.
+        today: this run's local date.
+
+    Returns:
+        E.g. 'Планировщик Windows: сбор выручки и цен запускался 26 октября
+        в 13:00, но свежих данных после него нет.' None when no task is
+        relevant, or on any failure (not Windows, no powershell, no such
+        task, unreadable answer): the reason is logged and the caller simply
+        leaves the line out.
+    """
+    names = ",".join(f"'{name}'" for name, _, _ in _TASKS_FOR_NOTICE)
+    script = (
+        f"foreach ($n in {names}) {{ $i = Get-ScheduledTaskInfo -TaskName $n -ErrorAction Stop; "
+        "'{0:yyyy-MM-dd HH:mm}|{1}' -f $i.LastRunTime, $i.LastTaskResult }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.splitlines()
+        lines = [line.strip() for line in out if line.strip()]
+        if len(lines) != len(_TASKS_FOR_NOTICE):
+            raise ValueError(f"unexpected answer: {out!r}")
+        parts = []
+        for (_, label, sources), line in zip(_TASKS_FOR_NOTICE, lines):
+            if not any(s in stale_sources for s in sources):
+                continue
+            moment, _, code = line.partition("|")
+            ran = datetime.strptime(moment, "%Y-%m-%d %H:%M")
+            when = f"{_date_ru(ran.date())} в {ran:%H:%M}"
+            # year < 2000: the scheduler's "never ran" placeholder date
+            if code == _TASK_NEVER_RAN or ran.year < 2000:
+                parts.append(f"{label} ещё ни разу не запускался")
+            elif code == _TASK_RUNNING:
+                parts.append(f"{label} выполняется сейчас (запущен {when})")
+            elif code != "0":
+                parts.append(f"{label} запускался {when} и завершился с кодом {code}")
+            elif ran.date() == today:
+                parts.append(f"{label} запускался {when}, но свежих данных после него нет")
+            else:
+                parts.append(f"{label}: последний запуск {when}, сегодня запуска не было")
+    except Exception as exc:
+        logger.warning("Could not read the scheduled tasks' last run, notice goes without that line: %s", exc)
+        return None
+    if not parts:
+        return None
+    return "Планировщик Windows: " + "; ".join(parts) + "."
+
+
+_CHECK_COLLECTION = "Откройте Claude Code в папке проекта и попросите проверить, почему не идёт сбор данных."
+
+
+def format_collection_notice(
+    data_date: date, days: int, tasks_line: str | None, stale_sources: dict[str, str | None]
+) -> str:
+    """Short notice that the data collection did not run. Facts only: what did
+    not update (with each source's own last collection date) and what did, why
+    there is no new digest, and the scheduler line when it is known. No
+    guess about the reason, no advice.
+
+    Args:
+        data_date: the date of the last data (the digest for it already went).
+        days: today minus data_date, in days (>= 1).
+        tasks_line: scheduled_tasks_line()'s result or None.
+        stale_sources: sources_without_fetch_today()'s result; empty -> the
+            notice cannot say which sources, and is a single line.
+
+    Returns:
+        The message text.
+    """
+    old = f"Последние данные — за {_date_ru(data_date)}, сводка по ним уже была."
+    if not stale_sources:
+        first = "Сегодня сбор данных пока не прошёл." if days == 1 else f"Сбор данных не проходит {days}-й день подряд."
+        return "\n".join([f"{first} {old}"] + ([_CHECK_COLLECTION] if days >= 2 else []))
+    # "Сегодня ... не обновились" on day one: the first notice goes out about
+    # 13:00 and the DeFiLlama repeats run until 21:00, so it may still happen.
+    stale = "; ".join(f"{names} — {when}" for names, when in _stale_groups(stale_sources))
+    head = "Сегодня не обновились" if days == 1 else f"Сбор не проходит {days}-й день подряд: не обновились"
+    fresh = [_STALE_SOURCE_SHORT[s] for s in _STALE_SOURCE_SHORT if s not in stale_sources]
+    fresh_text = f" {_join_names(fresh).capitalize()} обновились." if fresh else ""
+    lines = [
+        f"{head} {stale}.{fresh_text}",
+        "Новая сводка не уйдёт, пока не обновятся все три источника (выручка, цены, фьючерсы); "
+        f"сводка по прежним данным (за {_date_ru(data_date)}) уже была.",
+    ]
+    if tasks_line:
+        lines.append(tasks_line)
+    if days >= 2:
+        # A third day of failure must read differently from the first (owner, 26 Oct 2026).
+        lines.append(_CHECK_COLLECTION)
+    return "\n".join(lines)
+
+
+def _first_run_time(config: dict) -> time_of_day:
+    """schedule.telegram_run_time ('HH:MM') as a time of day."""
+    return datetime.strptime(config["schedule"]["telegram_run_time"], "%H:%M").time()
+
+
+def _read_state(db_path: Path, today: date) -> tuple[date, set[date], set[date], dict[str, str | None]]:
+    """Everything the decision needs from the database, in one short
+    connection: the data date, the dates whose digest went out, the days whose
+    notice went out, and the sources with no collection today."""
+    conn = get_connection(db_path)
+    try:
+        return (
+            get_data_date(conn, today),
+            get_digest_send_dates(conn),
+            get_collection_notice_dates(conn),
+            sources_without_fetch_today(conn, today),
+        )
+    finally:
+        conn.close()
+
+
+def _record(db_path: Path, record, day: date, what: str) -> bool:
+    """Write the sent mark (`record` is record_digest_sent or
+    record_collection_notice_sent) after a successful send. False (logged) if
+    the mark could not be written - the next run may then send a duplicate."""
+    try:
+        conn = get_connection(db_path)
+        try:
+            record(conn, day, datetime.now().astimezone().isoformat(timespec="seconds"))
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception(
+            "The %s for %s WAS SENT to Telegram, but the mark could not be written to the "
+            "database - the next scheduled run (in ~2 hours) may send a duplicate",
+            what, day.isoformat(),
+        )
+        return False
+    return True
+
+
+def main() -> int:
+    """One digest run: decide (decide_action), then send a digest, a short
+    notice, or nothing.
+
+    Steps: read .env and the database state; if the collection of today has
+    not happened and the first regular digest time has passed, wait for fresh
+    data; decide; for a digest: rank candidates, update observations.md,
+    build the text (with a stale-data warning if needed), send, remember the
+    data date. A failed send leaves no mark, so the next scheduled run (every
+    2 hours, see config.yaml schedule) tries again.
+
+    Returns:
+        Process exit code: 0 - sent, or nothing to send; 1 - no credentials,
+        the send failed, or the sent mark could not be written.
     """
     env_values = _read_env_file()
     token = env_values.get("TELEGRAM_BOT_TOKEN")
@@ -1087,42 +1363,48 @@ def main() -> int:
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
-    today = date.today()
-    # init_db: this script is the first to touch the digest_sends table, and
-    # it may run before main.py ever did after an upgrade.
+    # The clock is read ONCE: a run that crosses midnight (waiting for data)
+    # must not change what "today" means halfway through.
+    started = datetime.now()
+    today = started.date()
+    first_run = _first_run_time(config)
+    # init_db: creates the tables of the marks if this run is the first after
+    # an upgrade.
     init_db(db_path)
-    conn = get_connection(db_path)
-    try:
-        sent_stale = get_digest_send_stale(conn, today)
-    finally:
-        conn.close()
+    data_date, digests_sent, notices_sent, stale_sources = _read_state(db_path, today)
 
-    # At most two digests per date: the first one may go out on stale data
-    # (after the wait below ran out); if so, a second one - on fresh data -
-    # is allowed later the same day, without waiting, and it replaces the mark.
-    is_resend = sent_stale is True
-    if sent_stale is False:
-        logger.info("Digest for %s was already sent today - nothing to do", today.isoformat())
+    # Waiting makes sense only once the collection should have happened: before
+    # the first regular digest time of the day (the night catch-up run) data
+    # from yesterday are normal, not late.
+    # If today's notice has already gone out there is nothing to wait for: every
+    # later repeat would otherwise hang 30 minutes for nothing while the
+    # collection stays dead.
+    if data_date < today and started.time() >= first_run and today not in notices_sent:
+        wait_for_fresh_data(db_path, today)
+        data_date, digests_sent, notices_sent, stale_sources = _read_state(db_path, today)
+
+    action = decide_action(data_date, today, started.time(), first_run, digests_sent, notices_sent)
+    if action.kind == NOTHING:
+        logger.info("Nothing to send (data date %s, today %s)", data_date.isoformat(), today.isoformat())
         return 0
-    if is_resend:
-        conn = get_connection(db_path)
-        try:
-            stale_sources = sources_without_fetch_today(conn, today)
-        finally:
-            conn.close()
-        if stale_sources:
-            logger.info(
-                "Digest for %s went out on stale data and %s still has no collection today - nothing to do",
-                today.isoformat(), ", ".join(stale_sources),
-            )
-            return 0
-        logger.info("Data are fresh now - sending the second digest for %s", today.isoformat())
-    else:
-        stale_sources = wait_for_fresh_data(db_path, today)
-        if stale_sources:
-            logger.warning(
-                "Building the digest on stale data, no collection today for: %s", ", ".join(stale_sources)
-            )
+
+    if action.kind == SEND_NOTICE:
+        text = format_collection_notice(
+            data_date, action.days, scheduled_tasks_line(stale_sources, today), stale_sources
+        )
+        logger.warning(
+            "Collection did not run for %d day(s), last data %s - sending the notice",
+            action.days, data_date.isoformat(),
+        )
+        if not send_telegram_message(token, chat_id, text, what="уведомление о сборе"):
+            return 1
+        return 0 if _record(db_path, record_collection_notice_sent, today, "collection notice") else 1
+
+    if stale_sources:
+        logger.warning(
+            "Building the digest for %s on data without a collection today for: %s",
+            data_date.isoformat(), ", ".join(stale_sources),
+        )
 
     signal_weights = signal_weights_from_config(config)
     conn = get_connection(db_path)
@@ -1133,65 +1415,41 @@ def main() -> int:
         # Manual-labeling journal (TZ section 6, cut-down MVP version - see
         # notifications/observations.py's module docstring). Independent of
         # the Telegram send below: a failure here must not block the digest,
-        # and a failed digest send below must not block this.
+        # and a failed digest send below must not block this. It uses the
+        # digest's DATA date, so the journal never disagrees with the digest.
         from notifications.observations import (
             append_new_observations,
             backfill_seven_day_outcomes,
         )
 
         try:
-            append_new_observations(conn, results, today.isoformat())
+            append_new_observations(conn, results, data_date.isoformat())
         except Exception:
             logger.exception("observations.md: append_new_observations failed")
         try:
-            backfill_seven_day_outcomes(conn)
+            backfill_seven_day_outcomes(conn, today=data_date)
         except Exception:
             logger.exception("observations.md: backfill_seven_day_outcomes failed")
 
-        fallback_text = False
         try:
-            digest_text = format_digest(results, today, conn, config, since_by_signal, stale_sources)
+            digest_text = format_digest(results, data_date, conn, config, since_by_signal, stale_sources, today)
         except Exception:
-            fallback_text = True
             # Without this a bug in the wording code would end the run before
             # the send below and the digest would silently not arrive.
             logger.exception("Digest text could not be built")
             digest_text = (
-                f"Сводка за {_date_ru(today)} не построилась из-за ошибки. "
+                f"Сводка за {_date_ru(data_date)} не построилась из-за ошибки. "
                 "Данные собраны, подробности в logs\\telegram.log."
             )
     finally:
         conn.close()
-
-    if is_resend:
-        digest_text = (
-            "Данные обновились. Это повторная сводка за сегодня, уже на свежих данных.\n\n"
-            + digest_text
-        )
     logger.info("Digest text built (%d candidate(s), %d char(s))", len(results), len(digest_text))
 
-    if not send_telegram_message(token, chat_id, digest_text):
+    if not send_telegram_message(token, chat_id, digest_text, what=f"сводка за {_date_ru(data_date)}"):
         return 1
-
-    # The fallback "не построилась" text is final (stale=False): repeating it
-    # every two hours would only mean several identical error messages.
-    try:
-        conn = get_connection(db_path)
-        try:
-            record_digest_sent(
-                conn, today, datetime.now().astimezone().isoformat(timespec="seconds"),
-                stale=bool(stale_sources) and not fallback_text,
-            )
-        finally:
-            conn.close()
-    except Exception:
-        logger.exception(
-            "The digest for %s WAS SENT to Telegram, but the mark could not be written to the "
-            "database - the next scheduled run (in ~2 hours) may send a duplicate",
-            today.isoformat(),
-        )
-        return 1
-    return 0
+    # The "не построилась" fallback is final too: repeating it every two hours
+    # would only mean several identical error messages.
+    return 0 if _record(db_path, record_digest_sent, data_date, "digest") else 1
 
 
 if __name__ == "__main__":

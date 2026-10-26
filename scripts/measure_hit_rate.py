@@ -26,11 +26,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
 import replay_signals as rs
+from signals.revenue_price_gap import revenue_window_end_date
 from storage.db import get_connection, get_latest_complete_restated_fetch
 
 logging.disable(logging.CRITICAL)
 cfg = rs.load_config()
 wl = cfg["watchlist"]["defillama_protocols"]
+LOOKBACK = cfg["signals"]["revenue_price_gap"]["lookback_days"]
+BASELINE_DAYS = cfg["signals"]["revenue_price_gap"]["baseline_window_days"]
 conn = get_connection(ROOT / "storage" / "db.sqlite")
 fetched, n = get_latest_complete_restated_fetch(conn, len(wl))
 
@@ -89,8 +92,11 @@ def affected(ep):
     s, e = date.fromisoformat(ep.episode_start_date), date.fromisoformat(ep.episode_end_date)
     d = s; rec = set(); base = set()
     while d <= e:
-        for k in range(7): rec.add(d - timedelta(days=k))
-        for k in range(7, 97): base.add(d - timedelta(days=k))
+        # The signal's own windows: the recent one ends where the shared rule
+        # says (by the episode day's date), the base is the baseline_window_days before it.
+        end = date.fromisoformat(revenue_window_end_date(d.isoformat()))
+        for k in range(LOOKBACK): rec.add(end - timedelta(days=k))
+        for k in range(LOOKBACK, LOOKBACK + BASELINE_DAYS): base.add(end - timedelta(days=k))
         d += timedelta(days=1)
     f7 = sorted(x for x in rec if (slug, x.isoformat()) in flag)
     f90 = sorted(x for x in base if (slug, x.isoformat()) in flag)
@@ -225,7 +231,18 @@ for slug, ents in res["per_protocol_entries"].items():
     for dd, sig in ents:
         if sig and dd >= FREEZE: rp.add((slug, dd.isoformat()))
 lv = {(r["protocol_slug"], r["d"]) for r in conn.execute("SELECT protocol_slug, date(triggered_at) d FROM signal_events WHERE signal_name='revenue_price_gap' AND date(triggered_at)>=?", (FREEZE.isoformat(),))}
-print(f"\nСверка stored-повтора с живым журналом с 15.09: повтор {len(rp)}, журнал {len(lv)}, совпало {len(rp&lv)}, лишних в повторе {sorted(rp-lv)}, недостающих {sorted(lv-rp)}")
+print("\nДо 26.10.2026 повтор считает окно выручки по старому правилу (до дня снимка; снимок 25.10 тоже по старому — в тот день сигнал работал ещё старым кодом), с 26.10 — по новому (до D-1); граница задана одной константой WINDOW_RULE_CHANGE_DATE.")
+print(f"Сверка stored-повтора с живым журналом с 15.09: повтор {len(rp)}, журнал {len(lv)}, совпало {len(rp&lv)}, лишних в повторе {sorted(rp-lv)}, недостающих {sorted(lv-rp)}")
+
+# Classification of the differences above (printing only; the comparison itself is untouched).
+# The rule and its history: rs.is_discrepancy_explained.
+entries_by_day = {(slug, dd.isoformat()): sig for slug, ents in res["per_protocol_entries"].items() for dd, sig in ents}
+extra_in_replay = sorted(rp - lv)
+explained = [(s, d) for s, d in extra_in_replay
+             if rs.is_discrepancy_explained(date.fromisoformat(d), entries_by_day[(s, d)].max_day_share_pct, "extra")]
+unexplained = [p for p in extra_in_replay if p not in explained] + sorted(lv - rp)
+verdict = "необъяснённых нет" if not unexplained else "ПОИСК ОШИБКИ"
+print(f"Разбор расхождений: всего {len(extra_in_replay) + len(lv - rp)}, объяснено правилом до 19.10 (доля дня >{rs.OUTLIER_DAY_SHARE_PCT:.0f}% недели) {len(explained)} {explained}, необъяснённых {len(unexplained)} {unexplained} — {verdict}")
 
 print("\n\n#### ДОП: общие 7 / только stored / только restated")
 keyf = lambda e: (e.protocol_slug, e.episode_start_date, e.episode_end_date)

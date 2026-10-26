@@ -76,6 +76,8 @@ MIN_REQUEST_INTERVAL_SECONDS = 1.5
 # window treated as safe here.
 MAX_SAFE_DAYS = 365
 
+MS_PER_DAY = 86_400_000
+
 _last_request_at: float = 0.0
 
 
@@ -167,8 +169,9 @@ def fetch_market_chart(
             project needs so far.
 
     Returns:
-        List of dicts sorted oldest-to-newest, one per CoinGecko data point,
-        each with:
+        List of dicts sorted oldest-to-newest, one per CoinGecko daily point
+        stamped exactly 00:00:00 UTC (the trailing "current" point of the
+        response is NOT included - see the comment in the loop), each with:
           - timestamp: ISO 8601 UTC timestamp of the point, as reported by
             CoinGecko.
           - date: "YYYY-MM-DD" UTC calendar date of `timestamp` - convenient
@@ -197,8 +200,21 @@ def fetch_market_chart(
     volume_by_ts = {int(ts): value for ts, value in data.get("total_volumes", [])}
 
     records: list[dict] = []
+    dropped = 0
     for ts_ms, price in prices:
         ts_ms_int = int(ts_ms)
+        # Only the closed daily points, stamped exactly 00:00:00 UTC. With
+        # days=365 CoinGecko ends the list with one more "current" point
+        # stamped with the moment of the request (e.g. 09:00 UTC): it is an
+        # unfinished day's reading that would also be stored under today's
+        # date. Until now it was dropped only by accident - today's midnight
+        # point comes earlier in the list and INSERT OR IGNORE keeps the first
+        # one; if the midnight point were ever missing, the current one would
+        # have been stored and frozen. A point dated D is the 00:00 UTC value
+        # of D (for volume: the 24 h that ended at that moment).
+        if ts_ms_int % MS_PER_DAY != 0:
+            dropped += 1
+            continue
         point_dt = datetime.fromtimestamp(ts_ms_int / 1000, tz=timezone.utc)
         records.append({
             "timestamp": point_dt.isoformat(),
@@ -207,6 +223,16 @@ def fetch_market_chart(
             "market_cap": mcap_by_ts.get(ts_ms_int),
             "volume": volume_by_ts.get(ts_ms_int),
         })
+
+    # Exactly one point (the current one) is expected to be dropped. More
+    # means CoinGecko moved its timestamps off 00:00:00 UTC, and without this
+    # line volume_breakout would just stop getting new data, in silence.
+    if dropped > 1:
+        logger.warning(
+            "CoinGecko: %s - %d of %d points were not stamped 00:00:00 UTC and were dropped "
+            "(1 is expected); kept %d",
+            gecko_id, dropped, len(prices), len(records),
+        )
 
     return records
 

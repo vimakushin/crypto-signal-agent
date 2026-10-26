@@ -165,13 +165,17 @@ def collect_daily_revenue(watchlist_slugs: list[str]) -> list[dict]:
         watchlist_slugs: config.yaml watchlist.defillama_protocols.
 
     Returns:
-        List of dicts ready for storage/db.py's save_defillama_daily_revenue:
+        List of dicts ready for storage/db.py's save_defillama_daily_revenue,
+        for FINISHED days only (date before today's UTC date; today's partial
+        figure is never returned - see the comment inside):
         protocol_slug, date, revenue_usd, fetched_at (one shared fetched_at
         for the whole call - when THIS collection run happened, not when any
         individual historical day's revenue was itself recorded by
         DeFiLlama).
     """
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    fetched_at = now.isoformat()
+    today_utc = now.date().isoformat()
     records: list[dict] = []
     for slug in watchlist_slugs:
         try:
@@ -184,7 +188,18 @@ def collect_daily_revenue(watchlist_slugs: list[str]) -> list[dict]:
             )
             continue
 
-        daily_revenue = history["daily_revenue"][-LIVE_DAILY_REVENUE_WINDOW_DAYS:]
+        # Only days that have ended (date < today UTC). DeFiLlama already
+        # serves today's partial figure in the morning (measured 23 Oct 2026:
+        # 15 of 25 protocols had a row for the 23rd), and INSERT OR IGNORE
+        # in storage/db.py would freeze that first partial value forever:
+        # about a third of such first values were more than 10% below the
+        # finished day. Filtered BEFORE the 100-day cut so the window is
+        # 100 finished days. Rows already stored by earlier runs are not
+        # touched here (the owner re-fetches them separately).
+        finished_days = [
+            pair for pair in history["daily_revenue"] if pair[0] < today_utc
+        ]
+        daily_revenue = finished_days[-LIVE_DAILY_REVENUE_WINDOW_DAYS:]
         for date_str, revenue in daily_revenue:
             records.append({
                 "protocol_slug": slug,

@@ -164,16 +164,28 @@ CREATE TABLE IF NOT EXISTS defillama_daily_revenue_restated (
 CREATE INDEX IF NOT EXISTS idx_defillama_daily_revenue_restated_slug_date
     ON defillama_daily_revenue_restated (protocol_slug, date);
 
--- One row per calendar date for which the Telegram digest was actually sent:
--- the digest task is retried every 2 hours (see config.yaml schedule), and
--- this mark is what makes the later runs exit without sending a second one.
--- stale=1 means it went out with the "data are stale" warning; then one more
--- digest (at most two per date) is allowed once the data are fresh, and the
--- row is updated to stale=0.
+-- One row per DATA date for which the Telegram digest was actually sent (the
+-- latest day all three sources have data for - not the clock at the moment of
+-- sending; 26 Oct 2026 a run at 01:58 caught midnight and sent yesterday's
+-- data as "за 26 октября"). The digest task is retried every 2 hours (see
+-- config.yaml schedule), and this mark is what makes the later runs exit
+-- without sending a second digest for the same data.
+-- `stale` is no longer written or read (since 26 Oct 2026 fresh data means a
+-- new data date, so there is no "second digest for one date"). The column is
+-- left in place: dropping it would mean rebuilding the live table for nothing;
+-- old rows keep their 0/1, new rows get the default 0.
 CREATE TABLE IF NOT EXISTS digest_sends (
     digest_date TEXT PRIMARY KEY,
     sent_at TEXT NOT NULL,
     stale INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per calendar day on which the short "collection did not run" notice
+-- was sent (at most one a day). Kept apart from digest_sends on purpose: a
+-- notice is not a digest and must not make a date look like its digest left.
+CREATE TABLE IF NOT EXISTS collection_notices (
+    notice_date TEXT PRIMARY KEY,
+    sent_at TEXT NOT NULL
 );
 
 -- Closed daily candles of the watchlist Binance Futures coins (volume in USDT),
@@ -398,8 +410,11 @@ def get_defillama_daily_revenue_window(
     Unlike get_coingecko_price_history_before above (which EXCLUDES its
     `before_date`, so "today" never leaks into its own comparison baseline),
     this deliberately includes `end_date` itself: it is the direct
-    replacement for DeFiLlama's own revenue_total_7d - "the last 7 days,
-    counting today" - not a lookback baseline that must exclude today. Both
+    replacement for DeFiLlama's own revenue_total_7d - "the last 7 days" -
+    not a lookback baseline that must exclude its last day. (The live signal
+    now passes the last FINISHED UTC day as `end_date`, not today: see
+    signals/revenue_price_gap.py scan_watchlist. This function does not care
+    which day it is given.) Both
     `end_date` and the stored `date` column are plain "YYYY-MM-DD" strings
     (like coingecko_price_history.date - see
     get_coingecko_price_history_before's docstring for why that means no
@@ -1092,35 +1107,65 @@ def backup_problem(config: dict) -> BackupProblem | None:
     return problem
 
 
-def get_digest_send_stale(conn: sqlite3.Connection, digest_date: date) -> bool | None:
-    """State of the digest_sends mark for `digest_date`.
-
-    Returns:
-        None if no digest was sent for that date; True if it was sent on
-        stale data (a fresh one may follow); False if it was sent and is final.
-    """
-    row = conn.execute(
-        "SELECT stale FROM digest_sends WHERE digest_date = ?", (digest_date.isoformat(),)
-    ).fetchone()
-    return None if row is None else bool(row["stale"])
-
-
-def record_digest_sent(
-    conn: sqlite3.Connection, digest_date: date, sent_at: str, stale: bool
-) -> None:
-    """Remember that the digest for `digest_date` went out; a second call for
-    the same date (the fresh digest after a stale one) updates the row.
+def get_data_date(conn: sqlite3.Connection, today: date) -> date:
+    """The date the digest is named after: the EARLIEST of the local dates of
+    the last successful collections of the three sources, i.e. the latest day
+    for which there is data from all of them.
 
     Args:
         conn: open connection to the live database.
-        digest_date: the local date the digest is for.
+        today: the local date of this run, taken once at its start. Returned
+            only when no source has ever been collected (an empty database).
+
+    Returns:
+        The earliest of the sources' last-collection local dates (a source
+        that has never been collected is skipped), or `today` if none has.
+    """
+    latest = (
+        get_latest_defillama_fetch_time(conn),
+        get_latest_coingecko_fetch_time(conn),
+        get_latest_binance_oi_fetch_time(conn),
+    )
+    days = [datetime.fromisoformat(iso).astimezone().date() for iso in latest if iso is not None]
+    return min(days) if days else today
+
+
+def get_digest_send_dates(conn: sqlite3.Connection) -> set[date]:
+    """Data dates for which a digest has already been sent (digest_sends)."""
+    return {date.fromisoformat(row[0]) for row in conn.execute("SELECT digest_date FROM digest_sends")}
+
+
+def record_digest_sent(conn: sqlite3.Connection, digest_date: date, sent_at: str) -> None:
+    """Remember that the digest for the data date `digest_date` went out.
+
+    Args:
+        conn: open connection to the live database.
+        digest_date: the DATA date the digest is named after.
         sent_at: ISO 8601 timestamp of the send.
-        stale: True if it was built on stale data (a fresh one may follow).
     """
     conn.execute(
-        "INSERT INTO digest_sends (digest_date, sent_at, stale) VALUES (?, ?, ?) "
-        "ON CONFLICT(digest_date) DO UPDATE SET sent_at = excluded.sent_at, stale = excluded.stale",
-        (digest_date.isoformat(), sent_at, int(stale)),
+        "INSERT OR REPLACE INTO digest_sends (digest_date, sent_at) VALUES (?, ?)",
+        (digest_date.isoformat(), sent_at),
+    )
+    conn.commit()
+
+
+def get_collection_notice_dates(conn: sqlite3.Connection) -> set[date]:
+    """Calendar days on which the "collection did not run" notice was sent."""
+    return {date.fromisoformat(row[0]) for row in conn.execute("SELECT notice_date FROM collection_notices")}
+
+
+def record_collection_notice_sent(conn: sqlite3.Connection, notice_date: date, sent_at: str) -> None:
+    """Remember that today's "collection did not run" notice went out.
+
+    Args:
+        conn: open connection to the live database.
+        notice_date: the local calendar day of the notice.
+        sent_at: ISO 8601 timestamp of the send.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO collection_notices (notice_date, sent_at) VALUES (?, ?)",
+        (notice_date.isoformat(), sent_at),
     )
     conn.commit()
 

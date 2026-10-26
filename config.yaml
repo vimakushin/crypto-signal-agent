@@ -315,7 +315,7 @@ schedule:
   # locked database (the backup was copying it), on the 3rd there was no
   # internet; nothing retried either, so no signals were computed on those
   # two days. Repeats are harmless: `main.py --skip-if-fresh` exits at once if
-  # today's data are already collected, and the digest exits if today's was
+  # today's data are already collected, and the digest exits if the one for the current data was
   # already sent (digest_sends table). Read by
   # scripts/register_scheduled_task.ps1 - re-run it after changing these.
   retry_interval_hours: 2
@@ -370,7 +370,7 @@ backup:
   # Google Drive was not running and the G: drive was absent - two weeks with
   # no backup, noticed only by the audit. On 22 Oct the path was briefly moved
   # to a OneDrive folder, but OneDrive turned out not to be installed on this
-  # machine (the folder was just a local directory), so on 23 Oct the path
-  # went back here once Google Drive was running again. If G: is missing the
+  # machine (the folder was just a local directory), so on 22 Oct (the first backup on G: is
+  # 02:41, git a82b85d) the path went back here once Google Drive was running again. If G: is missing the
   # digest now opens with a warning (storage/db.py's backup_problem).
   backup_dir: "G:\\My Drive\\crypto-signal-agent-backups"
