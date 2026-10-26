@@ -61,9 +61,22 @@ the user to choose between (this script doesn't guess):
 
 Rotation
 --------
-Only the most recent --keep backups (default: 14, i.e. two weeks of daily
-backups) are kept - older ones are deleted automatically so this doesn't
-grow forever. Rotation only ever touches files matching this script's own
+Two rules, both decided by the pure function select_backups_to_delete():
+
+  1. Backups from the last --keep-days DAYS (default 14) are kept; older ones
+     are deleted. Age is counted in days from the date in the file NAME
+     (db_YYYYMMDD_HHMMSS.sqlite) to today's local date - not from the file's
+     modification time, which is unreliable on Google Drive. Why days and not
+     "the last N files" (the earlier rule): manual backups (4 on 22 Oct and 2
+     on 25 Oct 2026) pushed the daily ones out, so 14 files covered only
+     about 9 days. The protection depth must be measured in days.
+  2. For every calendar month, the EARLIEST backup present in the folder is
+     never deleted, however old. Why: if the database is corrupted quietly,
+     within two weeks every daily backup contains the corruption and there is
+     nothing to roll back to. A backup from the start of each month costs
+     ~36 MB and gives a way back to a state that predates the damage.
+
+Rotation only ever touches files matching this script's own
 `db_YYYYMMDD_HHMMSS.sqlite` naming pattern inside --backup-dir, never
 anything else that might be stored there (e.g. if --backup-dir points at a
 shared cloud folder with other files in it).
@@ -71,7 +84,7 @@ shared cloud folder with other files in it).
 Usage
 -----
     .venv\\Scripts\\python.exe scripts\\backup_db.py
-    .venv\\Scripts\\python.exe scripts\\backup_db.py --backup-dir "C:\\Users\\<you>\\OneDrive\\crypto-signal-agent-backups" --keep 30
+    .venv\\Scripts\\python.exe scripts\\backup_db.py --backup-dir "C:\\Users\\<you>\\OneDrive\\crypto-signal-agent-backups" --keep-days 30
 
 Safe to run repeatedly / on a schedule: creates --backup-dir if it doesn't
 exist yet, never overwrites a previous backup (each filename carries its own
@@ -86,9 +99,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -111,10 +125,11 @@ from storage.db import SQLITE_BUSY_TIMEOUT_SECONDS  # noqa: E402
 # looks like.
 DEFAULT_BACKUP_DIR = PROJECT_ROOT / "backups"
 
-# Two weeks of daily backups. Generous enough to recover from "didn't notice
-# a problem for a few days", cheap enough (each backup is a full copy of
-# storage/db.sqlite) not to worry about disk space on a personal PC.
-DEFAULT_KEEP = 14
+# Two weeks, counted in days (not files - see the module docstring's
+# "Rotation"). Generous enough to recover from "didn't notice a problem for a
+# few days", cheap enough (each backup is a full copy of storage/db.sqlite)
+# not to worry about disk space on a personal PC.
+DEFAULT_KEEP_DAYS = 14
 
 BACKUP_FILENAME_FORMAT = "db_%Y%m%d_%H%M%S.sqlite"
 # Matches exactly what BACKUP_FILENAME_FORMAT produces - used by
@@ -122,6 +137,7 @@ BACKUP_FILENAME_FORMAT = "db_%Y%m%d_%H%M%S.sqlite"
 # --backup-dir, never anything else that might be stored there (e.g. a
 # shared cloud-sync folder used for other things too).
 BACKUP_FILENAME_GLOB = "db_????????_??????.sqlite"
+_BACKUP_FILENAME_RE = re.compile(r"db_(\d{8})_\d{6}\.sqlite")
 
 
 def _setup_logging() -> None:
@@ -224,27 +240,60 @@ def backup_database(db_path: Path, backup_dir: Path) -> Path:
     return backup_path
 
 
-def _rotate_backups(backup_dir: Path, keep: int) -> None:
-    """Delete all but the `keep` most recent backups in `backup_dir`.
+def select_backups_to_delete(
+    filenames: list[str], today: date, keep_days: int
+) -> list[str]:
+    """Decide which backup files rotation should delete (pure: no files, no
+    clock - see the module docstring's "Rotation" for the two rules and why).
 
-    Only touches files matching BACKUP_FILENAME_GLOB (this script's own
-    `db_YYYYMMDD_HHMMSS.sqlite` naming) - anything else in `backup_dir`
-    (e.g. other files in a shared cloud-sync folder) is left untouched.
-    Sorting is lexicographic on the filename, which is equivalent to
-    chronological order here because the timestamp format is fixed-width
-    and zero-padded (YYYYMMDD_HHMMSS) - no need to parse each name back into
-    a datetime just to sort it.
+    Args:
+        filenames: file names (not paths) found in the backup folder. Names
+            not matching `db_YYYYMMDD_HHMMSS.sqlite` are ignored entirely
+            and never returned.
+        today: today's local date; age is today minus the date in the name.
+        keep_days: backups at most this many days old are kept (exactly
+            keep_days days old is kept, keep_days + 1 is not).
+
+    Returns:
+        Sorted names to delete: older than keep_days days and not the
+        earliest backup of their calendar month.
+    """
+    dated: list[tuple[str, date]] = []
+    for name in filenames:
+        match = _BACKUP_FILENAME_RE.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            dated.append((name, datetime.strptime(match.group(1), "%Y%m%d").date()))
+        except ValueError:  # e.g. db_20261345_...: looks like ours, isn't a date
+            continue
+
+    earliest_of_month: dict[tuple[int, int], str] = {}
+    for name, day in sorted(dated):  # names sort chronologically
+        earliest_of_month.setdefault((day.year, day.month), name)
+    protected = set(earliest_of_month.values())
+
+    return sorted(
+        name
+        for name, day in dated
+        if (today - day).days > keep_days and name not in protected
+    )
+
+
+def _rotate_backups(backup_dir: Path, keep_days: int) -> None:
+    """Delete backups in `backup_dir` that select_backups_to_delete() picks
+    (older than `keep_days` days, except each month's earliest one).
 
     Args:
         backup_dir: directory backups were written into.
-        keep: how many of the newest backups to retain.
+        keep_days: how many days of backups to retain.
     """
-    existing = sorted(backup_dir.glob(BACKUP_FILENAME_GLOB))
-    surplus = existing[:-keep] if keep > 0 else existing
-    for old_backup in surplus:
+    names = [p.name for p in backup_dir.glob(BACKUP_FILENAME_GLOB)]
+    for name in select_backups_to_delete(names, date.today(), keep_days):
+        old_backup = backup_dir / name
         try:
             old_backup.unlink()
-            logger.info("Rotation: deleted old backup %s", old_backup.name)
+            logger.info("Rotation: deleted old backup %s", name)
         except OSError as exc:
             # A single backup file that can't be deleted (e.g. locked open
             # by another program, like being previewed in Explorer) must not
@@ -279,10 +328,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--keep",
+        "--keep-days",
         type=int,
-        default=DEFAULT_KEEP,
-        help=f"How many most-recent backups to retain (default: {DEFAULT_KEEP}).",
+        default=DEFAULT_KEEP_DAYS,
+        help=(
+            f"Keep backups from the last N days (default: {DEFAULT_KEEP_DAYS}); "
+            "each month's earliest backup is kept forever."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -338,7 +390,7 @@ def main() -> None:
     if not backup_dir.is_absolute():
         backup_dir = PROJECT_ROOT / backup_dir
 
-    logger.info("Backing up %s -> %s (keeping last %d backup(s))", db_path, backup_dir, args.keep)
+    logger.info("Backing up %s -> %s (keeping %d days + each month's earliest)", db_path, backup_dir, args.keep_days)
 
     try:
         backup_path = backup_database(db_path, backup_dir)
@@ -353,7 +405,7 @@ def main() -> None:
     logger.info("Backup created: %s (%.2f MB)", backup_path, size_mb)
 
     try:
-        _rotate_backups(backup_dir, args.keep)
+        _rotate_backups(backup_dir, args.keep_days)
     except Exception:
         # Rotation failing must not make a fresh, successful backup look
         # like a failed run - log it and still exit 0, the backup itself is

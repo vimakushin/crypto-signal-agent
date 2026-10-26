@@ -198,7 +198,7 @@ To change where backups are stored, edit `backup.backup_dir` in `config.yaml`. T
 .venv\Scripts\python.exe scripts\backup_db.py --backup-dir "C:\path\for\a\one-off\test"
 ```
 
-The 14 most recent backups are kept (`--keep` changes that number); older ones are deleted automatically. Log: `logs\backup.log`.
+Backups from the last 14 days are kept (`--keep-days` changes that number); older ones are deleted automatically, except the earliest backup of each calendar month, which is kept forever (if the database is corrupted quietly, all recent copies would carry the damage). Log: `logs\backup.log`.
 
 ### Version control (git)
 
