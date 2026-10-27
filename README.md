@@ -115,6 +115,8 @@ Four separate Windows Task Scheduler tasks:
 - **`CryptoSignalAgent-Backup`** — once a day, `scripts\backup_db.py`.
 - **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`), then retried every 2 hours for 10 hours.
 
+The digest is named after the date of its data — the earliest of the last-collection dates of the three sources — not after the clock at the moment of sending.
+
 Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.yaml`, re-run this once to apply it:
 
 ```powershell
@@ -154,7 +156,7 @@ If the scheduled tasks ever disappear (a Windows reinstall, moving to a new mach
 
 #### Failure modes: when a run fails
 
-The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date of its data (a row in the `digest_sends` table marks it as sent). The digest is named after the date of its data — the earliest of the last-collection dates of the three sources — not after the clock at the moment of sending. A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. If the collection did not run and the digest for the last data already went out, instead of a digest there is one short notice a day (table `collection_notices`) saying for how many days the collection has not run, with the last run of the scheduler tasks when it can be read.
+The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date of its data (a row in the `digest_sends` table marks it as sent). A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. If the collection did not run and the digest for the last data already went out, instead of a digest there is one short notice a day (table `collection_notices`) saying for how many days the collection has not run, with the last run of the scheduler tasks when it can be read.
 
 If the computer is off at the scheduled time, the missed runs start once it is back on — all of them at the same moment, whatever times they were set to. Two things keep that from breaking a day: a process that finds the database busy waits for it (up to 5 minutes) instead of failing, and the digest, if today's data isn't in yet, waits for the collection (up to 30 minutes) before it is built.
 
