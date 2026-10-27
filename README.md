@@ -8,7 +8,7 @@ A daily market-surveillance service. Every day it collects revenue, market cap a
 
 Unusual behaviour in market data is easy to miss, and hard to tell apart from a glitch in the data itself. The service watches for three kinds of oddity: protocol revenue growing while the token's market cap doesn't react, futures positioning building up while price stays flat, and a price breakout on abnormal volume. Every day, a Telegram bot sends a list of the coins that stood out — with a breakdown of exactly which detector fired and on what numbers. The system only marks; whether there is an explanation behind the oddity is for a human to find out.
 
-This isn't a trading bot. It never says "buy" or "sell," never names a price target, and never places an order.
+Trading is out of scope, as the requirements specification put it from the start. This isn't a trading bot. It never says "buy" or "sell," never names a price target, and never places an order.
 
 ## Where the project started
 
@@ -35,7 +35,7 @@ All thresholds, signal weights, the watchlist and the schedule live in `config.y
 
 ## What's working today
 
-MVP readiness is defined in [`MVP.md`](MVP.md) — six concrete items, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six items hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
+MVP readiness is defined in [`MVP.md`](MVP.md) as six acceptance criteria, each either met or not, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six items hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
 
 Beyond MVP, one screen of the web UI exists: manual labeling of signal episodes (see "Web UI — episode labeling"). A candidate list, signal history and weight editing in the web UI are not built. The backtest of 15 September 2026 was computed with a replay tool that looked one day ahead (found on 12 October) and was redone on 15 October with the corrected tool: the share of "it worked" among episodes is not above a random coin's, and the sample is far too small to settle it either way — see "Where the project started" above and [`BACKLOG.md`](BACKLOG.md).
 
@@ -52,7 +52,7 @@ Every line of code here was written and reviewed through Claude Code, with the w
 
 The default order is: the relevant agent writes the change → `code-reviewer` checks it → if it's a signal, `signal-validator` checks it too → any blocking finding gets fixed before moving on to the next thing.
 
-MVP readiness was defined up front, in writing, in [`MVP.md`](MVP.md) — six items, and anything not on that list is simply out of scope for MVP. Every deviation from the current item gets called out explicitly rather than slipped in quietly. Decisions that were deliberately deferred — with the reasoning for deferring them, not just dropped — are logged in [`BACKLOG.md`](BACKLOG.md) and re-read before each new round of work.
+The requirements were written down before any code, in September 2026, in a requirements specification ([`TZ_crypto_early_signal_detector.md`](TZ_crypto_early_signal_detector.md), in Russian). It records the original idea, from before the measurement, and is not rewritten. MVP readiness was defined up front, in writing, in [`MVP.md`](MVP.md) — six acceptance criteria, and anything not on that list is simply out of scope for MVP. Every deviation from the current item gets called out explicitly rather than slipped in quietly. [`BACKLOG.md`](BACKLOG.md) is the decision log: what was deliberately deferred and what was decided along the way, each with its date and reasoning, not just dropped. It is re-read before each new round of work.
 
 ---
 
@@ -115,19 +115,11 @@ Four separate Windows Task Scheduler tasks:
 - **`CryptoSignalAgent-Backup`** — once a day, `scripts\backup_db.py`.
 - **`CryptoSignalAgent-TelegramDigest`** — once a day, `notifications\telegram_bot.py` (which also updates `observations.md`), then retried every 2 hours for 10 hours.
 
-The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date of its data (a row in the `digest_sends` table marks it as sent). The digest is named after the date of its data — the earliest of the last-collection dates of the three sources — not after the clock at the moment of sending. A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. If the collection did not run and the digest for the last data already went out, instead of a digest there is one short notice a day (table `collection_notices`) saying for how many days the collection has not run, with the last run of the scheduler tasks when it can be read.
-
-What a retry does not fix: "today's data is in" means at least one row was collected today. A collection that got only some of the coins (CoinGecko's rate limit, for instance) counts as done and is not repeated.
-
-Because of this, starting these two tasks by hand may do nothing: `Start-ScheduledTask` on the DeFiLlama task exits within a second if today's data is already collected, and on the digest task if the digest for the current data has already gone out. To collect regardless, run `main.py --cycle defillama` yourself (without `--skip-if-fresh`). To send that digest again, delete its row from `digest_sends` first.
-
 Times and frequency live in `config.yaml` (`schedule.*`). After editing `config.yaml`, re-run this once to apply it:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_scheduled_task.ps1
 ```
-
-If the computer is off at the scheduled time, the missed runs start once it is back on — all of them at the same moment, whatever times they were set to. Two things keep that from breaking a day: a process that finds the database busy waits for it (up to 5 minutes) instead of failing, and the digest, if today's data isn't in yet, waits for the collection (up to 30 minutes) before it is built.
 
 Check status:
 
@@ -160,13 +152,25 @@ The log always explains exactly why a coin got a signal, and separately distingu
 
 If the scheduled tasks ever disappear (a Windows reinstall, moving to a new machine), recreate them with the same `register_scheduled_task.ps1` command above.
 
+#### When a run fails (failure modes)
+
+The retries exist because one failed run used to cost a whole day (2–3 October 2026: a locked database one day, no internet the next — see `BACKLOG.md`). They are harmless on a normal day: the collection exits at once if today's data is already in, and the digest is sent once per date of its data (a row in the `digest_sends` table marks it as sent). The digest is named after the date of its data — the earliest of the last-collection dates of the three sources — not after the clock at the moment of sending. A digest that couldn't be sent leaves no mark, so the next run two hours later tries again. If the collection did not run and the digest for the last data already went out, instead of a digest there is one short notice a day (table `collection_notices`) saying for how many days the collection has not run, with the last run of the scheduler tasks when it can be read.
+
+If the computer is off at the scheduled time, the missed runs start once it is back on — all of them at the same moment, whatever times they were set to. Two things keep that from breaking a day: a process that finds the database busy waits for it (up to 5 minutes) instead of failing, and the digest, if today's data isn't in yet, waits for the collection (up to 30 minutes) before it is built.
+
+What a retry does not fix: "today's data is in" means at least one row was collected today. A collection that got only some of the coins (CoinGecko's rate limit, for instance) counts as done and is not repeated.
+
+Because of this, starting the DeFiLlama and digest tasks by hand may do nothing: `Start-ScheduledTask` on the DeFiLlama task exits within a second if today's data is already collected, and on the digest task if the digest for the current data has already gone out. To collect regardless, run `main.py --cycle defillama` yourself (without `--skip-if-fresh`). To send that digest again, delete its row from `digest_sends` first.
+
+Stale data and a missing backup are reported at the top of the digest, before any coin — see the paragraph on logs above and "Database backups" below.
+
 ### The observations journal (`observations.md`)
 
 An early, cut-down version of manual labeling: a plain markdown table at the project root, committed to git. Every day, when the Telegram digest goes out, one row gets added per new candidate — no more than once every 30 days for the same coin, so a signal that stays fired for weeks doesn't flood the journal with near-duplicates — with the date, the coin, its score, which signals fired, and price/market cap at that moment. Seven days later, the system fills in the actual price/market cap on its own. The "after 14 days," "after 30 days," and "Verdict" columns are filled in by hand; the code never touches them.
 
 ### Web UI — episode labeling
 
-The first screen of the internal web UI (TZ section 6): manual "did it hold up" labeling for signal firings. Not a product for end users — that stays Telegram-only — this is a local tool for the owner, since manual "worked / didn't work" labels are the only honest data behind future weight calibration.
+The first screen of the internal web UI (functional requirement 5 in section 6 of the requirements specification): manual "did it hold up" labeling for signal firings. Not a product for end users — that stays Telegram-only — this is a local tool for the owner, since manual "worked / didn't work" labels are the only honest data behind future weight calibration.
 
 ```powershell
 .venv\Scripts\python.exe -m uvicorn web.app:app --host 127.0.0.1 --port 8000
@@ -232,3 +236,7 @@ copy "<backup_dir>\db_YYYYMMDD_HHMMSS.sqlite" "storage\db.sqlite"
 ## License
 
 [MIT](LICENSE)
+
+---
+
+How the work on this project is run — documents, roles, and how the original claim was dropped: [How the work is done](https://github.com/vimakushin/vimakushin/blob/main/how-the-work-is-done.md).
