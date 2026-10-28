@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notifications.telegram_bot import (  # noqa: E402
     _GAP_SENTENCE, _digest_text_revenue_price_gap, _freshness_label, _digest_text_volume_breakout, _market_background_line,
-    _BOLD_OFF, _BOLD_ON, _data_gap_note, _market_footer, _revenue_window_phrase, _to_html, _volume_background_line,
+    _BOLD_OFF, _BOLD_ON, _data_gap_note, _market_sentence, _revenue_window_phrase, _to_html, _volume_background_line,
 )  # noqa: E402
 from collectors import binance_futures  # noqa: E402
 from storage.db import (  # noqa: E402
@@ -260,16 +260,31 @@ class CardTests(unittest.TestCase):
         text = _market_background_line(contribution, "aave-v2", self.conn, self.CONFIG)
         self.assertIn("сравнить с рынком нельзя", text)
 
-    def test_market_explanation_is_said_once_in_the_footer(self):
-        self.assertEqual(
-            _market_footer({25}),
-            "Рынок — серединное значение (половина монет выше, половина ниже) "
-            "по 25 монетам Binance. Монета самой карточки в свой рынок не входит.",
-        )
+    def test_market_explanation_is_said_once_in_the_header(self):
+        self.assertEqual(_market_sentence({25}), "Рынок — 25 монет Binance, кроме самой монеты карточки.")
         # a card whose coin is in the list has a market one coin smaller
-        self.assertIn("по 25–26 монетам", _market_footer({26, 25}))
+        self.assertIn("25–26 монет", _market_sentence({26, 25}))
         self.assertEqual(_data_gap_note(20, 25), "Данные нашлись у 20 из 25.")
         self.assertEqual(_data_gap_note(25, 25), "")
+
+    def test_price_window_is_dropped_from_the_card_only_when_it_is_the_common_one(self):
+        for date_, price in (("2026-10-15", 100.0), ("2026-10-22", 105.0)):
+            self.conn.execute(
+                "INSERT INTO coingecko_price_history (gecko_id, protocol_slug, date, fetched_at, price) "
+                "VALUES ('aave', 'aave-v2', ?, ?, ?)", (date_, END, price),
+            )
+        for symbol, end in (("BTCUSDT", 110), ("ETHUSDT", 120), ("SOLUSDT", 130)):
+            add_prices(self.conn, symbol, 100, end)
+        contribution = SimpleNamespace(
+            signal_name="revenue_price_gap",
+            details={"revenue_window_first": "2026-10-15", "revenue_window_last": "2026-10-21"},
+        )
+        common = "с 15 октября 00:00 по 22 октября 00:00 (время UTC)"
+        same = _market_background_line(contribution, "aave-v2", self.conn, self.CONFIG, None, common)
+        self.assertTrue(same.startswith("Цена за те же дни: монета AAVE"))
+        self.assertNotIn("октября", same)
+        other = _market_background_line(contribution, "aave-v2", self.conn, self.CONFIG, None, "другое окно")
+        self.assertIn("с 15 октября 00:00 по 22 октября 00:00", other)
 
     def test_revenue_card_says_what_was_noticed(self):
         details = {
@@ -278,13 +293,15 @@ class CardTests(unittest.TestCase):
             "revenue_window_count": 7, "lookback_days": 7, "revenue_growth_pct": 40.0,
             "baseline_window_first": "2026-07-26", "baseline_window_last": "2026-10-23",
             "baseline_window_count": 90, "mcap_growth_pct": 2.0,
+            "recent_median_daily_revenue": 15000.0, "baseline_median_daily_revenue": 10000.0,
         }
         lines = _digest_text_revenue_price_gap(details, {}).splitlines()
         # the first line says what happened, the main number in bold; the
         # windows are the header's business (not repeated in the card)
         self.assertEqual(
             lines[0],
-            f"{_GAP_SENTENCE}: медиана дневной выручки на {_BOLD_ON}40%{_BOLD_OFF} выше обычной.",
+            f"{_GAP_SENTENCE}: типичный день — 15,0 тыс. $ против 10,0 тыс. $ за 90 дней, "
+            f"на {_BOLD_ON}40%{_BOLD_OFF} больше.",
         )
         self.assertNotIn("октября", lines[0])
         self.assertNotIn("снизилась", _GAP_SENTENCE)
@@ -298,11 +315,11 @@ class CardTests(unittest.TestCase):
         # the window phrase keeps every date and the "including these days" remark
         self.assertEqual(
             _revenue_window_phrase(details),
-            "медиана за 17–23 октября против медианы за 90 дней (26 июля – 23 октября, включая эти дни)",
+            "типичный день за 17–23 октября против типичного за 90 дней (26 июля – 23 октября, включая эти дни)",
         )
         # a card with other windows says its own
-        own = _digest_text_revenue_price_gap(details, {}, own_window="медиана за 17–22 октября (6 дней)").splitlines()
-        self.assertEqual(own[1], "Для этой монеты сравнение другое: медиана за 17–22 октября (6 дней).")
+        own = _digest_text_revenue_price_gap(details, {}, own_window="типичный день за 17–22 октября (6 дней)").splitlines()
+        self.assertEqual(own[1], "Для этой монеты сравнение другое: типичный день за 17–22 октября (6 дней).")
         # the cap line (its own window) is the LAST line, after the daily
         # revenue, with no remark about the market comparison
         self.assertEqual(lines[-1], "Капитализация токена с 16 по 23 октября изменилась на +2,0%.")
@@ -315,6 +332,7 @@ class CardTests(unittest.TestCase):
             "revenue_window_count": 7, "lookback_days": 7, "revenue_growth_pct": 40.0,
             "baseline_window_first": "2026-07-26", "baseline_window_last": "2026-10-23",
             "baseline_window_count": 90, "mcap_growth_pct": -2.1,
+            "recent_median_daily_revenue": 15000.0, "baseline_median_daily_revenue": 10000.0,
         }
         block = "Цена монеты и рынка, с 17 октября 00:00 по 24 октября 00:00 (время UTC): монета +1,0%, рынок +2,0%."
         lines = _digest_text_revenue_price_gap(details, {}, block).splitlines()
@@ -329,8 +347,14 @@ class CardTests(unittest.TestCase):
             signal_name="revenue_price_gap", protocol_slug="rune",
             episode_start_date="2026-10-06", episode_end_date="2026-10-25",
         )
-        self.assertEqual(_freshness_label(candidate, [episode]), "срабатывает с 6 октября, была и вчера")
-        self.assertEqual(_freshness_label(candidate, []), "первый день срабатывания")
+        self.assertEqual(_freshness_label(candidate, [episode]), "отмечается с 6 октября")
+        self.assertEqual(_freshness_label(candidate, []), "отмечена впервые")
+        # a run that began yesterday must not say "since yesterday, and yesterday too"
+        second = SimpleNamespace(
+            signal_name="revenue_price_gap", protocol_slug="rune",
+            episode_start_date="2026-10-24", episode_end_date="2026-10-25",
+        )
+        self.assertEqual(_freshness_label(candidate, [second]), "отмечается второй день подряд (с 24 октября)")
 
     def test_volume_card_coin_in_list_is_left_out(self):
         for symbol, ratio in (("AAVEUSDT", 90), ("BTCUSDT", 1), ("ETHUSDT", 2), ("SOLUSDT", 3)):

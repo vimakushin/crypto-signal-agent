@@ -338,8 +338,10 @@ _BOLD_OFF = ""
 # signal was really computed from (details_json: revenue_window_*,
 # baseline_window_*, mcap_date_*); a card whose windows differ from the common
 # ones (e.g. 6 days instead of 7) states its own in the card.
-_WINDOW_PHRASE = "медиана за {revenue_dates}{revenue_note} против медианы за {baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)"
-_WINDOW_HEADER = "Выручка сравнивается так: "
+# "Типичный день" is the median (the digest's reader did not know the word,
+# first-user 28 Oct 2026); the header says once that it means the middle value.
+_WINDOW_PHRASE = "типичный день за {revenue_dates}{revenue_note} против типичного за {baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)"
+_WINDOW_HEADER = "Выручка: "
 _WINDOW_OWN = "Для этой монеты сравнение другое: "
 # The market cap is a different quantity from the price the market is compared
 # with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), and its window is another
@@ -350,6 +352,8 @@ _WINDOW_OWN = "Для этой монеты сравнение другое: "
 # участвует)" made readers re-read; away from the price/market pair it is not needed).
 _MCAP_LINE = "Капитализация токена {mcap_dates} изменилась на {mcap}%"
 _BACKGROUND_TITLE = "Цена монеты и рынка, "
+# The same, when the window is the one the header already states.
+_BACKGROUND_SAME_DAYS = "Цена за те же дни: "
 # What the signal compares, in one sentence: revenue growth against market-cap
 # growth (the cap, not the price). The signal fires only when the cap grew by
 # less than revenue did (or fell). 25 Oct 2026: "…выросла слабее выручки или
@@ -365,7 +369,9 @@ _BACKGROUND_TITLE = "Цена монеты и рынка, "
 # number (": медиана дневной выручки на 135% выше обычной."), so it says what
 # happened before how it was counted.
 _GAP_SENTENCE = "Выручка протокола выросла сильнее, чем капитализация его токена"
-_HEADLINE = _GAP_SENTENCE + ": медиана дневной выручки на {growth} выше обычной."
+# The two numbers are in the card itself: "обычная" pointed at the header
+# the reader no longer looks at (first-user, 28 Oct 2026).
+_HEADLINE = _GAP_SENTENCE + ": типичный день — {recent} тыс. $ против {base} тыс. $ за {base_count} {base_days}, на {growth} больше."
 _CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
@@ -574,7 +580,13 @@ def _revenue_window_phrase(details: dict) -> str:
 
 def _revenue_headline(details: dict) -> str:
     """First line of a revenue card: what happened, with the main number in bold."""
-    return _HEADLINE.format(growth=f"{_BOLD_ON}{details['revenue_growth_pct']:.0f}%{_BOLD_OFF}")
+    return _HEADLINE.format(
+        recent=_daily_numbers([details["recent_median_daily_revenue"]]),
+        base=_daily_numbers([details["baseline_median_daily_revenue"]]),
+        base_count=details["baseline_window_count"],
+        base_days=_days_word(details["baseline_window_count"]),
+        growth=f"{_BOLD_ON}{details['revenue_growth_pct']:.0f}%{_BOLD_OFF}",
+    )
 
 
 def _revenue_mcap_line(details: dict) -> str:
@@ -681,6 +693,14 @@ def _window_text(start: str, end: str) -> str:
     return f"с {_moment_ru(start)} по {_moment_ru(end)} (время UTC)"
 
 
+def _revenue_price_moments(details: dict) -> tuple[str, str]:
+    """The two ISO moments of a revenue card's price window (from the card's
+    revenue days alone, so the header can state them before the cards)."""
+    first = date.fromisoformat(details["revenue_window_first"])
+    after_last = date.fromisoformat(details["revenue_window_last"]) + timedelta(days=1)
+    return f"{first.isoformat()}T00:00:00+00:00", f"{after_last.isoformat()}T00:00:00+00:00"
+
+
 def _revenue_price_window(details: dict, conn, slug: str) -> _PriceWindow:
     """Price window of a revenue_price_gap card: the SAME days as the card's
     revenue (revenue_window_first .. revenue_window_last), from 00:00 UTC of
@@ -705,8 +725,7 @@ def _revenue_price_window(details: dict, conn, slug: str) -> _PriceWindow:
             (slug, day.isoformat()),
         ).fetchone()
         prices.append(row["price"] if row else None)
-    start = f"{first.isoformat()}T00:00:00+00:00"
-    end = f"{after_last.isoformat()}T00:00:00+00:00"
+    start, end = _revenue_price_moments(details)
     coin_pct = None if None in prices else (prices[1] - prices[0]) / prices[0] * 100
     return _PriceWindow(start, end, coin_pct, _window_text(start, end))
 
@@ -756,31 +775,32 @@ def _own_symbol(signal_name: str, slug: str, conn) -> str | None:
 def _data_gap_note(n: int, total: int) -> str:
     """Card-specific rest of the market remark: how many of the coins had data
     for this block (empty when all of them did). `total` is already counted
-    without the card's own coin. What "рынок" is stays in _market_footer.
+    without the card's own coin. What "рынок" is stays in _market_sentence.
     """
     return f"Данные нашлись у {n} из {total}." if n < total else ""
 
 
-def _market_footer(totals: set[int]) -> str:
-    """What "рынок" means, said once after the last card instead of under every
-    block (owner, 28 Oct 2026). `totals` are the coin counts of the cards'
-    markets: the card's own coin is left out of its market, so a coin that is
-    in the list gives one less, and the cards can differ ("25–26 монетам").
+def _market_sentence(totals: set[int]) -> str:
+    """What "рынок" means, said once before the first card instead of under
+    every block (owner, 28 Oct 2026). `totals` are the coin counts of the
+    cards' markets: the card's own coin is left out of its market, so a coin
+    that is in the list gives one less, and the cards can differ ("25–26").
+    First-user: the old "Монета самой карточки в свой рынок не входит" had to
+    be read twice.
     """
     counts = f"{min(totals)}–{max(totals)}" if len(totals) > 1 else str(min(totals))
-    return (
-        "Рынок — серединное значение (половина монет выше, половина ниже) "
-        f"по {counts} монетам Binance. Монета самой карточки в свой рынок не входит."
-    )
+    return f"Рынок — {counts} монет Binance, кроме самой монеты карточки."
 
 
-def _market_background_line(contribution, slug: str, conn, config: dict, totals: set[int] | None = None) -> str:
+def _market_background_line(
+    contribution, slug: str, conn, config: dict, totals: set[int] | None = None, common_price_window: str | None = None
+) -> str:
     """The block comparing the coin's PRICE change with the median price change
     of the watchlist coins over the same two moments. Both numbers are prices
     (the coin's market cap or open-interest growth is never compared). Facts
     only, no verdict. Any exception is logged and replaced by a plain line: the
     background must never cost the owner the digest. `totals`, if given,
-    collects the market's coin count for _market_footer.
+    collects the market's coin count for _market_sentence.
     """
     try:
         symbols = config["watchlist"]["binance_futures_symbols"]
@@ -799,10 +819,10 @@ def _market_background_line(contribution, slug: str, conn, config: dict, totals:
         if totals is not None:
             totals.add(change.total)
         gap = _data_gap_note(change.n, change.total)
-        return "\n".join([
-            f"{_BACKGROUND_TITLE}{window.text}:",
-            f"{who} {coin}%, рынок {value}%." + (f" {gap}" if gap else ""),
-        ])
+        line = f"{who} {coin}%, рынок {value}%." + (f" {gap}" if gap else "")
+        if window.text == common_price_window:
+            return f"{_BACKGROUND_SAME_DAYS}{line}"
+        return "\n".join([f"{_BACKGROUND_TITLE}{window.text}:", line])
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
         return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
@@ -848,7 +868,8 @@ def _volume_background_line(contribution, slug: str, conn, config: dict, totals:
 
 
 def _digest_signal_text(
-    contribution, config: dict, conn, slug: str, totals: set[int] | None = None, common_window: str | None = None
+    contribution, config: dict, conn, slug: str, totals: set[int] | None = None, common_window: str | None = None,
+    common_price_window: str | None = None,
 ) -> str:
     """Plain-language sentence for one SignalContribution, plus a market
     background line for signals that show the coin's own % move. Unknown
@@ -856,7 +877,8 @@ def _digest_signal_text(
     (and a warning) so one bad row can't sink the whole digest. `totals`
     collects the market coin counts for the footer; `common_window` is the
     comparison window the header already states - a revenue card repeats its
-    windows only when they differ from it.
+    windows only when they differ from it; `common_price_window` is the same
+    for the price block's window.
     """
     generic = f"{contribution.signal_name}: metric_value={contribution.metric_value}"
     text_fn = _DIGEST_TEXTS.get(contribution.signal_name)
@@ -865,7 +887,7 @@ def _digest_signal_text(
         return generic
     background = ""
     if contribution.signal_name in _PRICE_WINDOWS:
-        background = _market_background_line(contribution, slug, conn, config, totals)
+        background = _market_background_line(contribution, slug, conn, config, totals, common_price_window)
     elif contribution.signal_name == "volume_breakout":
         background = _volume_background_line(contribution, slug, conn, config, totals)
     try:
@@ -901,15 +923,19 @@ def _coin_label(conn, candidate: CandidateScore) -> str:
 
 
 def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
-    """'первый день срабатывания' or 'срабатывает с <дата>, была и вчера',
-    judged by the episode (run of consecutive days of the signal firing, from
+    """'отмечена впервые', 'отмечается второй день подряд (с <дата>)' or
+    'отмечается с <дата>', judged by the episode (run of consecutive days of the signal firing, from
     signal_events) each contribution belongs to. It says only what is counted:
     when the firing run began, NOT when the coin first appeared in a sent
     digest (digest_sends only starts on 5 Oct, signals on 10 Sep) and not how
     long the revenue has been high (the old "идёт с 6 октября" read as a
     revenue duration next to "6 дней").
+    28 Oct 2026: "срабатывает с 27 октября, была и вчера" said the same thing
+    twice when the run began yesterday (first-user did not understand it, and
+    "срабатывает" itself needs a signal vocabulary), hence the three forms.
     """
     starts = []
+    run_day = None
     for contribution in candidate.contributions:
         day = datetime.fromisoformat(contribution.triggered_at).date().isoformat()
         for episode in episodes:
@@ -920,9 +946,13 @@ def _freshness_label(candidate: CandidateScore, episodes: list) -> str:
                 and episode.episode_start_date < day
             ):
                 starts.append(episode.episode_start_date)
+                run_day = date.fromisoformat(day)
     if not starts:
-        return "первый день срабатывания"
-    return f"срабатывает с {_date_ru(date.fromisoformat(min(starts)))}, была и вчера"
+        return "отмечена впервые"
+    start = date.fromisoformat(min(starts))
+    if run_day - start == timedelta(days=1):
+        return f"отмечается второй день подряд (с {_date_ru(start)})"
+    return f"отмечается с {_date_ru(start)}"
 
 
 # Source key (storage.db.sources_without_fetch_today) -> the one word the owner
@@ -1080,6 +1110,16 @@ def format_digest(
                 except (TypeError, ValueError, KeyError):
                     pass  # an old event without the window dates: its card falls back by itself
     common_window = Counter(phrases).most_common(1)[0][0] if phrases else None
+    # The price window of a revenue card is its revenue days; likewise stated once.
+    price_windows = []
+    for candidate in results:
+        for c in candidate.contributions:
+            if c.signal_name == "revenue_price_gap":
+                try:
+                    price_windows.append(_window_text(*_revenue_price_moments(c.details)))
+                except (TypeError, ValueError, KeyError):
+                    pass
+    common_price_window = Counter(price_windows).most_common(1)[0][0] if price_windows else None
     market_totals: set[int] = set()
     multi: list[str] = []
     single: list[str] = []
@@ -1089,7 +1129,9 @@ def format_digest(
             f"{_BOLD_ON}{ticker}{_BOLD_OFF}{space}{rest} · {_freshness_label(candidate, episodes)}"
         )
         texts = [
-            _digest_signal_text(c, config, conn, candidate.protocol_slug, market_totals, common_window)
+            _digest_signal_text(
+                c, config, conn, candidate.protocol_slug, market_totals, common_window, common_price_window
+            )
             for c in candidate.contributions
         ]
         if len({c.signal_name for c in candidate.contributions}) >= 2:
@@ -1102,8 +1144,18 @@ def format_digest(
         else:
             single.append(f"{title}\n{texts[0]}")
 
+    how = []
     if common_window:
-        header += f"\n{_WINDOW_HEADER}{common_window}."
+        how.append(f"{_WINDOW_HEADER}{common_window}.")
+    if common_price_window:
+        how.append(f"Цена монеты и рынка — за те же дни, {common_price_window}.")
+    if market_totals:
+        how.append(_market_sentence(market_totals))
+    if how:
+        header += (
+            "\n\nКак считали. «Типичный» и «рынок» — серединное значение: половина выше, половина ниже.\n"
+            + "\n".join(how)
+        )
     blocks = [warning + header]
     if multi:
         blocks.append(
@@ -1114,8 +1166,6 @@ def format_digest(
             blocks.append("Остальные\n" + "\n\n".join(single))
     elif single:
         blocks.append("\n\n".join(single))
-    if market_totals:
-        blocks.append(_market_footer(market_totals))
     return "\n\n".join(blocks)
 
 
