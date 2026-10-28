@@ -416,6 +416,33 @@ class CardTests(unittest.TestCase):
         # a message cut inside a bold run is closed, or Telegram rejects it
         self.assertEqual(_to_html(f"{_BOLD_ON}cut"), "<b>cut</b>")
 
+    def test_send_uses_html_only_for_the_digest_and_falls_back_to_plain_on_400(self):
+        from notifications import telegram_bot
+        import requests
+
+        sent = []
+
+        def fake_post(url, data, timeout):
+            sent.append(dict(data))
+            response = mock.Mock()
+            if "parse_mode" in data and data["text"].startswith("<b>BAD"):
+                response.status_code = 400
+                error = requests.exceptions.HTTPError("400", response=response)
+                response.raise_for_status.side_effect = error
+            return response
+
+        with mock.patch.object(telegram_bot.requests, "post", side_effect=fake_post):
+            # the digest: HTML and escaped
+            self.assertTrue(telegram_bot.send_telegram_message("t", "c", f"{_BOLD_ON}A{_BOLD_OFF} <&>", bold=True))
+            self.assertEqual((sent[0]["parse_mode"], sent[0]["text"]), ("HTML", "<b>A</b> &lt;&amp;&gt;"))
+            # a notice: plain text, no parse_mode
+            self.assertTrue(telegram_bot.send_telegram_message("t", "c", "a <b> notice"))
+            self.assertNotIn("parse_mode", sent[1])
+            self.assertEqual(sent[1]["text"], "a <b> notice")
+            # Telegram rejects the markup: the same text goes once more, plain
+            self.assertTrue(telegram_bot.send_telegram_message("t", "c", f"{_BOLD_ON}BAD{_BOLD_OFF} x", bold=True))
+            self.assertEqual(sent[-1], {"chat_id": "c", "text": "BAD x"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -254,6 +254,17 @@ def send_telegram_message(
             # where Telegram itself is asking for a retry, so it still goes
             # through the normal backoff loop below.
             if status_code is not None and 400 <= status_code < 500 and status_code != 429:
+                if "parse_mode" in payload:
+                    # Telegram could not parse our markup. A digest without bold
+                    # is better than none: the same text would fail every two
+                    # hours until the window ends, and nobody would be told.
+                    logger.error(
+                        "Telegram rejected the HTML (HTTP %s): %s - sending the same text without formatting",
+                        status_code, last_error_text,
+                    )
+                    plain = _truncate_for_telegram(text).replace(_BOLD_ON, "").replace(_BOLD_OFF, "")
+                    payload = {"chat_id": chat_id, "text": plain}
+                    continue
                 logger.error(
                     "Telegram sendMessage failed with a non-retryable client error "
                     "(attempt %s/%s, HTTP %s): %s",
@@ -332,7 +343,7 @@ _DAILY_LINE = "Выручка по дням, {dates}{note}, тыс. $: {numbers}
 _BOLD_ON = ""
 _BOLD_OFF = ""
 # What is shared by all the revenue cards is said once, in the header (the
-# comparison windows) and after the last card (what "рынок" is); the card keeps
+# comparison windows, the price window, what "рынок" is); the card keeps
 # only what is about its coin. 28 Oct 2026, owner: the same two explanations
 # stood in every card word for word. Every date and number is still the one the
 # signal was really computed from (details_json: revenue_window_*,
@@ -875,7 +886,7 @@ def _digest_signal_text(
     background line for signals that show the coin's own % move. Unknown
     signal_name or a broken details dict falls back to the generic line
     (and a warning) so one bad row can't sink the whole digest. `totals`
-    collects the market coin counts for the footer; `common_window` is the
+    collects the market coin counts for the header's market sentence;`common_window` is the
     comparison window the header already states - a revenue card repeats its
     windows only when they differ from it; `common_price_window` is the same
     for the price block's window.
@@ -1101,24 +1112,18 @@ def format_digest(
     # The comparison windows are the same for nearly every revenue card: the
     # most common ones are stated once under the header, a card with other
     # windows says its own.
-    phrases = []
+    pairs = []  # (comparison windows, price window) of each revenue card
     for candidate in results:
         for c in candidate.contributions:
             if c.signal_name == "revenue_price_gap":
                 try:
-                    phrases.append(_revenue_window_phrase(c.details))
+                    pairs.append((_revenue_window_phrase(c.details), _window_text(*_revenue_price_moments(c.details))))
                 except (TypeError, ValueError, KeyError):
                     pass  # an old event without the window dates: its card falls back by itself
-    common_window = Counter(phrases).most_common(1)[0][0] if phrases else None
-    # The price window of a revenue card is its revenue days; likewise stated once.
-    price_windows = []
-    for candidate in results:
-        for c in candidate.contributions:
-            if c.signal_name == "revenue_price_gap":
-                try:
-                    price_windows.append(_window_text(*_revenue_price_moments(c.details)))
-                except (TypeError, ValueError, KeyError):
-                    pass
+    common_window = Counter(p[0] for p in pairs).most_common(1)[0][0] if pairs else None
+    # The price window is the revenue days, so the header says "те же дни" only
+    # for the price window of the cards that have the common revenue window.
+    price_windows = [p[1] for p in pairs if p[0] == common_window]
     common_price_window = Counter(price_windows).most_common(1)[0][0] if price_windows else None
     market_totals: set[int] = set()
     multi: list[str] = []
