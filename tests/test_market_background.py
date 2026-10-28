@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notifications.telegram_bot import (  # noqa: E402
     _GAP_SENTENCE, _digest_text_revenue_price_gap, _freshness_label, _digest_text_volume_breakout, _market_background_line,
-    _market_note, _volume_background_line,
+    _BOLD_OFF, _BOLD_ON, _data_gap_note, _market_footer, _revenue_window_phrase, _to_html, _volume_background_line,
 )  # noqa: E402
 from collectors import binance_futures  # noqa: E402
 from storage.db import (  # noqa: E402
@@ -220,7 +220,7 @@ class CardTests(unittest.TestCase):
         )
         text = _market_background_line(contribution, "aave-v2", self.conn, self.CONFIG)
         self.assertIn("монета AAVE +5,0%, рынок +20,0%.", text)
-        self.assertIn("по 3 монетам Binance; AAVE в расчёт рынка не входит", text)
+        self.assertNotIn("серединное значение", text)  # said once, in the footer
         self.assertIn("с 15 октября 00:00 по 22 октября 00:00", text)
 
     def test_price_window_follows_revenue_window_not_cap_dates(self):
@@ -260,14 +260,16 @@ class CardTests(unittest.TestCase):
         text = _market_background_line(contribution, "aave-v2", self.conn, self.CONFIG)
         self.assertIn("сравнить с рынком нельзя", text)
 
-    def test_market_note_is_one_short_line(self):
+    def test_market_explanation_is_said_once_in_the_footer(self):
         self.assertEqual(
-            _market_note(25, 25, "RUNE"),
+            _market_footer({25}),
             "Рынок — серединное значение (половина монет выше, половина ниже) "
-            "по 25 монетам Binance; RUNE в расчёт рынка не входит.",
+            "по 25 монетам Binance. Монета самой карточки в свой рынок не входит.",
         )
-        self.assertIn("Данные нашлись у 20 из 25.", _market_note(20, 25, "RUNE"))
-        self.assertIn("Эта монета в расчёт рынка не входит", _market_note(25, 25, "эта монета"))
+        # a card whose coin is in the list has a market one coin smaller
+        self.assertIn("по 25–26 монетам", _market_footer({26, 25}))
+        self.assertEqual(_data_gap_note(20, 25), "Данные нашлись у 20 из 25.")
+        self.assertEqual(_data_gap_note(25, 25), "")
 
     def test_revenue_card_says_what_was_noticed(self):
         details = {
@@ -278,16 +280,29 @@ class CardTests(unittest.TestCase):
             "baseline_window_count": 90, "mcap_growth_pct": 2.0,
         }
         lines = _digest_text_revenue_price_gap(details, {}).splitlines()
-        self.assertIn("Медиана дневной выручки за 17–23 октября", lines[0])
-        self.assertEqual(lines[1], _GAP_SENTENCE)
+        # the first line says what happened, the main number in bold; the
+        # windows are the header's business (not repeated in the card)
+        self.assertEqual(
+            lines[0],
+            f"{_GAP_SENTENCE}: медиана дневной выручки на {_BOLD_ON}40%{_BOLD_OFF} выше обычной.",
+        )
+        self.assertNotIn("октября", lines[0])
         self.assertNotIn("снизилась", _GAP_SENTENCE)
         # the sentence states the signal's condition (cap grew LESS than revenue),
         # so it must not claim the cap "did not follow" when it is +9%
-        self.assertEqual(_GAP_SENTENCE, "Выручка протокола выросла сильнее, чем капитализация его токена.")
+        self.assertEqual(_GAP_SENTENCE, "Выручка протокола выросла сильнее, чем капитализация его токена")
         for mcap_growth in (9.0, -2.1):
             with self.subTest(mcap_growth=mcap_growth):
                 text = _digest_text_revenue_price_gap({**details, "mcap_growth_pct": mcap_growth}, {})
-                self.assertEqual(text.splitlines()[1], _GAP_SENTENCE)
+                self.assertTrue(text.startswith(_GAP_SENTENCE))
+        # the window phrase keeps every date and the "including these days" remark
+        self.assertEqual(
+            _revenue_window_phrase(details),
+            "медиана за 17–23 октября против медианы за 90 дней (26 июля – 23 октября, включая эти дни)",
+        )
+        # a card with other windows says its own
+        own = _digest_text_revenue_price_gap(details, {}, own_window="медиана за 17–22 октября (6 дней)").splitlines()
+        self.assertEqual(own[1], "Для этой монеты сравнение другое: медиана за 17–22 октября (6 дней).")
         # the cap line (its own window) is the LAST line, after the daily
         # revenue, with no remark about the market comparison
         self.assertEqual(lines[-1], "Капитализация токена с 16 по 23 октября изменилась на +2,0%.")
@@ -303,7 +318,7 @@ class CardTests(unittest.TestCase):
         }
         block = "Цена монеты и рынка, с 17 октября 00:00 по 24 октября 00:00 (время UTC): монета +1,0%, рынок +2,0%."
         lines = _digest_text_revenue_price_gap(details, {}, block).splitlines()
-        self.assertEqual(lines[2:5], ["", block, ""])
+        self.assertEqual(lines[1:4], ["", block, ""])
         self.assertIn("изменилась на −2,1%", lines[-1])
         self.assertTrue(all("Капитализация" not in line for line in lines[:-1]))
 
@@ -328,7 +343,7 @@ class CardTests(unittest.TestCase):
         self.assertIn("монета AAVE — в 3,5 раза, рынок — в 2,0 раза.", text)
         self.assertIn("во сколько раз к среднему", text)
         self.assertIn("с 21 октября 00:00 по 22 октября 00:00", text)
-        self.assertIn("по 3 монетам Binance; AAVE в расчёт рынка не входит", text)
+        self.assertNotIn("серединное значение", text)
 
     def test_volume_card_without_market_data_says_so(self):
         contribution = SimpleNamespace(
@@ -346,10 +361,10 @@ class CardTests(unittest.TestCase):
                    "volume_ratio": 3.46, "volume_avg_lookback_days": 30}
         text = _digest_text_volume_breakout(details, {})
         self.assertIn("Цена поднялась выше уровня, державшегося 180 дней", text)
-        self.assertIn("на объёме в 3,5 раза выше среднего за 30 дней", text)
+        self.assertIn(f"на объёме в {_BOLD_ON}3,5 раза{_BOLD_OFF} выше среднего за 30 дней", text)
         self.assertNotIn("пробила", text)
         details["volume_ratio"] = 12.04
-        self.assertIn("в 12,0 раза", _digest_text_volume_breakout(details, {}))
+        self.assertIn("12,0 раза", _digest_text_volume_breakout(details, {}))
         # the decimal comma is for the ratio only: the level's price keeps its point
         self.assertIn("$2.48", text)
 
@@ -368,6 +383,14 @@ class CardTests(unittest.TestCase):
         with self.assertLogs("notifications.telegram_bot", level="ERROR"):
             text = _volume_background_line(contribution, "aave-v2", self.conn, self.CONFIG)
         self.assertIn("сравнить с рынком нельзя", text)
+
+    def test_bold_markers_become_html_and_everything_else_is_escaped(self):
+        # a name from the database with '<' or '&' must not become markup
+        self.assertEqual(
+            _to_html(f"{_BOLD_ON}A&B{_BOLD_OFF} <x> _y_"), "<b>A&amp;B</b> &lt;x&gt; _y_",
+        )
+        # a message cut inside a bold run is closed, or Telegram rejects it
+        self.assertEqual(_to_html(f"{_BOLD_ON}cut"), "<b>cut</b>")
 
 
 if __name__ == "__main__":

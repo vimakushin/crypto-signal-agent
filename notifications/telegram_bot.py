@@ -15,19 +15,22 @@ This module does three things, and nothing else:
 Like scoring/ranker.py, signals/*.py and every other module in this
 project, this only ranks/formats already-collected data for a human to
 review manually - it never recommends or executes a trade (TZ section 1/9).
-No parse_mode is used (see send_telegram_message's docstring) - the text is
-plain, unformatted Telegram text, deliberately, so a coin name or a number
-from the database can never accidentally break Telegram's Markdown/HTML
-parsing.
+Only the digest uses formatting (bold ticker and main number, parse_mode
+HTML), and only through two private markers that _to_html turns into <b> after
+escaping everything else (see send_telegram_message's docstring) - so a coin
+name or a number from the database can never break Telegram's parsing. The
+notices are plain text.
 """
 from __future__ import annotations
 
+import html
 import logging
 import math
 import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import date, datetime, time as time_of_day, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -189,16 +192,32 @@ def _truncate_for_telegram(text: str) -> str:
     return text[:cutoff] + TRUNCATION_SUFFIX
 
 
-def send_telegram_message(token: str, chat_id: str, text: str, what: str = "digest") -> bool:
+def _to_html(text: str) -> str:
+    """The digest's text with _BOLD_ON/_BOLD_OFF markers -> Telegram HTML.
+
+    Everything else is escaped first: a coin name or a reason pulled from the
+    database can contain '<', '&' or '_' that would otherwise be read as
+    markup and fail the API call outright (why parse_mode was off until
+    28 Oct 2026). The markers are control characters that no source text
+    contains, so only our own <b> tags survive. A message cut by
+    _truncate_for_telegram in the middle of a bold run is closed here, or
+    Telegram would reject the unbalanced tag.
+    """
+    if text.count(_BOLD_ON) > text.count(_BOLD_OFF):
+        text += _BOLD_OFF
+    return html.escape(text, quote=False).replace(_BOLD_ON, "<b>").replace(_BOLD_OFF, "</b>")
+
+
+def send_telegram_message(
+    token: str, chat_id: str, text: str, what: str = "digest", bold: bool = False
+) -> bool:
     """Send `text` to `chat_id` via the Telegram Bot API's sendMessage,
     with retry-with-backoff (same shape as
     collectors/defillama.py's _get_with_retry).
 
-    Deliberately does NOT set parse_mode (neither Markdown nor HTML): a
-    coin name or a number pulled from the database can contain characters
-    (e.g. '_', '*', '<') that would otherwise be interpreted as formatting
-    and either break the message or fail the API call outright. Plain text
-    sidesteps that entirely.
+    Plain text by default (no parse_mode): the notices have no formatting and
+    nothing in them needs escaping. With bold=True the text carries
+    _BOLD_ON/_BOLD_OFF markers and goes out as HTML through _to_html.
 
     Args:
         token: Telegram bot token (from .env's TELEGRAM_BOT_TOKEN).
@@ -207,6 +226,7 @@ def send_telegram_message(token: str, chat_id: str, text: str, what: str = "dige
             (see _truncate_for_telegram).
         what: what is being sent, for the log only ("сводка за 26 октября",
             "уведомление о сборе") - so the log does not call a notice a digest.
+        bold: the text uses the bold markers (the digest only).
 
     Returns:
         True if the message was sent successfully, False if all
@@ -215,6 +235,8 @@ def send_telegram_message(token: str, chat_id: str, text: str, what: str = "dige
     """
     url = TELEGRAM_API_URL_TEMPLATE.format(token=token)
     payload = {"chat_id": chat_id, "text": _truncate_for_telegram(text)}
+    if bold:
+        payload = {**payload, "text": _to_html(payload["text"]), "parse_mode": "HTML"}
 
     last_error_text: str | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -303,13 +325,22 @@ _MARK_ONE_DAY = (
     "(обычно у этой монеты — {habitual:.0f}%)"
 )
 _DAILY_LINE = "Выручка по дням, {dates}{note}, тыс. $: {numbers}"
-# Headline sentence of the digest. Every date and number in it is the one the
+# Bold in the digest: two private marker characters, turned into <b> by
+# _to_html after everything else is escaped. At most two bold runs per card -
+# the ticker and the main number; more, and bold stops standing out
+# (owner, 28 Oct 2026: the digest read as one wall of text).
+_BOLD_ON = ""
+_BOLD_OFF = ""
+# What is shared by all the revenue cards is said once, in the header (the
+# comparison windows) and after the last card (what "рынок" is); the card keeps
+# only what is about its coin. 28 Oct 2026, owner: the same two explanations
+# stood in every card word for word. Every date and number is still the one the
 # signal was really computed from (details_json: revenue_window_*,
-# baseline_window_*, mcap_date_*).
-_HEADLINE = (
-    "Медиана дневной выручки за {revenue_dates}{revenue_note} на {growth:.0f}% выше, чем за "
-    "{baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)."
-)
+# baseline_window_*, mcap_date_*); a card whose windows differ from the common
+# ones (e.g. 6 days instead of 7) states its own in the card.
+_WINDOW_PHRASE = "медиана за {revenue_dates}{revenue_note} против медианы за {baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)"
+_WINDOW_HEADER = "Выручка сравнивается так: "
+_WINDOW_OWN = "Для этой монеты сравнение другое: "
 # The market cap is a different quantity from the price the market is compared
 # with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), and its window is another
 # one too (dates of the two DeFiLlama snapshots, not the revenue days) - so the
@@ -330,7 +361,11 @@ _BACKGROUND_TITLE = "Цена монеты и рынка, "
 # signal's condition is exactly "cap growth < revenue growth" (and below the cap
 # threshold; signals/revenue_price_gap.py), so the sentence says that: true for
 # +9% and for a fall alike.
-_GAP_SENTENCE = "Выручка протокола выросла сильнее, чем капитализация его токена."
+# 28 Oct 2026: the sentence is now the card's first line and carries the main
+# number (": медиана дневной выручки на 135% выше обычной."), so it says what
+# happened before how it was counted.
+_GAP_SENTENCE = "Выручка протокола выросла сильнее, чем капитализация его токена"
+_HEADLINE = _GAP_SENTENCE + ": медиана дневной выручки на {growth} выше обычной."
 _CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
@@ -506,9 +541,9 @@ def _days_word(n: int) -> str:
     return "дней"
 
 
-def _revenue_headline(details: dict) -> str:
-    """The digest's headline sentence, naming the real windows. An event
-    saved before the window dates were stored raises KeyError, which
+def _revenue_window_phrase(details: dict) -> str:
+    """The comparison windows of a revenue card, naming the real dates. An
+    event saved before the window dates were stored raises KeyError, which
     _digest_signal_text catches.
     """
     latest_day = date.fromisoformat(details["mcap_date_latest"])
@@ -528,14 +563,18 @@ def _revenue_headline(details: dict) -> str:
     baseline_days_word = _days_word(baseline_count)
     if baseline_count < (baseline_last - baseline_first).days + 1:
         baseline_days_word += " с данными"
-    return _HEADLINE.format(
+    return _WINDOW_PHRASE.format(
         revenue_dates=_date_range_ru(date.fromisoformat(details["revenue_window_first"]), revenue_last),
         revenue_note=revenue_note,
-        growth=details["revenue_growth_pct"],
         baseline_count=baseline_count,
         baseline_days_word=baseline_days_word,
         baseline_dates=_date_range_ru(baseline_first, baseline_last),
     )
+
+
+def _revenue_headline(details: dict) -> str:
+    """First line of a revenue card: what happened, with the main number in bold."""
+    return _HEADLINE.format(growth=f"{_BOLD_ON}{details['revenue_growth_pct']:.0f}%{_BOLD_OFF}")
 
 
 def _revenue_mcap_line(details: dict) -> str:
@@ -553,8 +592,10 @@ def _revenue_mcap_line(details: dict) -> str:
     ) + "."
 
 
-def _digest_text_revenue_price_gap(details: dict, config: dict, background: str = "") -> str:
-    """Headline, the sentence about the point, the price/market block
+def _digest_text_revenue_price_gap(
+    details: dict, config: dict, background: str = "", own_window: str = ""
+) -> str:
+    """Headline (which already says the point), the price/market block
     (`background`, if any), what is visible in the daily numbers (marks), the
     'cannot compare' line if any, the daily numbers, and the market-cap line
     last (its window differs from the price/market one, so it stands apart).
@@ -576,7 +617,9 @@ def _digest_text_revenue_price_gap(details: dict, config: dict, background: str 
     if shape_first is not None and (shape_first, date.fromisoformat(details["shape_window_last"])) != (first, last):
         note = f" (в медиану выше вошли {_date_range_ru(first, last)})"
     texts = _revenue_mark_texts(details, note)
-    lines = [_revenue_headline(details), _GAP_SENTENCE]
+    lines = [_revenue_headline(details)]
+    if own_window:
+        lines.append(_WINDOW_OWN + own_window + ".")
     if background:
         lines += ["", background, ""]
     if texts.marks:
@@ -594,14 +637,14 @@ def _digest_text_volume_breakout(details: dict, config: dict) -> str:
     return (
         f"Цена поднялась выше уровня, державшегося {details['resistance_lookback_days']} дней "
         f"({_price_level(details['resistance_level'])}), на объёме в "
-        f"{ratio} раза выше среднего за "
+        f"{_BOLD_ON}{ratio} раза{_BOLD_OFF} выше среднего за "
         f"{details['volume_avg_lookback_days']} дней."
     )
 
 
 def _digest_text_oi_divergence(details: dict, config: dict) -> str:
     return (
-        f"Открытый интерес по фьючерсам Binance вырос на {details['oi_growth_pct']:.0f}% "
+        f"Открытый интерес по фьючерсам Binance вырос на {_BOLD_ON}{details['oi_growth_pct']:.0f}%{_BOLD_OFF} "
         f"за {details['lookback_hours']:.0f} ч, а цена за это время изменилась на "
         f"{_signed(details['price_change_pct']).replace('.', ',')}%. "
         f"С рынком ниже сравнивается цена, а не рост интереса."
@@ -710,32 +753,34 @@ def _own_symbol(signal_name: str, slug: str, conn) -> str | None:
     return f"{row['symbol']}USDT" if row and row["symbol"] else None
 
 
-def _market_note(n: int, total: int, ticker: str) -> str:
-    """One short line under a background block (price and volume alike): what
-    'рынок' is, how many coins it is taken over, and that the card's own coin
-    is not among them. `total` is already counted without the own coin; the
-    sentence says so for a coin that is in the list and for one that is not.
-
-    Args:
-        n: coins that had data for this block.
-        total: coins the market is taken over (the list without the own coin).
-        ticker: the card coin's ticker, or 'эта монета' when it is unknown.
+def _data_gap_note(n: int, total: int) -> str:
+    """Card-specific rest of the market remark: how many of the coins had data
+    for this block (empty when all of them did). `total` is already counted
+    without the card's own coin. What "рынок" is stays in _market_footer.
     """
-    note = (
-        f"Рынок — серединное значение (половина монет выше, половина ниже) "
-        f"по {total} монетам Binance; {ticker[:1].upper() + ticker[1:]} в расчёт рынка не входит."
+    return f"Данные нашлись у {n} из {total}." if n < total else ""
+
+
+def _market_footer(totals: set[int]) -> str:
+    """What "рынок" means, said once after the last card instead of under every
+    block (owner, 28 Oct 2026). `totals` are the coin counts of the cards'
+    markets: the card's own coin is left out of its market, so a coin that is
+    in the list gives one less, and the cards can differ ("25–26 монетам").
+    """
+    counts = f"{min(totals)}–{max(totals)}" if len(totals) > 1 else str(min(totals))
+    return (
+        "Рынок — серединное значение (половина монет выше, половина ниже) "
+        f"по {counts} монетам Binance. Монета самой карточки в свой рынок не входит."
     )
-    if n < total:
-        note += f" Данные нашлись у {n} из {total}."
-    return note
 
 
-def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
+def _market_background_line(contribution, slug: str, conn, config: dict, totals: set[int] | None = None) -> str:
     """The block comparing the coin's PRICE change with the median price change
     of the watchlist coins over the same two moments. Both numbers are prices
     (the coin's market cap or open-interest growth is never compared). Facts
     only, no verdict. Any exception is logged and replaced by a plain line: the
-    background must never cost the owner the digest.
+    background must never cost the owner the digest. `totals`, if given,
+    collects the market's coin count for _market_footer.
     """
     try:
         symbols = config["watchlist"]["binance_futures_symbols"]
@@ -751,17 +796,19 @@ def _market_background_line(contribution, slug: str, conn, config: dict) -> str:
         value = _signed(change.median_pct).replace(".", ",")
         coin = _signed(window.coin_pct).replace(".", ",")
         who = f"монета {ticker}" if own else "монета"
+        if totals is not None:
+            totals.add(change.total)
+        gap = _data_gap_note(change.n, change.total)
         return "\n".join([
             f"{_BACKGROUND_TITLE}{window.text}:",
-            f"{who} {coin}%, рынок {value}%.",
-            _market_note(change.n, change.total, ticker),
+            f"{who} {coin}%, рынок {value}%." + (f" {gap}" if gap else ""),
         ])
     except Exception:
         logger.exception("Market background failed for %s", contribution.signal_name)
         return "Рыночный фон посчитать не удалось, сравнить с рынком нельзя."
 
 
-def _volume_background_line(contribution, slug: str, conn, config: dict) -> str:
+def _volume_background_line(contribution, slug: str, conn, config: dict, totals: set[int] | None = None) -> str:
     """The volume block of a volume_breakout card: the coin's volume ratio (the
     signal's own volume_ratio) next to the median of the same ratio over the
     watchlist coins, for the same day. A CoinGecko daily point dated D is the
@@ -786,23 +833,30 @@ def _volume_background_line(contribution, slug: str, conn, config: dict) -> str:
         if market.median_ratio is None:
             return f"Рынок посчитать не удалось: {market.reason}. Сравнить с рынком нельзя."
         who = f"монета {ticker}" if own else "монета"
+        if totals is not None:
+            totals.add(market.total)
+        gap = _data_gap_note(market.n, market.total)
         return "\n".join([
             f"Объём за сутки {text}, во сколько раз к среднему за {days} предыдущих суток:",
             "{} — в {} раза, рынок — в {} раза.".format(
                 who, f"{ratio:.1f}".replace(".", ","), f"{market.median_ratio:.1f}".replace(".", ",")
-            ),
-            _market_note(market.n, market.total, ticker),
+            ) + (f" {gap}" if gap else ""),
         ])
     except Exception:
         logger.exception("Volume background failed for %s", contribution.signal_name)
         return "Рыночный фон по объёму посчитать не удалось, сравнить с рынком нельзя."
 
 
-def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
+def _digest_signal_text(
+    contribution, config: dict, conn, slug: str, totals: set[int] | None = None, common_window: str | None = None
+) -> str:
     """Plain-language sentence for one SignalContribution, plus a market
     background line for signals that show the coin's own % move. Unknown
     signal_name or a broken details dict falls back to the generic line
-    (and a warning) so one bad row can't sink the whole digest.
+    (and a warning) so one bad row can't sink the whole digest. `totals`
+    collects the market coin counts for the footer; `common_window` is the
+    comparison window the header already states - a revenue card repeats its
+    windows only when they differ from it.
     """
     generic = f"{contribution.signal_name}: metric_value={contribution.metric_value}"
     text_fn = _DIGEST_TEXTS.get(contribution.signal_name)
@@ -811,12 +865,13 @@ def _digest_signal_text(contribution, config: dict, conn, slug: str) -> str:
         return generic
     background = ""
     if contribution.signal_name in _PRICE_WINDOWS:
-        background = _market_background_line(contribution, slug, conn, config)
+        background = _market_background_line(contribution, slug, conn, config, totals)
     elif contribution.signal_name == "volume_breakout":
-        background = _volume_background_line(contribution, slug, conn, config)
+        background = _volume_background_line(contribution, slug, conn, config, totals)
     try:
         if contribution.signal_name == "revenue_price_gap":
-            return text_fn(contribution.details, config, background)
+            phrase = _revenue_window_phrase(contribution.details)
+            return text_fn(contribution.details, config, background, "" if phrase == common_window else phrase)
         text = text_fn(contribution.details, config)
     except (TypeError, ValueError, KeyError) as exc:
         logger.warning("Digest: could not format details for %s: %s", contribution.signal_name, exc)
@@ -1013,17 +1068,42 @@ def format_digest(
         return f"{warning}{header}: сигналов нет. Система работает, данные собираются."
 
     episodes = _build_all_episodes(conn, since_by_signal)
+    # The comparison windows are the same for nearly every revenue card: the
+    # most common ones are stated once under the header, a card with other
+    # windows says its own.
+    phrases = []
+    for candidate in results:
+        for c in candidate.contributions:
+            if c.signal_name == "revenue_price_gap":
+                try:
+                    phrases.append(_revenue_window_phrase(c.details))
+                except (TypeError, ValueError, KeyError):
+                    pass  # an old event without the window dates: its card falls back by itself
+    common_window = Counter(phrases).most_common(1)[0][0] if phrases else None
+    market_totals: set[int] = set()
     multi: list[str] = []
     single: list[str] = []
     for candidate in results:
-        title = f"{_coin_label(conn, candidate)} · {_freshness_label(candidate, episodes)}"
-        texts = [_digest_signal_text(c, config, conn, candidate.protocol_slug) for c in candidate.contributions]
+        ticker, space, rest = _coin_label(conn, candidate).partition(" ")
+        title = (
+            f"{_BOLD_ON}{ticker}{_BOLD_OFF}{space}{rest} · {_freshness_label(candidate, episodes)}"
+        )
+        texts = [
+            _digest_signal_text(c, config, conn, candidate.protocol_slug, market_totals, common_window)
+            for c in candidate.contributions
+        ]
         if len({c.signal_name for c in candidate.contributions}) >= 2:
-            body = "\n".join(f"• {t}" for t in texts)
+            # Bold only the ticker here: several numbers in bold in one card
+            # would be the "everything is highlighted" the limit is against.
+            body = "\n".join(
+                f"• {t.replace(_BOLD_ON, '').replace(_BOLD_OFF, '')}" for t in texts
+            )
             multi.append(f"{title} · скор {candidate.total_score:.2f}\n{body}")
         else:
             single.append(f"{title}\n{texts[0]}")
 
+    if common_window:
+        header += f"\n{_WINDOW_HEADER}{common_window}."
     blocks = [warning + header]
     if multi:
         blocks.append(
@@ -1034,6 +1114,8 @@ def format_digest(
             blocks.append("Остальные\n" + "\n\n".join(single))
     elif single:
         blocks.append("\n\n".join(single))
+    if market_totals:
+        blocks.append(_market_footer(market_totals))
     return "\n\n".join(blocks)
 
 
@@ -1445,7 +1527,7 @@ def main() -> int:
         conn.close()
     logger.info("Digest text built (%d candidate(s), %d char(s))", len(results), len(digest_text))
 
-    if not send_telegram_message(token, chat_id, digest_text, what=f"сводка за {_date_ru(data_date)}"):
+    if not send_telegram_message(token, chat_id, digest_text, what=f"сводка за {_date_ru(data_date)}", bold=True):
         return 1
     # The "не построилась" fallback is final too: repeating it every two hours
     # would only mean several identical error messages.
