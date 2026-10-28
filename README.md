@@ -220,6 +220,8 @@ git push
 
 `git add .` marks changes as ready to be saved. `git commit` saves a snapshot locally. `git push` sends it to GitHub, off the machine.
 
+One exception: `observations.md` gets new rows from the daily digest run, and its follow-up columns are filled in by hand, so it can't be rebuilt from the database. Commit it separately and add it by name (`git add observations.md`) rather than with `git add .`, or its changes end up in an unrelated commit.
+
 #### Restoring on a new machine
 
 See "Setup" above. Once you've cloned it, the code and `config.yaml` are in place, but:
