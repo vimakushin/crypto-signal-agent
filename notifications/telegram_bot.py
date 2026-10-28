@@ -352,7 +352,7 @@ _BOLD_OFF = ""
 # "Типичный день" is the median (the digest's reader did not know the word,
 # first-user 28 Oct 2026); the header says once that it means the middle value.
 _WINDOW_PHRASE = "типичный день за {revenue_dates}{revenue_note} против типичного за {baseline_count} {baseline_days_word} ({baseline_dates}, включая эти дни)"
-_WINDOW_HEADER = "Выручка: "
+_WINDOW_HEADER = "Сравнение выручки: "
 _WINDOW_OWN = "Для этой монеты сравнение другое: "
 # The market cap is a different quantity from the price the market is compared
 # with (RUNE 15-22 Oct 2026: price +6.8%, cap +9.1%), and its window is another
@@ -1130,8 +1130,16 @@ def format_digest(
     market_totals: set[int] = set()
     multi: list[str] = []
     single: list[str] = []
-    for candidate in results:
-        ticker, space, rest = _coin_label(conn, candidate).partition(" ")
+    # Order: by score (multi-signal coins first); coins with the same score -
+    # nearly always several single-signal ones with the same weight - by name,
+    # a rule the reader can check. Before 28 Oct 2026 their order was the
+    # accident of the ranker's input, and a first place that meant nothing
+    # looked like it did (first-user).
+    labelled = sorted(
+        ((_coin_label(conn, c), c) for c in results), key=lambda lc: (-round(lc[1].total_score, 6), lc[0])
+    )
+    for label, candidate in labelled:
+        ticker, space, rest = label.partition(" ")
         title = (
             f"{_BOLD_ON}{ticker}{_BOLD_OFF}{space}{rest} · {_freshness_label(candidate, episodes)}"
         )
@@ -1153,14 +1161,22 @@ def format_digest(
 
     how = []
     if common_window:
+        how.append("Выручка — часть комиссий протокола, которая остаётся ему, по данным DeFiLlama.")
         how.append(f"{_WINDOW_HEADER}{common_window}.")
     if common_price_window:
         how.append(f"Цена монеты и рынка — за те же дни, {common_price_window}.")
     if market_totals:
         how.append(_market_sentence(market_totals))
+    # One line for the size and the order (owner, 28 Oct 2026, after first-user:
+    # the reader did not know whether this is the whole list or an extract, or
+    # whether the first place means anything).
+    order = "порядок по алфавиту, место в списке ничего не значит"
+    if multi:
+        order = "сначала монеты с несколькими сигналами, остальные по алфавиту; место в списке ничего не значит"
+    header += f"\nОтмечено монет: {len(results)}; {order}."
     if how:
         header += (
-            "\n\nКак считали. «Типичный» и «рынок» — серединное значение: половина выше, половина ниже.\n"
+            f"\n\nКак считали. «Типичный» и «рынок» — серединное значение: половина выше, половина ниже.\n"
             + "\n".join(how)
         )
     blocks = [warning + header]
