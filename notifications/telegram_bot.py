@@ -382,7 +382,7 @@ _BACKGROUND_SAME_DAYS = "Цена за те же дни: "
 _GAP_SENTENCE = "Выручка протокола выросла сильнее, чем капитализация его токена"
 # The two numbers are in the card itself: "обычная" pointed at the header
 # the reader no longer looks at (first-user, 28 Oct 2026).
-_HEADLINE = _GAP_SENTENCE + ": типичный день — {recent} тыс. $ против {base} тыс. $ за {base_count} {base_days}, на {growth} больше."
+_HEADLINE = _GAP_SENTENCE + ": типичный день — {recent} $ против {base} $ за {base_count} {base_days}, на {growth} больше."
 _CHECK_FAILED = "Сравнить дневные цифры с обычными для этой монеты не получается: {reason}"
 
 
@@ -592,8 +592,10 @@ def _revenue_window_phrase(details: dict) -> str:
 def _revenue_headline(details: dict) -> str:
     """First line of a revenue card: what happened, with the main number in bold."""
     return _HEADLINE.format(
-        recent=_daily_numbers([details["recent_median_daily_revenue"]]),
-        base=_daily_numbers([details["baseline_median_daily_revenue"]]),
+        # Whole dollars, not "13,3 тыс.": from the rounded thousands the reader
+        # got 133% for a printed 135% (first-user, 28 Oct 2026).
+        recent=f"{details['recent_median_daily_revenue']:,.0f}".replace(",", " "),
+        base=f"{details['baseline_median_daily_revenue']:,.0f}".replace(",", " "),
         base_count=details["baseline_window_count"],
         base_days=_days_word(details["baseline_window_count"]),
         growth=f"{_BOLD_ON}{details['revenue_growth_pct']:.0f}%{_BOLD_OFF}",

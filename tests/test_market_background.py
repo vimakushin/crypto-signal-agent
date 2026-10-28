@@ -300,7 +300,7 @@ class CardTests(unittest.TestCase):
         # windows are the header's business (not repeated in the card)
         self.assertEqual(
             lines[0],
-            f"{_GAP_SENTENCE}: типичный день — 15,0 тыс. $ против 10,0 тыс. $ за 90 дней, "
+            f"{_GAP_SENTENCE}: типичный день — 15 000 $ против 10 000 $ за 90 дней, "
             f"на {_BOLD_ON}40%{_BOLD_OFF} больше.",
         )
         self.assertNotIn("октября", lines[0])
