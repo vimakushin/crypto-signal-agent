@@ -296,7 +296,10 @@ def _build_view(
     # function as the Telegram digest, in the digest's order. The description
     # is built from details without those keys, because the formatter appends
     # them in [brackets] and they are shown as their own block instead.
-    mark_keys = ("single_day_marked", "shape_marked", "shape_check_skipped", "shape_window_values")
+    # The first three are the mark flags; the last two are supporting data and
+    # stay out of the flag comparison below (mark_keys[:3]).
+    mark_keys = ("single_day_marked", "shape_marked", "low_day_marked",
+                 "shape_check_skipped", "shape_window_values")
     plain_details = {k: v for k, v in first_details.items() if k not in mark_keys}
     mark_lines = _mark_lines(first_details)
     # Marks that appeared after the first day: compare the set of flags, not

@@ -253,6 +253,7 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
                 min_revenue_total_usd=revenue_signal_cfg.get("min_revenue_total_usd", 0),
                 single_day_mark_ratio=revenue_signal_cfg["single_day_mark_ratio"],
                 shape_mark_ratio=revenue_signal_cfg["shape_mark_ratio"],
+                low_day_mark_ratio=revenue_signal_cfg["low_day_mark_ratio"],
             )
 
             # Four distinct reasons for "no candidates" - conflating them
@@ -287,15 +288,17 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
                     "revenue_price_gap FIRED: %s (%s) median daily revenue +%.1f%% over %dd "
                     "(configured) - recent $%.0f/day vs baseline $%.0f/day, week sum $%.0f "
                     "(largest day %.1f%% of it), actual gap between compared snapshots "
-                    "%.1fd, mcap only +%.1f%%; marks: single_day=%s, shape=%s (week unevenness "
-                    "%s vs usual %s, ratio %s, check skipped=%s, note: %s, shape window %s..%s, window max day share %.1f%% vs usual %s, ratio %s)",
+                    "%.1fd, mcap only +%.1f%%; marks: single_day=%s, shape=%s, low_day=%s (week unevenness "
+                    "%s vs usual %s, ratio %s, check skipped=%s, note: %s, shape window %s..%s, window max day share %.1f%% vs usual %s, ratio %s, window min day share %.1f%% vs usual %s, ratio %s)",
                     s.protocol_slug, s.symbol, s.revenue_growth_pct, s.lookback_days,
                     s.recent_median_daily_revenue, s.baseline_median_daily_revenue,
                     s.recent_week_sum, s.max_day_share_pct, s.actual_lookback_days,
-                    s.mcap_growth_pct, s.single_day_marked, s.shape_marked, s.week_unevenness,
+                    s.mcap_growth_pct, s.single_day_marked, s.shape_marked, s.low_day_marked,
+                    s.week_unevenness,
                     s.habitual_unevenness, s.shape_ratio, s.shape_check_skipped, s.shape_note,
                     s.shape_window_first, s.shape_window_last, s.window_max_day_share_pct,
-                    s.habitual_max_day_share_pct, s.single_day_ratio,
+                    s.habitual_max_day_share_pct, s.single_day_ratio, s.window_min_day_share_pct,
+                    s.habitual_min_day_share_pct, s.low_day_ratio,
                 )
                 save_signal_event(
                     conn,
@@ -328,6 +331,10 @@ def run_defillama_cycle(config: dict, skip_if_fresh: bool = False) -> None:
                         "window_max_day_share_pct": s.window_max_day_share_pct,
                         "habitual_max_day_share_pct": s.habitual_max_day_share_pct,
                         "single_day_ratio": s.single_day_ratio,
+                        "window_min_day_share_pct": s.window_min_day_share_pct,
+                        "habitual_min_day_share_pct": s.habitual_min_day_share_pct,
+                        "low_day_ratio": s.low_day_ratio,
+                        "low_day_marked": s.low_day_marked,
                         "revenue_window_first": s.revenue_window_first,
                         "revenue_window_last": s.revenue_window_last,
                         "revenue_window_count": s.revenue_window_count,

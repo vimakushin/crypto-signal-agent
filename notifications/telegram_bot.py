@@ -335,6 +335,17 @@ _MARK_ONE_DAY = (
     "самый крупный день дал {share:.0f}% выручки этих дней "
     "(обычно у этой монеты — {habitual:.0f}%)"
 )
+# Mark 3. The day is named and its amount given, so the reader sees which of the
+# shown numbers is meant; no verdict about the cause (a real fall, or a hole in
+# the source's data, cannot be told apart from our side).
+_MARK_LOW_DAY = (
+    "день выбивается вниз: {day} — {value} $, всего {share}% выручки этих дней "
+    "(самый малый день этой монеты обычно даёт {habitual}%, сейчас {ratio} меньше)"
+)
+_MARK_LOW_DAY_ZERO = (
+    "день выбивается вниз: {day} — {value} $ (самый малый день этой монеты "
+    "обычно даёт {habitual}% выручки этих дней)"
+)
 _DAILY_LINE = "Выручка по дням, {dates}{note}, тыс. $: {numbers}"
 # Bold in the digest: two private marker characters, turned into <b> by
 # _to_html after everything else is escaped. At most two bold runs per card -
@@ -431,6 +442,30 @@ def _revenue_mark_texts(details: dict, daily_note: str = "") -> RevenueMarkTexts
             share=details["window_max_day_share_pct"],
             habitual=details["habitual_max_day_share_pct"],
         ))
+    if details.get("low_day_marked"):
+        values = details["shape_window_values"]
+        low = min(values)
+        low_date = date.fromisoformat(details["shape_window_first"]) + timedelta(days=values.index(low))
+        fields = dict(
+            day=_date_ru(low_date), value=f"{low:,.0f}".replace(",", " ").replace("-", "−"),
+            habitual=f"{details['habitual_min_day_share_pct']:.1f}".replace(".", ","),
+        )
+        # The ratio is taken from the PRINTED numbers, so a reader who divides
+        # the usual share by the window's share gets the printed "в N раз" (the
+        # same care as the digest card's typical day, commit 0d65bd1). A share
+        # that would print as 0,0% gets two decimals; one that is 0,00% too is
+        # worded like a zero day.
+        share = details["window_min_day_share_pct"]
+        habitual = round(details["habitual_min_day_share_pct"], 1)
+        digits = 1 if round(share, 1) > 0 else 2
+        if details["low_day_ratio"] is not None and round(share, digits) > 0:
+            ratio = habitual / round(share, digits)
+            ratio_text = "более чем в 1000 раз" if ratio >= 1000 else f"в {ratio:.0f} раз"
+            marks.append(_MARK_LOW_DAY.format(
+                share=f"{share:.{digits}f}".replace(".", ","), ratio=ratio_text, **fields,
+            ))
+        else:
+            marks.append(_MARK_LOW_DAY_ZERO.format(**fields))
 
     daily_line = None
     if "shape_window_values" in details:

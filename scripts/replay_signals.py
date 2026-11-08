@@ -366,6 +366,7 @@ def replay_revenue_price_gap(
     mcap_threshold = signal_cfg["mcap_reaction_threshold_pct"]
     single_day_mark_ratio = signal_cfg["single_day_mark_ratio"]
     shape_mark_ratio = signal_cfg["shape_mark_ratio"]
+    low_day_mark_ratio = signal_cfg["low_day_mark_ratio"]
     max_gap_days = lookback_days * MAX_GAP_MULTIPLIER
     min_revenue_total_usd = signal_cfg.get("min_revenue_total_usd", 0)
     # math.floor, not math.ceil - mirrors signals/revenue_price_gap.py's own
@@ -395,6 +396,7 @@ def replay_revenue_price_gap(
     revenue_values: list[float] = []
     marked_single_day = 0
     marked_shape = 0
+    marked_low_day = 0
     shape_not_applied = 0
 
     for slug in watchlist:
@@ -514,7 +516,7 @@ def replay_revenue_price_gap(
                 signal = revenue_price_gap._evaluate_snapshots(
                     latest, earlier, recent_rows, baseline_rows,
                     revenue_threshold, mcap_threshold, single_day_mark_ratio,
-                    shape_mark_ratio, lookback_days,
+                    shape_mark_ratio, low_day_mark_ratio, lookback_days,
                 )
             except revenue_price_gap._DataQualityRejected:
                 # _evaluate_snapshots raises instead of returning None for
@@ -551,6 +553,7 @@ def replay_revenue_price_gap(
                 revenue_values.append(signal.revenue_growth_pct)
                 marked_single_day += signal.single_day_marked
                 marked_shape += signal.shape_marked
+                marked_low_day += signal.low_day_marked
                 shape_not_applied += signal.shape_check_skipped
 
         episodes = _collapse_daily_episodes(entries)
@@ -567,6 +570,8 @@ def replay_revenue_price_gap(
         "mcap_threshold": mcap_threshold,
         "single_day_mark_ratio": single_day_mark_ratio,
         "shape_mark_ratio": shape_mark_ratio,
+        "low_day_mark_ratio": low_day_mark_ratio,
+        "marked_low_day": marked_low_day,
         "marked_single_day": marked_single_day,
         "marked_shape": marked_shape,
         "shape_not_applied": shape_not_applied,
@@ -592,10 +597,10 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "revenue_price_gap: lookback_days=%d, baseline_window_days=%d, "
         "revenue_growth_threshold_pct=%s, mcap_reaction_threshold_pct=%s, "
-        "single_day_mark_ratio=%s, shape_mark_ratio=%s, min_revenue_total_usd=%s (config.yaml)",
+        "single_day_mark_ratio=%s, shape_mark_ratio=%s, low_day_mark_ratio=%s, min_revenue_total_usd=%s (config.yaml)",
         result["lookback_days"], result["baseline_window_days"], result["revenue_threshold"],
         result["mcap_threshold"], result["single_day_mark_ratio"], result["shape_mark_ratio"],
-        result["min_revenue_total_usd"],
+        result["low_day_mark_ratio"], result["min_revenue_total_usd"],
     )
     logger.info(
         "  Evaluated %d protocol-day point(s) total. Excluded from that count: %d with no "
@@ -629,10 +634,10 @@ def _report_revenue_price_gap(result: dict) -> None:
     logger.info(
         "  Of those %d fired protocol-days: %d marked 'one day dominates' (its share of the "
         "shown 7 days is more than single_day_mark_ratio times the coin's usual one), %d marked 'week shape more uneven than usual', "
-        "%d where the shape check was not applied (nothing to compare with). Marks do not "
+        "%d marked 'smallest day far below usual', %d where the shape check was not applied (nothing to compare with). Marks do not "
         "remove a day from the counts above.",
         result["fired_raw_total"], result["marked_single_day"], result["marked_shape"],
-        result["shape_not_applied"],
+        result["marked_low_day"], result["shape_not_applied"],
     )
     logger.info(
         "  Per protocol (evaluated / raw fired days / episodes / raw rows in DB / deduped "
@@ -733,6 +738,10 @@ def _revenue_price_gap_details_json(signal, result: dict) -> str:
         "window_max_day_share_pct": signal.window_max_day_share_pct,
         "habitual_max_day_share_pct": signal.habitual_max_day_share_pct,
         "single_day_ratio": signal.single_day_ratio,
+        "window_min_day_share_pct": signal.window_min_day_share_pct,
+        "habitual_min_day_share_pct": signal.habitual_min_day_share_pct,
+        "low_day_ratio": signal.low_day_ratio,
+        "low_day_marked": signal.low_day_marked,
         "revenue_window_first": signal.revenue_window_first,
         "revenue_window_last": signal.revenue_window_last,
         "revenue_window_count": signal.revenue_window_count,

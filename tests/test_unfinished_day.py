@@ -104,7 +104,7 @@ class RevenueWindowEndsYesterdayTests(unittest.TestCase):
             conn, ["p"],
             revenue_growth_threshold_pct=50, mcap_reaction_threshold_pct=10,
             lookback_days=7, baseline_window_days=90,
-            shape_mark_ratio=2.0, single_day_mark_ratio=2.0,
+            shape_mark_ratio=2.0, single_day_mark_ratio=2.0, low_day_mark_ratio=5.0,
         )
         self.assertEqual(len(result.signals), 1, result)
         signal = result.signals[0]
@@ -124,7 +124,7 @@ class ReplayWindowMatchesLiveTests(unittest.TestCase):
     CFG = {
         "lookback_days": 7, "baseline_window_days": 90,
         "revenue_growth_threshold_pct": 50, "mcap_reaction_threshold_pct": 10,
-        "single_day_mark_ratio": 2.0, "shape_mark_ratio": 2.0,
+        "single_day_mark_ratio": 2.0, "shape_mark_ratio": 2.0, "low_day_mark_ratio": 5.0,
     }
 
     def build_db(self) -> sqlite3.Connection:
@@ -178,7 +178,7 @@ class ReplayWindowMatchesLiveTests(unittest.TestCase):
                     conn, ["p"],
                     revenue_growth_threshold_pct=50, mcap_reaction_threshold_pct=10,
                     lookback_days=7, baseline_window_days=90,
-                    shape_mark_ratio=2.0, single_day_mark_ratio=2.0,
+                    shape_mark_ratio=2.0, single_day_mark_ratio=2.0, low_day_mark_ratio=5.0,
                 ).signals
                 self.assertEqual(len(live), 1)
                 self.assertEqual(live[0].revenue_window_last, expected_last)
@@ -196,7 +196,7 @@ class ReplayWindowMatchesLiveTests(unittest.TestCase):
             conn, ["p"],
             revenue_growth_threshold_pct=50, mcap_reaction_threshold_pct=10,
             lookback_days=7, baseline_window_days=90,
-            shape_mark_ratio=2.0, single_day_mark_ratio=2.0,
+            shape_mark_ratio=2.0, single_day_mark_ratio=2.0, low_day_mark_ratio=5.0,
         ).signals
         self.assertEqual(len(live), 1)
         for restated_at in (None, self.SNAPSHOT.isoformat()):

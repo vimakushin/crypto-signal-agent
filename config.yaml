@@ -176,6 +176,55 @@ signals:
     # a wrong guess is cheap. See BACKLOG.md, entry "Фильтр выбросов ловит
     # один доминирующий день...".
     shape_mark_ratio: 2
+    # Third mark, "one day falls out downward, for THIS coin" (8 Nov 2026, the
+    # owner's decision after the 8 Nov re-fetch; BACKLOG.md, "Пометка формы ряда
+    # не видит одиночного провала вниз"). The mirror of single_day_mark_ratio:
+    # the share of the SMALLEST day in the shown 7 days, compared with the coin's
+    # usual share of its smallest day (median of min/sum over the complete past
+    # 7-day windows, the same windows as the other two marks). The mark is set
+    # when usual / this-week's is above this number, i.e. the smallest day is
+    # more than 5 times lower than usual. A zero or negative day has no finite
+    # ratio and always counts. Why it exists: the other two marks do not see
+    # one collapsed day (the shape mark takes the 2nd smallest day on purpose),
+    # and the 27 Oct 2026 failures of thorchain-dex (234 $ against 10-28 thousand
+    # on the neighbouring days; the source did not correct it) and ens (503 $,
+    # later corrected to 15 459 $ by DeFiLlama - a hole in the source) went
+    # unmarked.
+    # "Zeros are normal" screening: the mark is NOT set when the shape check was
+    # skipped or when the coin's usual smallest-day share is 0 or below (more
+    # than half of its past weeks have a zero day: safe and frankencoin have a
+    # zero day in 100% of their weeks, so they can never be marked). An extra
+    # limit on the share of past weeks with a zero day was considered and NOT
+    # added: the median is positive only while fewer than half of the past
+    # weeks have a zero day (at exactly half it is positive but equals half of
+    # the smallest positive value, so the coin is nearly "zeros are normal"
+    # already), and in the data the highest shares among coins that fired are
+    # 41% (jupiter-aggregator), 37% (nexus-mutual), 35% (thorchain-dex over its
+    # whole history), yet no coin is marked on most of its fired days (stored
+    # data: at most 6 of 30 for reserve-protocol, 19 of 96 for thorchain-dex);
+    # a second number would be fitted to nothing.
+    # Honest cost of that choice (code review, 8 Nov 2026, whole history): for
+    # coins with 30-49% of weeks having a zero day the mark sits on roughly
+    # every fifth or fourth card - nexus-mutual ~26% of all its days,
+    # reserve-protocol ~28%, thorchain-dex ~27%, renzo ~17%, ankr ~15%. The
+    # threshold was not changed because of this; whether to change it is the
+    # owner's decision.
+    # The value 5 was fixed BEFORE any result was looked at and has not been
+    # touched since; after the results are seen it must not be - that would be
+    # fitting it to the answers. One replay run over the whole history, as the
+    # live run saw it (stored first values): 43 of 767 fired days marked, on 7
+    # coins (cowswap 4, ens 4, hyperlane 4, nexus-mutual 3, reserve-protocol 6,
+    # thorchain-dex 19, virtuals-protocol 3); on the re-fetched data 46 of 805.
+    # Known cases: thorchain-dex 28 Oct - 7 Nov 2026, all 11 days marked in
+    # the stored data (ratio 12-29; restated: 10 of them, 15-35; 28 Oct = the RUNE case, 16 against the
+    # usual share of 3.9%); thorchain-dex 29 Aug - 2 Sep 2026 (zero days) marked.
+    # ens: in the 27 Oct - 7 Nov window the signal itself did not fire in the
+    # replay (neither stored nor restated), so the mark was not exercised on that
+    # case; its 4 marked days are December 2025 (ratio ~40). The margin is thin
+    # in places: hyperlane 2 Jan 2026 gave 5.1, thorchain-dex 18 Jan 2026 5.0
+    # (restated: reserve-protocol 5.1 on 9 Dec 2025, 31 Mar 2026) - right at the
+    # line, which a different number would move either way.
+    low_day_mark_ratio: 5
     # Business-scale floor, NOT exchange/market liquidity (unlike
     # oi_divergence's min_oi_value_usdt or volume_breakout's
     # min_volume_avg_usd, which do measure real trading liquidity) - this is

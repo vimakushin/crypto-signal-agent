@@ -133,6 +133,18 @@ class RevenueGapSignal:
     habitual_max_day_share_pct: float | None
     single_day_ratio: float | None
     single_day_marked: bool
+    # Mark 3 ("one day falls out downward, for THIS coin"): the same share for
+    # the SMALLEST day of the shown 7 days (0.0 when they sum to <= 0), the
+    # coin's usual one (median over the same past windows), and the usual
+    # divided by the window's. low_day_ratio is None when the window's share is
+    # <= 0 (a zero or negative day: no finite ratio; the mark is then set
+    # whenever the usual share is positive). habitual_min_day_share_pct and
+    # low_day_ratio are None, and the mark is not set, when the shape check was
+    # skipped or the coin's usual smallest day is zero ("zeros are normal").
+    window_min_day_share_pct: float
+    habitual_min_day_share_pct: float | None
+    low_day_ratio: float | None
+    low_day_marked: bool
     # Mark 2 ("this week is more uneven than usual for this coin"), see
     # _shape_check. week_unevenness/habitual_unevenness are None when they
     # could not be computed; shape_ratio is None when it is not a finite
@@ -292,9 +304,11 @@ def _shape_check(
     baseline_daily_revenue: list[sqlite3.Row],
     shape_mark_ratio: float,
     single_day_mark_ratio: float,
+    low_day_mark_ratio: float,
 ) -> dict:
-    """Marks 1 and 2 for the latest 7 days: is one day's share, and the
-    spread between big and small days, unusual for this protocol?
+    """Marks 1, 2 and 3 for the latest 7 days: is one day's share, the
+    spread between big and small days, and the smallest day's share unusual
+    for this protocol?
 
     The window is the LAST 7 consecutive days that have data as of this
     evaluation (the last day with data and the 6 before it). All windows end
@@ -309,21 +323,28 @@ def _shape_check(
 
     The same past windows give the coin's habitual share of the largest day
     (median of max/sum, windows with sum <= 0 skipped); mark 1 is set when the
-    window's share is more than `single_day_mark_ratio` times that. Both marks
-    need the same comparison base, so both are off when the check is skipped.
+    window's share is more than `single_day_mark_ratio` times that. Mark 3
+    mirrors it downward: the median of min/sum over the same windows (sum <= 0
+    skipped), and the mark is set when that usual share divided by the window's
+    share is more than `low_day_mark_ratio` (a zero or negative day in the
+    window always counts, provided the usual share is positive). All three marks
+    need the same comparison base, so all are off when the check is skipped.
 
     Args:
         baseline_daily_revenue: the baseline window's rows (date, revenue_usd).
         shape_mark_ratio: config.yaml signals.revenue_price_gap.shape_mark_ratio.
         single_day_mark_ratio: config.yaml
             signals.revenue_price_gap.single_day_mark_ratio.
+        low_day_mark_ratio: config.yaml
+            signals.revenue_price_gap.low_day_mark_ratio.
 
     Returns:
         Dict with the RevenueGapSignal fields week_unevenness,
         habitual_unevenness, shape_ratio, shape_marked, shape_check_skipped,
         shape_note, shape_window_first, shape_window_last, shape_window_values,
         window_max_day_share_pct, habitual_max_day_share_pct,
-        single_day_ratio, single_day_marked.
+        single_day_ratio, single_day_marked, window_min_day_share_pct,
+        habitual_min_day_share_pct, low_day_ratio, low_day_marked.
         Never contains inf/NaN (the result goes into JSON).
     """
     result: dict = {
@@ -331,6 +352,8 @@ def _shape_check(
         "shape_marked": False, "shape_check_skipped": True, "shape_note": None,
         "habitual_max_day_share_pct": None, "single_day_ratio": None,
         "single_day_marked": False,
+        "habitual_min_day_share_pct": None, "low_day_ratio": None,
+        "low_day_marked": False,
     }
     by_date = {
         date.fromisoformat(r["date"]): r["revenue_usd"]
@@ -345,6 +368,8 @@ def _shape_check(
     shown = [v for v in result["shape_window_values"] if v is not None]
     window_share = (max(shown) / sum(shown) * 100) if sum(shown) > 0 else 0.0
     result["window_max_day_share_pct"] = window_share
+    window_min_share = (min(shown) / sum(shown) * 100) if sum(shown) > 0 else 0.0
+    result["window_min_day_share_pct"] = window_min_share
     if not all(d in by_date for d in window_days):
         result["shape_note"] = NOTE_GAPS
         return result
@@ -352,6 +377,7 @@ def _shape_check(
 
     past = []
     past_shares = []
+    past_min_shares = []
     for end_day in by_date:
         if end_day >= first_day:
             continue
@@ -361,6 +387,7 @@ def _shape_check(
             past.append(_unevenness(values))
             if sum(values) > 0:
                 past_shares.append(max(values) / sum(values) * 100)
+                past_min_shares.append(min(values) / sum(values) * 100)
     if len(past) < MIN_PAST_WINDOWS_FOR_SHAPE:
         result["shape_note"] = NOTE_FEW_WINDOWS
         return result
@@ -378,6 +405,14 @@ def _shape_check(
     result["habitual_max_day_share_pct"] = habitual_share
     result["single_day_ratio"] = window_share / habitual_share
     result["single_day_marked"] = result["single_day_ratio"] > single_day_mark_ratio
+    habitual_min_share = statistics.median(past_min_shares)
+    result["habitual_min_day_share_pct"] = habitual_min_share
+    if habitual_min_share > 0:
+        if window_min_share > 0:
+            result["low_day_ratio"] = habitual_min_share / window_min_share
+            result["low_day_marked"] = result["low_day_ratio"] > low_day_mark_ratio
+        else:
+            result["low_day_marked"] = True
     week_unevenness = _unevenness(week)
     if math.isfinite(week_unevenness):
         result["week_unevenness"] = week_unevenness
@@ -397,6 +432,7 @@ def _evaluate_snapshots(
     mcap_reaction_threshold_pct: float,
     single_day_mark_ratio: float,
     shape_mark_ratio: float,
+    low_day_mark_ratio: float,
     lookback_days: int,
     actual_lookback_days: float | None = None,
 ) -> RevenueGapSignal | None:
@@ -425,6 +461,8 @@ def _evaluate_snapshots(
             threshold, not a rejection).
         shape_mark_ratio: see config.yaml
             signals.revenue_price_gap.shape_mark_ratio.
+        low_day_mark_ratio: see config.yaml
+            signals.revenue_price_gap.low_day_mark_ratio.
         lookback_days: configured "recent" comparison window in days.
         actual_lookback_days: real elapsed time between `earlier` and
             `latest` (see _days_between), checked against
@@ -523,7 +561,9 @@ def _evaluate_snapshots(
     if mcap_growth_pct >= revenue_growth_pct or mcap_growth_pct >= mcap_reaction_threshold_pct:
         return None
 
-    shape = _shape_check(baseline_daily_revenue, shape_mark_ratio, single_day_mark_ratio)
+    shape = _shape_check(
+        baseline_daily_revenue, shape_mark_ratio, single_day_mark_ratio, low_day_mark_ratio
+    )
 
     return RevenueGapSignal(
         protocol_slug=latest["protocol_slug"],
@@ -561,6 +601,7 @@ def scan_watchlist(
     baseline_window_days: int,
     shape_mark_ratio: float,
     single_day_mark_ratio: float,
+    low_day_mark_ratio: float,
     min_revenue_total_usd: float = 0,
 ) -> RevenueGapScanResult:
     """Run the signal for every watchlist protocol using stored snapshot and
@@ -592,6 +633,8 @@ def scan_watchlist(
             signals.revenue_price_gap.single_day_mark_ratio.
         shape_mark_ratio: see config.yaml
             signals.revenue_price_gap.shape_mark_ratio.
+        low_day_mark_ratio: see config.yaml
+            signals.revenue_price_gap.low_day_mark_ratio.
 
     Raises:
         ValueError: if `lookback_days` is not strictly less than
@@ -663,7 +706,8 @@ def scan_watchlist(
             signal = _evaluate_snapshots(
                 latest, earlier, recent_rows, baseline_rows,
                 revenue_growth_threshold_pct, mcap_reaction_threshold_pct,
-                single_day_mark_ratio, shape_mark_ratio, lookback_days, actual_lookback_days,
+                single_day_mark_ratio, shape_mark_ratio, low_day_mark_ratio,
+                lookback_days, actual_lookback_days,
             )
         except _DataQualityRejected:
             # Reason already logged by _evaluate_snapshots - just route
