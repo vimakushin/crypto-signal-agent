@@ -339,12 +339,13 @@ _MARK_ONE_DAY = (
 # shown numbers is meant; no verdict about the cause (a real fall, or a hole in
 # the source's data, cannot be told apart from our side).
 _MARK_LOW_DAY = (
-    "день выбивается вниз: {day} — {value} $, всего {share}% выручки этих дней "
-    "(самый малый день этой монеты обычно даёт {habitual}%, сейчас {ratio} меньше)"
+    "день выбивается вниз: {day} — {value} $, это {share}% суммы дней, показанных ниже; "
+    "по прошлым неделям самый малый день этой монеты даёт {habitual}% такой суммы, "
+    "сейчас доля меньше {ratio}"
 )
 _MARK_LOW_DAY_ZERO = (
-    "день выбивается вниз: {day} — {value} $ (самый малый день этой монеты "
-    "обычно даёт {habitual}% выручки этих дней)"
+    "день выбивается вниз: {day} — {value} $; по прошлым неделям самый малый день "
+    "этой монеты даёт {habitual}% суммы дней, показанных ниже"
 )
 _DAILY_LINE = "Выручка по дням, {dates}{note}, тыс. $: {numbers}"
 # Bold in the digest: two private marker characters, turned into <b> by
@@ -414,6 +415,28 @@ def _daily_numbers(values: list) -> str:
     return " · ".join(parts)
 
 
+def _times_text(ratio: float) -> str:
+    """'in N times' in Russian for a ratio above 1.
+
+    Rounded to a whole number, or to one decimal (comma) below 10; from 1000
+    'более чем в 1000 раз'. Declension: whole numbers ending in 2-4 (except
+    12-14) take 'раза', fractions always 'раза', the rest 'раз'.
+
+    Args:
+        ratio: the true (unrounded) ratio.
+
+    Returns:
+        E.g. 'в 16 раз', 'в 22 раза', 'в 4,6 раза', 'в 5 раз'.
+    """
+    if ratio >= 1000:
+        return "более чем в 1000 раз"
+    if ratio < 10 and round(ratio, 1) != round(ratio):
+        return f"в {ratio:.1f} раза".replace(".", ",")
+    n = round(ratio)
+    few = n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14)
+    return f"в {n} {'раза' if few else 'раз'}"
+
+
 def _revenue_mark_texts(details: dict, daily_note: str = "") -> RevenueMarkTexts:
     """Texts for revenue_price_gap's marks and the daily-numbers line.
 
@@ -450,17 +473,19 @@ def _revenue_mark_texts(details: dict, daily_note: str = "") -> RevenueMarkTexts
             day=_date_ru(low_date), value=f"{low:,.0f}".replace(",", " ").replace("-", "−"),
             habitual=f"{details['habitual_min_day_share_pct']:.1f}".replace(".", ","),
         )
-        # The ratio is taken from the PRINTED numbers, so a reader who divides
-        # the usual share by the window's share gets the printed "в N раз" (the
-        # same care as the digest card's typical day, commit 0d65bd1). A share
-        # that would print as 0,0% gets two decimals; one that is 0,00% too is
-        # worded like a zero day.
+        # "в N раз" is the TRUE ratio (the stored low_day_ratio, from unrounded
+        # numbers), rounded only for printing. Taken from the printed, rounded
+        # shares it lied: 28 Oct 2026 printed "в 20 раз", the real value was 16.2.
+        # A reader dividing the printed shares may get a slightly different
+        # number; the printed "в N раз" is still true. But with one decimal the
+        # RUNE card read "обычно 3,9%" next to "всего 0,2%" (3,9/0,2 = 20) beside
+        # "в 16 раз", contradicting itself. So a share below 1% is printed with
+        # two decimals (0,24%: 3,9/0,24 = 16). One that is 0,00% too is worded
+        # like a zero day.
         share = details["window_min_day_share_pct"]
-        habitual = round(details["habitual_min_day_share_pct"], 1)
-        digits = 1 if round(share, 1) > 0 else 2
+        digits = 2 if share < 1 else 1
         if details["low_day_ratio"] is not None and round(share, digits) > 0:
-            ratio = habitual / round(share, digits)
-            ratio_text = "более чем в 1000 раз" if ratio >= 1000 else f"в {ratio:.0f} раз"
+            ratio_text = _times_text(details["low_day_ratio"])
             marks.append(_MARK_LOW_DAY.format(
                 share=f"{share:.{digits}f}".replace(".", ","), ratio=ratio_text, **fields,
             ))
