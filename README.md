@@ -33,6 +33,8 @@ collectors/  →  signals/  →  scoring/  →  notifications/
 
 All thresholds, signal weights, the watchlist and the schedule live in `config.yaml`, not hardcoded in the code.
 
+Comments in the code are in Russian. They record why each decision was made, including what was tried and what didn't work.
+
 ## What's working today
 
 MVP readiness is defined in [`MVP.md`](MVP.md) as six acceptance criteria, each either met or not, no "mostly done." As things stand: all three data sources are being collected, all three signals are computed and logged, firings are persisted to the database, the score is computed and explained, and a daily digest goes out on Telegram. Five of the six criteria hold. The sixth — the cycle running on its own, three days in a row — was unchecked on 5 October 2026: an audit found that a collection had failed on 2 October and no digest was sent on the 3rd. The causes are fixed (see "Scheduled runs" below and `BACKLOG.md`); the item gets checked again only after three digests in a row arrive unaided.
@@ -171,6 +173,10 @@ Stale data and a missing backup are reported at the top of the digest, before an
 An early, cut-down version of manual labeling: a plain markdown table at the project root, committed to git. Every day, when the Telegram digest goes out, one row gets added per new candidate — no more than once every 30 days for the same coin, so a signal that stays fired for weeks doesn't flood the journal with near-duplicates — with the date, the coin, its score, which signals fired, and price/market cap at that moment. Seven days later, the system fills in the actual price/market cap on its own. The "after 14 days," "after 30 days," and "Verdict" columns are filled in by hand; the code never touches them.
 
 ### Web UI — episode labeling
+
+![The episode labeling screen: two signal episodes, each with the detector's numbers, price and market cap at the start and now, and three buttons: worked, didn't work, too early to tell.](docs/episode-labeling.png)
+
+*Invented data; the interface text is in Russian.*
 
 The first screen of the internal web UI (functional requirement 5 in section 6 of the requirements specification): manual "did it hold up" labeling for signal firings. Not a product for end users — that stays Telegram-only — this is a local tool for the owner, since manual "worked / didn't work" labels are the only honest data behind future weight calibration.
 
